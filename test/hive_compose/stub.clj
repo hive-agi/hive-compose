@@ -14,13 +14,40 @@
   (when (contains? (:fail @world) method)
     (r/err :stub/fault {:method method})))
 
+(defn- enabled
+  "Services of `model` enabled under native `profiles`: always-on plus members."
+  [model profiles]
+  (sort (for [[svc {ps :profiles}] model
+              :when (or (empty? ps) (some (set profiles) ps))]
+          svc)))
+
+(defn- closure
+  "`targets` plus everything they transitively depend on in `model`."
+  [model targets]
+  (loop [seen (sorted-set) todo (vec targets)]
+    (if-let [[s & more] (seq todo)]
+      (if (seen s)
+        (recur seen (vec more))
+        (recur (conj seen s) (into (vec more) (get-in model [s :deps]))))
+      (vec seen))))
+
 (defrecord StubEngine [world]
   port/IComposeEngine
   (-version [_] (or (fault world :version) (r/ok "stub")))
   (-closure [_ p]
     (record! world [:closure (:profile/id p)])
     (or (fault world :closure)
-        (r/ok (vec (sort (get-in @world [:closures (:profile/id p)]))))))
+        (if-let [c (get-in @world [:closures (:profile/id p)])]
+          (r/ok (vec (sort c)))
+          (let [model (get-in @world [:projects (profile/project p)])
+                targets (or (seq (:profile/services p)) (enabled model (:profile/compose-profiles p)))]
+            (if-let [missing (first (remove model targets))]
+              (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " missing)})
+              (r/ok (closure model targets)))))))
+  (-listed [_ p]
+    (r/ok (vec (enabled (get-in @world [:projects (profile/project p)]) (:profile/compose-profiles p)))))
+  (-profiles [_ p]
+    (r/ok (into #{} (mapcat :profiles) (vals (get-in @world [:projects (profile/project p)])))))
   (-running [_ p]
     (or (fault world :running)
         (r/ok (into (sorted-set) (get-in @world [:running (profile/project p)])))))
@@ -47,11 +74,13 @@
     (r/ok {:out "log"})))
 
 (defn engine
-  "StubEngine over `closures` ({profile-id [service]}) and `running`
-   ({project #{service}})."
+  "StubEngine over `closures` ({preset-id [service]}), `running`
+   ({project #{service}}) and compose `projects`
+   ({project {service {:deps [service] :profiles #{name}}}})."
   ([closures] (engine closures {}))
-  ([closures running]
-   (->StubEngine (atom {:closures closures :running running :calls [] :fail #{}}))))
+  ([closures running] (engine closures running {}))
+  ([closures running projects]
+   (->StubEngine (atom {:closures closures :running running :projects projects :calls [] :fail #{}}))))
 
 (defn calls [e] (:calls @(:world e)))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))

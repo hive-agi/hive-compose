@@ -6,7 +6,8 @@
 ;; SPDX-License-Identifier: MIT
 
 (def ProfileId
-  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"])
+  "A preset name, or a section id `<project>/<target>[+<target>..]`."
+  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$"])
 
 (def IdleAction
   "What the reaper does to an idle profile. :stop keeps containers, :down removes
@@ -40,8 +41,22 @@
 
 (def ActiveMap [:map-of :string Active])
 
+(def Project
+  "Where a compose project lives. Its YAML is the source of truth: sections are
+   resolved from its services, native profiles and depends_on."
+  [:map
+   [:project/id [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"]]
+   [:project/dir [:string {:min 1}]]
+   [:project/files {:optional true} [:vector [:string {:min 1}]]]
+   [:project/name {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+   [:project/env {:optional true} [:map-of :string :string]]
+   [:project/wait? {:optional true} :boolean]
+   [:project/ttl-minutes {:optional true} [:int {:min 1}]]
+   [:project/idle-action {:optional true} IdleAction]])
+
 (def Settings
   [:map
+   [:compose/projects [:map-of :string Project]]
    [:compose/profiles [:map-of :string Profile]]
    [:compose/tick-seconds [:int {:min 5}]]
    [:compose/default-ttl-minutes [:int {:min 1}]]

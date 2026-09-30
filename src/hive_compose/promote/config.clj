@@ -37,10 +37,10 @@
     (str home (subs s 1))
     s))
 
-(defn- as-seq [profiles]
-  (if (map? profiles)
-    (map (fn [[k v]] (update v :profile/id #(or % (name k)))) profiles)
-    profiles))
+(defn- as-seq [id-key coll]
+  (if (map? coll)
+    (map (fn [[k v]] (update v id-key #(or % (name k)))) coll)
+    coll))
 
 (defn normalize-profile
   "Profile with a string id and its dir expanded against `home`."
@@ -48,6 +48,13 @@
   (cond-> p
     (:profile/id p) (update :profile/id name)
     (:profile/dir p) (update :profile/dir #(expand-home home %))))
+
+(defn normalize-project
+  "Project with a string id and its dir expanded against `home`."
+  [home p]
+  (cond-> p
+    (:project/id p) (update :project/id name)
+    (:project/dir p) (update :project/dir #(expand-home home %))))
 
 (defn profiles-file
   "Path of the profiles file `cfg` names, expanded against `home`."
@@ -60,10 +67,13 @@
    override file profiles with the same id."
   [cfg file-profiles home]
   (let [profiles (map #(normalize-profile home %)
-                      (concat (as-seq file-profiles) (as-seq (:compose/profiles cfg))))
+                      (concat (as-seq :profile/id file-profiles)
+                              (as-seq :profile/id (:compose/profiles cfg))))
+        projects (map #(normalize-project home %) (as-seq :project/id (:compose/projects cfg)))
         s (merge defaults
                  (select-keys cfg (keys defaults))
                  {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
+                  :compose/projects (into {} (map (juxt :project/id identity)) projects)
                   :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})]
     (if-let [problems (schema/explain schema/Settings s)]
       (r/err :compose/invalid-config {:problems problems})

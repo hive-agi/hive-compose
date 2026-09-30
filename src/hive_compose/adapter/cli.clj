@@ -34,6 +34,17 @@
 (defn ps-argv [p]
   (into (base-argv p) ["ps" "--format" "json"]))
 
+(defn listed-argv [p]
+  (into (base-argv p) ["config" "--services"]))
+
+(defn profiles-argv [p]
+  (into (base-argv p) ["config" "--profiles"]))
+
+(defn lines
+  "Non-blank trimmed lines of `s`."
+  [s]
+  (vec (remove str/blank? (map str/trim (str/split-lines (or s ""))))))
+
 (defn up-argv [p services]
   (-> (base-argv p)
       (into ["up" "-d"])
@@ -113,6 +124,10 @@
     (r/map-ok (run exec nil version-argv timeout-ms) str/trim))
   (-closure [_ p]
     (parsed (run exec p (closure-argv p) timeout-ms) :compose/unparseable closure-services))
+  (-listed [_ p]
+    (r/map-ok (run exec p (listed-argv p) timeout-ms) lines))
+  (-profiles [_ p]
+    (r/map-ok (run exec p (profiles-argv p) timeout-ms) (comp set lines)))
   (-running [_ p]
     (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
             (comp running-services parse-json-rows)))

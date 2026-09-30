@@ -8,6 +8,10 @@
     "Result<string>: the engine's version, or why it is unavailable.")
   (-closure [e profile]
     "Result<[service]>: the services `profile` needs, its depends_on closure included.")
+  (-listed [e profile]
+    "Result<[service]>: services enabled for `profile`: the always-on ones plus those of its native compose profiles.")
+  (-profiles [e profile]
+    "Result<#{name}>: native compose profiles declared by the profile's project.")
   (-running [e profile]
     "Result<#{service}>: services of the profile's project whose containers are running.")
   (-projects [e]

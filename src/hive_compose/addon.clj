@@ -90,28 +90,28 @@
   (or (get params k) (get params (keyword k))))
 
 (def commands
-  ["status" "up" "switch" "down" "stop" "touch" "ps" "logs" "reap" "adopt" "projects" "reload"])
+  ["status" "targets" "up" "switch" "down" "stop" "touch" "ps" "logs" "reap" "adopt" "projects" "reload"])
 
 (declare reload!)
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
-        need-id (fn [f] (if (str/blank? id)
-                          (r/err :compose/missing-param {:param "profile"})
-                          (f id)))]
+        tgt (some-> (param params "target") str)
+        on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))]
     (if (nil? ctx)
       (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
                                        :errors (:errors @(:state a))})
       (case command
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
-        "up" (need-id #(ops/up! ctx %))
-        "switch" (need-id #(ops/switch! ctx %))
-        "down" (need-id #(ops/down! ctx % :down))
-        "stop" (need-id #(ops/down! ctx % :stop))
-        "touch" (need-id #(ops/touch! ctx %))
-        "ps" (need-id #(ops/ps ctx %))
-        "logs" (need-id #(ops/logs ctx % (or (some-> (param params "tail") long) 100)))
+        "targets" (ops/targets ctx)
+        "up" (on-subject #(ops/up-profile! ctx %))
+        "switch" (on-subject #(ops/switch-profile! ctx %))
+        "down" (on-subject #(ops/down-profile! ctx % :down))
+        "stop" (on-subject #(ops/down-profile! ctx % :stop))
+        "touch" (on-subject #(ops/touch! ctx (:profile/id %)))
+        "ps" (on-subject #(ops/ps-profile ctx %))
+        "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
@@ -120,18 +120,20 @@
 
 (defn tool [a]
   {:name "compose"
-   :description (str "docker compose profiles for local development. A profile is a named set of services "
-                     "(compose files, native compose profiles, a service subset) defined in "
-                     "~/.config/hive-mcp/compose-profiles.edn. "
-                     "status: profiles, activity, reaper countdown. up: start a profile alongside others. "
-                     "switch: make a profile current, stopping what only the previous one needed. "
-                     "down/stop: remove/stop a profile's containers (volumes never), keeping services other "
-                     "active profiles need. touch: reset a profile's idle clock. ps/logs: inspect (also touch). "
-                     "reap: run the idle reaper now. adopt: take charge of running stacks of configured profiles. "
-                     "projects: every compose project on the host. reload: re-read the profiles file.")
+   :description (str "docker compose sections for local development. Name a TARGET (a service or native compose "
+                     "profile of a configured compose project, e.g. target=sisf-web, target=sisf/frontend, "
+                     "target=sisf-web,sisf-crm) and exactly that runs, closed over the YAML's depends_on; "
+                     "the section's id is <project>/<targets>. Presets from compose-profiles.edn work via profile=ID. "
+                     "targets: what each project offers. status: active sections, idle time, reaper countdown. "
+                     "up: start alongside others. switch: make current, stopping what only the previous one needed. "
+                     "down/stop: remove/stop a section's containers (volumes never), keeping services other active "
+                     "sections need. touch: reset the idle clock (ps/logs touch too). reap: run the idle reaper now. "
+                     "adopt: take charge of running stacks nobody owns. projects: every compose project on the host. "
+                     "reload: re-read config.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
-                              "profile" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] profile id"}
+                              "target" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
+                              "profile" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] preset or active section id"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
    :handler (fn [params]
