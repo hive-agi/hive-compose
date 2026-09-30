@@ -1,0 +1,7 @@
+{:project-id "hive-compose"
+ :parent "hive"
+ :description "docker compose profiles as a hive IAddon: named sets of services to run and test an app locally, switched in one call, with an idle reaper that stops what nobody is using."
+ :language :clojure
+ :license "MIT"
+ :tags ["hive-compose" "docker" "docker-compose" "local-dev" "profiles" "idle-reaper" "addon"]
+ :carto {:source-roots ["dev" "resources" "src" "test" "test/resources"]}}

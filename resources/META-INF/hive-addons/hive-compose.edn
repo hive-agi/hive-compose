@@ -1,0 +1,11 @@
+{:addon/id           "hive.compose"
+ :addon/kind         :addon
+ :addon/type         :native
+ :addon/init-ns      "hive-compose.addon"
+ :addon/init-fn      "addon-ctor"
+ :addon/capabilities #{:tools :health-reporting :compose}
+ :addon/config       {}
+ :addon/description  "docker compose profiles for local development: named sets of services (compose files, native compose profiles, a service subset) brought up, switched and torn down in one call. Switching keeps services the next profile shares; an idle reaper stops profiles untouched past their TTL, so no stack keeps loading the machine in the background (tool `compose`)."
+ :addon/license      "MIT"
+ :addon/maturity     :experimental
+ :addon/trust-class  :foss}
