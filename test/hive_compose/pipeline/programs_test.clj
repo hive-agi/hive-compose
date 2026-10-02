@@ -127,6 +127,20 @@
     (is (= :compose/program-needs-command (:error (:error row))))
     (is (empty? (runner/starts (:runner c))))))
 
+(deftest a-program-somebody-else-runs-is-neither-started-nor-held
+  (let [c (ctx)]
+    (runner/listen! (:runner c) 7902)
+    (let [res (ops/up! c "web")
+          [row] (:programs (:ok res))]
+      (is (r/ok? res))
+      (is (empty? (runner/starts (:runner c))) "its nREPL port already answers")
+      (is (= {:program/id "web" :external? true :nrepl-port 7902}
+             (select-keys row [:program/id :external? :nrepl-port])))
+      (is (empty? (held c "web")))
+      (testing "taking the section down leaves it alone"
+        (ops/down! c "web" :down)
+        (is (empty? (runner/stops (:runner c))))))))
+
 (deftest a-dead-program-is-started-again
   (let [c (ctx)]
     (ops/up! c "web")

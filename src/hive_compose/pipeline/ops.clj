@@ -104,14 +104,18 @@
 
 (defn subject
   "Result<Profile> for a tool call: `target` resolves a section, else `id`
-   looks up a preset or an active section."
+   looks up a preset or an active section. A target is resolved against the
+   config as it is now, so an active section picks up what its project gained
+   since (a program, a TTL); the snapshot it ran with answers only when the
+   target no longer resolves."
   [ctx {:keys [target id]}]
   (cond
     (seq target) (let [{:keys [project names]} (target/parse target)
-                       sid (when project (target/section-id project names))]
-                   (if (and sid (active-entry ctx sid))
+                       sid (when project (target/section-id project names))
+                       fresh (resolve-target ctx target)]
+                   (if (and (r/err? fresh) sid (active-entry ctx sid))
                      (lookup ctx sid)
-                     (resolve-target ctx target)))
+                     fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
 
@@ -135,24 +139,31 @@
 
 (defn- start-program!
   "Result<Running>: Program `p` of compose project `project`, completed from the
-   build files of its directory and started."
+   build files of its directory and started. When its nREPL port already
+   answers, somebody else runs it: nothing starts and the answer is
+   {:external? true}, a program this addon does not hold and will not stop."
   [ctx project p]
   (let [rn (runner ctx)
         log (program/log-file (get-in ctx [:settings :compose/log-dir] "logs") project p)]
     (r/let-ok [facts (port/-facts rn (:program/dir p))
-               ready (program/resolved p facts)
-               started (port/-start! rn ready log)]
-      (r/ok (cond-> {:program/id (:program/id p)
-                     :pid (:pid started)
-                     :log log
-                     :dir (:program/dir p)
-                     :kind (:program/kind ready)
-                     :started-at ((:now ctx))}
-              (:program/nrepl-port ready) (assoc :nrepl-port (:program/nrepl-port ready)))))))
+               ready (program/resolved p facts)]
+      (let [nrepl (:program/nrepl-port ready)]
+        (if (and nrepl (port/-listening? rn nrepl))
+          (r/ok {:program/id (:program/id p) :external? true :nrepl-port nrepl
+                 :dir (:program/dir p) :kind (:program/kind ready)})
+          (r/let-ok [started (port/-start! rn ready log)]
+            (r/ok (cond-> {:program/id (:program/id p)
+                           :pid (:pid started)
+                           :log log
+                           :dir (:program/dir p)
+                           :kind (:program/kind ready)
+                           :started-at ((:now ctx))}
+                    nrepl (assoc :nrepl-port nrepl)))))))))
 
 (defn- start-programs!
   "Start the programs `p` pairs with `services`, reusing the live ones in
-   `carried`. Answers {:held {program-id Running} :report [..]}."
+   `carried`. Answers {:held {program-id Running} :report [..]}; a program
+   running outside the addon is reported and not held."
   [ctx p services carried]
   (if-not (runner ctx)
     {:held {} :report []}
@@ -163,11 +174,12 @@
                       (assoc-in [:held id] run)
                       (update :report conj (assoc run :reused? true)))
                   (let [res (start-program! ctx (profile/project p) prog)]
-                    (if (r/ok? res)
-                      (-> acc
-                          (assoc-in [:held id] (:ok res))
-                          (update :report conj (assoc (:ok res) :started? true)))
-                      (update acc :report conj {:program/id id :error res}))))))
+                    (cond
+                      (r/err? res) (update acc :report conj {:program/id id :error res})
+                      (:external? (:ok res)) (update acc :report conj (:ok res))
+                      :else (-> acc
+                                (assoc-in [:held id] (:ok res))
+                                (update :report conj (assoc (:ok res) :started? true))))))))
             {:held {} :report []}
             (program/wanted (:profile/programs p) services))))
 
@@ -444,7 +456,7 @@
                  :with (vec (:program/with p)) :running? (some? run)}
           (r/ok? ready) (merge (select-keys (:ok ready) [:program/kind :program/command :program/nrepl-port]))
           (r/err? ready) (assoc :error ready)
-          run (merge (program-row ctx run))))))))
+          run (merge (select-keys (program-row ctx run) [:pid :log :alive? :nrepl-ready?]))))))))
 
 (defn targets
   "Result<[{:project :services :profiles}]>: what can be named as a target in each

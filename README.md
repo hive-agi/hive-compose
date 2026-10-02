@@ -98,7 +98,8 @@ sections want runs once and stops with the last of them, on `down`, `stop`,
 appended to `~/.local/state/hive-compose/logs/<project>-<program>.log`, and is
 tracked by pid, so it survives a restart of the host and is still stopped
 afterwards. A program that fails to start is reported and never fails the
-section.
+section. A program whose nREPL port already answers is somebody else's: it is
+reported as `external?`, not started a second time and never stopped.
 
 ## Tool `compose`
 
