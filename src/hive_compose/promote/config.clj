@@ -25,7 +25,8 @@
    :compose/default-idle-action :stop
    :compose/timeout-ms 60000
    :compose/up-timeout-ms 600000
-   :compose/adopt? true})
+   :compose/adopt? true
+   :compose/programs? true})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")
@@ -42,19 +43,48 @@
     (map (fn [[k v]] (update v id-key #(or % (name k)))) coll)
     coll))
 
+(def default-log-dir "~/.local/state/hive-compose/logs")
+
+(defn under
+  "`dir` as an absolute path: itself when absolute or under ~, else resolved
+   against `base`."
+  [home base dir]
+  (cond
+    (not (string? dir)) dir
+    (str/starts-with? dir "~") (expand-home home dir)
+    (str/starts-with? dir "/") dir
+    (str/ends-with? base "/") (str base dir)
+    :else (str base "/" dir)))
+
+(defn normalize-programs
+  "Programs with string ids and their dirs made absolute against `base`, the
+   directory of the project or profile that declares them."
+  [home base programs]
+  (mapv (fn [p]
+          (cond-> p
+            (:program/id p) (update :program/id name)
+            (:program/dir p) (update :program/dir #(under home base %))))
+        (as-seq :program/id programs)))
+
 (defn normalize-profile
-  "Profile with a string id and its dir expanded against `home`."
+  "Profile with a string id, its dir expanded against `home` and its programs
+   resolved against that dir."
   [home p]
-  (cond-> p
-    (:profile/id p) (update :profile/id name)
-    (:profile/dir p) (update :profile/dir #(expand-home home %))))
+  (let [p (cond-> p
+            (:profile/id p) (update :profile/id name)
+            (:profile/dir p) (update :profile/dir #(expand-home home %)))]
+    (cond-> p
+      (:profile/programs p) (update :profile/programs #(normalize-programs home (:profile/dir p) %)))))
 
 (defn normalize-project
-  "Project with a string id and its dir expanded against `home`."
+  "Project with a string id, its dir expanded against `home` and its programs
+   resolved against that dir."
   [home p]
-  (cond-> p
-    (:project/id p) (update :project/id name)
-    (:project/dir p) (update :project/dir #(expand-home home %))))
+  (let [p (cond-> p
+            (:project/id p) (update :project/id name)
+            (:project/dir p) (update :project/dir #(expand-home home %)))]
+    (cond-> p
+      (:project/programs p) (update :project/programs #(normalize-programs home (:project/dir p) %)))))
 
 (defn profiles-file
   "Path of the profiles file `cfg` names, expanded against `home`."
@@ -73,6 +103,7 @@
         s (merge defaults
                  (select-keys cfg (keys defaults))
                  {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
+                  :compose/log-dir (expand-home home (or (:compose/log-dir cfg) default-log-dir))
                   :compose/projects (into {} (map (juxt :project/id identity)) projects)
                   :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})]
     (if-let [problems (schema/explain schema/Settings s)]

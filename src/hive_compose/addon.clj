@@ -1,7 +1,8 @@
 (ns hive-compose.addon
   "IAddon `hive.compose`. Construction is pure. `initialize!` reads the config
    and profiles file, loads the active map and starts the reaper; `shutdown!`
-   stops the reaper. Containers are never touched by the lifecycle itself.
+   stops the reaper. Containers and host programs are never touched by the
+   lifecycle itself.
 
    The reaper is one daemon thread waking every `:compose/tick-seconds`. Its first
    pass adopts running stacks of configured profiles (when `:compose/adopt?`);
@@ -9,11 +10,13 @@
    idle past their TTL.
 
    Config: see `hive-compose.promote.config`. `:compose/engine` injects an
-   IComposeEngine in place of the docker CLI."
+   IComposeEngine in place of the docker CLI, `:compose/runner` an
+   IProgramRunner in place of the host one."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [hive-addon.protocol :as addon]
             [hive-compose.adapter.cli :as cli]
+            [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
@@ -47,6 +50,7 @@
 
 (defn- build-ctx [cfg settings persisted]
   {:engine (or (:compose/engine cfg) (cli/make-engine settings))
+   :runner (or (:compose/runner cfg) (host/make-runner cfg))
    :settings settings
    :state (atom (merge {:active {} :current nil} (select-keys persisted [:active :current])))
    :now (or (:compose/now cfg) now-ms)
@@ -90,7 +94,7 @@
   (or (get params k) (get params (keyword k))))
 
 (def commands
-  ["status" "targets" "up" "switch" "down" "stop" "touch" "ps" "logs" "reap" "adopt" "projects" "reload"])
+  ["status" "targets" "programs" "up" "switch" "down" "stop" "touch" "ps" "logs" "reap" "adopt" "projects" "reload"])
 
 (declare reload!)
 
@@ -105,6 +109,7 @@
       (case command
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
+        "programs" (ops/programs ctx)
         "up" (on-subject #(ops/up-profile! ctx %))
         "switch" (on-subject #(ops/switch-profile! ctx %))
         "down" (on-subject #(ops/down-profile! ctx % :down))
@@ -124,12 +129,15 @@
                      "profile of a configured compose project, e.g. target=sisf-web, target=sisf/frontend, "
                      "target=sisf-web,sisf-crm) and exactly that runs, closed over the YAML's depends_on; "
                      "the section's id is <project>/<targets>. Presets from compose-profiles.edn work via profile=ID. "
-                     "targets: what each project offers. status: active sections, idle time, reaper countdown. "
+                     "A section also starts the host PROGRAMS its project pairs with its services (a shadow-cljs "
+                     "watch, a JVM): a Clojure directory starts with its nREPL, and up/status answer the port. "
+                     "targets: what each project offers. programs: the host programs each project declares, how "
+                     "each starts and whether its nREPL answers. status: active sections, idle time, reaper countdown. "
                      "up: start alongside others. switch: make current, stopping what only the previous one needed. "
-                     "down/stop: remove/stop a section's containers (volumes never), keeping services other active "
-                     "sections need. touch: reset the idle clock (ps/logs touch too). reap: run the idle reaper now. "
-                     "adopt: take charge of running stacks nobody owns. projects: every compose project on the host. "
-                     "reload: re-read config.")
+                     "down/stop: remove/stop a section's containers (volumes never) and stop its programs, keeping "
+                     "what other active sections need. touch: reset the idle clock (ps/logs touch too). reap: run "
+                     "the idle reaper now. adopt: take charge of running stacks nobody owns. projects: every compose "
+                     "project on the host. reload: re-read config.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
                               "target" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] services or native profiles: name, project/name, or a,b"}

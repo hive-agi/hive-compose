@@ -2,6 +2,7 @@
   "Section and profile operations over a context:
 
      {:engine   IComposeEngine
+      :runner   IProgramRunner                   ; optional: host programs
       :settings Settings
       :state    (atom {:active {id Active} :current id-or-nil})
       :now      (fn [] epoch-ms)
@@ -10,10 +11,15 @@
    A subject is a Profile: a configured preset (`lookup`) or a section resolved
    from a target against the configured compose projects (`resolve-target`).
    Every operation answers a Result (reap! and adopt! answer reports). The
-   active map changes only after the engine confirmed the action."
+   active map changes only after the engine confirmed the action.
+
+   A section also holds the host programs paired with its services: they start
+   once its containers are up and stop when the last section holding them is
+   released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
+            [hive-compose.promote.program :as program]
             [hive-compose.promote.target :as target]
             [hive-dsl.result :as r]))
 
@@ -112,6 +118,71 @@
 ;; ---------------------------------------------------------------------------
 ;; release
 
+(defn- runner
+  "The program runner, nil when the context has none or programs are off."
+  [ctx]
+  (when (get-in ctx [:settings :compose/programs?] true) (:runner ctx)))
+
+(defn- live-programs
+  "{program-id Running} of the programs the active entries of `project` hold
+   that are still alive."
+  [ctx project]
+  (if-let [rn (runner ctx)]
+    (into {}
+          (filter (fn [[_ run]] (port/-alive? rn (:pid run))))
+          (program/running-in (:active @(:state ctx)) project nil))
+    {}))
+
+(defn- start-program!
+  "Result<Running>: Program `p` of compose project `project`, completed from the
+   build files of its directory and started."
+  [ctx project p]
+  (let [rn (runner ctx)
+        log (program/log-file (get-in ctx [:settings :compose/log-dir] "logs") project p)]
+    (r/let-ok [facts (port/-facts rn (:program/dir p))
+               ready (program/resolved p facts)
+               started (port/-start! rn ready log)]
+      (r/ok (cond-> {:program/id (:program/id p)
+                     :pid (:pid started)
+                     :log log
+                     :dir (:program/dir p)
+                     :kind (:program/kind ready)
+                     :started-at ((:now ctx))}
+              (:program/nrepl-port ready) (assoc :nrepl-port (:program/nrepl-port ready)))))))
+
+(defn- start-programs!
+  "Start the programs `p` pairs with `services`, reusing the live ones in
+   `carried`. Answers {:held {program-id Running} :report [..]}."
+  [ctx p services carried]
+  (if-not (runner ctx)
+    {:held {} :report []}
+    (reduce (fn [acc prog]
+              (let [id (:program/id prog)]
+                (if-let [run (get carried id)]
+                  (-> acc
+                      (assoc-in [:held id] run)
+                      (update :report conj (assoc run :reused? true)))
+                  (let [res (start-program! ctx (profile/project p) prog)]
+                    (if (r/ok? res)
+                      (-> acc
+                          (assoc-in [:held id] (:ok res))
+                          (update :report conj (assoc (:ok res) :started? true)))
+                      (update acc :report conj {:program/id id :error res}))))))
+            {:held {} :report []}
+            (program/wanted (:profile/programs p) services))))
+
+(defn- stop-programs!
+  "Stop the programs only active entry `id` holds, those in `keep` spared.
+   Answers one report row per program."
+  [ctx id keep]
+  (if-let [rn (runner ctx)]
+    (mapv (fn [[program-id run]]
+            (let [res (port/-halt! rn (:pid run))]
+              (cond-> {:program/id program-id :pid (:pid run) :ok? (r/ok? res)}
+                (r/err? res) (assoc :error res))))
+          (sort-by key (program/release-programs (:active @(:state ctx)) id keep)))
+    []))
+
 (defn- execute! [{:keys [engine]} p {:keys [action services]}]
   (case action
     :stop (port/-stop! engine p services)
@@ -123,12 +194,18 @@
       (update :current #(when-not (= % id) %))))
 
 (defn- release!
-  "Run Release `step`; on success the profile leaves the active map. Answers the
-   step with its :result."
-  [ctx {id :profile/id :as step}]
-  (let [res (r/bind (lookup ctx id) #(execute! ctx % step))]
-    (when (r/ok? res) (swap! (:state ctx) forget id))
-    (assoc step :result res)))
+  "Run Release `step`; on success the profile stops the programs it alone holds
+   (those in `keep` spared) and leaves the active map. Answers the step with its
+   :result."
+  ([ctx step] (release! ctx step #{}))
+  ([ctx {id :profile/id :as step} keep]
+   (let [res (r/bind (lookup ctx id) #(execute! ctx % step))]
+     (if (r/ok? res)
+       (let [stopped (stop-programs! ctx id keep)]
+         (swap! (:state ctx) forget id)
+         (cond-> (assoc step :result res)
+           (seq stopped) (assoc :programs stopped)))
+       (assoc step :result res)))))
 
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
@@ -137,45 +214,57 @@
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
 
-(defn- bring-up! [ctx p services]
+(defn- bring-up!
+  "Start `services` of `p`, then the programs paired with them (`carried` are
+   live ones to reuse), and track the profile as active."
+  [ctx p services carried]
   (let [id (:profile/id p)]
     (r/let-ok [out (port/-up! (:engine ctx) p services)]
-      (let [now ((:now ctx))]
+      (let [now ((:now ctx))
+            {:keys [held report]} (start-programs! ctx p services carried)]
         (swap! (:state ctx) update-in [:active id]
-               (fn [a] {:profile/id id
-                        :project (profile/project p)
-                        :services services
-                        :profile p
-                        :started-at (or (:started-at a) now)
-                        :last-touch now}))
-        (r/ok {:profile id :project (profile/project p) :services services :out (:out out)})))))
+               (fn [a] (cond-> {:profile/id id
+                                :project (profile/project p)
+                                :services services
+                                :profile p
+                                :started-at (or (:started-at a) now)
+                                :last-touch now}
+                         (seq held) (assoc :programs held))))
+        (r/ok (cond-> {:profile id :project (profile/project p) :services services :out (:out out)}
+                (seq report) (assoc :programs report)))))))
 
 (defn up-profile!
   "Bring `p` up alongside whatever is active. Becomes current when nothing is."
   [ctx p]
   (r/let-ok [services (port/-closure (:engine ctx) p)
-             up (bring-up! ctx p services)]
+             up (bring-up! ctx p services (live-programs ctx (profile/project p)))]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
     (persist! ctx)
     (r/ok up)))
 
 (defn switch-profile!
   "Make `p` current: release what only the previous current profile needs, then
-   bring `p` up. Shared services stay up throughout."
+   bring `p` up. Shared services and the programs `p` wants stay up throughout."
   [ctx p]
   (r/let-ok [services (port/-closure (:engine ctx) p)]
     (let [id (:profile/id p)
+          project (profile/project p)
           {:keys [active current]} @(:state ctx)
-          released (mapv #(step-report (release! ctx %))
-                         (plan/switch-releases active current id (profile/project p) services))
-          up (bring-up! ctx p services)]
+          carried (live-programs ctx project)
+          keep (if (= project (get-in active [current :project]))
+                 (into #{} (map :program/id) (program/wanted (:profile/programs p) services))
+                 #{})
+          released (mapv #(step-report (release! ctx % keep))
+                         (plan/switch-releases active current id project services))
+          up (bring-up! ctx p services carried)]
       (when (r/ok? up) (swap! (:state ctx) assoc :current id))
       (persist! ctx)
       (r/map-ok up #(assoc % :released released)))))
 
 (defn down-profile!
   "Take `p` down with `action` (:down removes containers, :stop keeps them;
-   volumes are never touched). Services another active profile needs stay up."
+   volumes are never touched). Services and programs another active profile
+   needs stay up."
   [ctx p action]
   (let [id (:profile/id p)
         active (:active @(:state ctx))]
@@ -183,10 +272,12 @@
                           (r/ok (:services a))
                           (port/-closure (:engine ctx) p))]
       (let [step (plan/down-release active id (profile/project p) services action)
-            res (execute! ctx p step)]
+            res (execute! ctx p step)
+            stopped (when (r/ok? res) (stop-programs! ctx id #{}))]
         (when (r/ok? res) (swap! (:state ctx) forget id))
         (persist! ctx)
-        (r/map-ok res (fn [o] (-> (step-report (assoc step :result res)) (assoc :out (:out o)))))))))
+        (r/map-ok res (fn [o] (cond-> (-> (step-report (assoc step :result res)) (assoc :out (:out o)))
+                                (seq stopped) (assoc :programs stopped))))))))
 
 (defn touch!
   "Reset the idle clock of active profile `id`."
@@ -231,14 +322,16 @@
 
 (defn reconcile!
   "Forget active profiles none of whose services still run (taken down outside
-   the addon). Answers the forgotten ids."
+   the addon), stopping the programs they alone hold. Answers the forgotten ids."
   [ctx]
   (let [dropped (vec (for [[id a] (:active @(:state ctx))
                            :let [running (r/bind (lookup ctx id) #(port/-running (:engine ctx) %))]
                            :when (and (r/ok? running) (not-any? (:ok running) (:services a)))]
                        id))]
     (when (seq dropped)
-      (swap! (:state ctx) #(reduce forget % dropped))
+      (doseq [id dropped]
+        (stop-programs! ctx id #{})
+        (swap! (:state ctx) forget id))
       (persist! ctx))
     dropped))
 
@@ -292,9 +385,20 @@
 ;; ---------------------------------------------------------------------------
 ;; reads
 
+(defn- program-row
+  "What is known of started program `run` right now: alive, and whether its
+   nREPL answers. A port the program chose itself is read from its .nrepl-port."
+  [ctx run]
+  (let [rn (runner ctx)
+        port (or (:nrepl-port run) (when rn (port/-nrepl-port rn (:dir run))))]
+    (cond-> (select-keys run [:program/id :pid :kind :log :dir])
+      rn (assoc :alive? (port/-alive? rn (:pid run)))
+      port (assoc :nrepl-port port)
+      (and rn port) (assoc :nrepl-ready? (port/-listening? rn port)))))
+
 (defn status
-  "Every configured preset and every active section, with activity and reaper
-   countdown."
+  "Every configured preset and every active section, with activity, reaper
+   countdown and the host programs it holds."
   [ctx]
   (let [{:keys [settings]} ctx
         {:keys [active current]} @(:state ctx)
@@ -310,13 +414,37 @@
                   (:profile/description p) (assoc :description (:profile/description p))
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
-                           :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000))))))]
+                           :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
+                  (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
+                                                             (sort-by key (:programs a)))))))]
     {:current current
      :projects (vec (sort (keys (:compose/projects settings))))
      :profiles (into (mapv (fn [[id p]] (row id p)) (sort-by key (:compose/profiles settings)))
                      (for [[id a] (sort-by key active)
                            :when (not (configured ctx id))]
                        (assoc (row id (:profile a)) :section? true)))}))
+
+(defn programs
+  "Result<[row]>: every program the configured projects declare, as it would
+   start (kind, command, nREPL port, the services it is paired with) and, when
+   it runs, its pid and whether its nREPL answers."
+  [ctx]
+  (let [rn (runner ctx)]
+    (r/ok
+     (vec
+      (for [[id proj] (sort-by key (get-in ctx [:settings :compose/projects]))
+            :let [project (profile/project (target/project-profile proj))
+                  live (live-programs ctx project)]
+            p (:project/programs proj)
+            :let [ready (if rn
+                          (r/bind (port/-facts rn (:program/dir p)) #(program/resolved p %))
+                          (r/ok p))
+                  run (get live (:program/id p))]]
+        (cond-> {:project id :program/id (:program/id p) :dir (:program/dir p)
+                 :with (vec (:program/with p)) :running? (some? run)}
+          (r/ok? ready) (merge (select-keys (:ok ready) [:program/kind :program/command :program/nrepl-port]))
+          (r/err? ready) (assoc :error ready)
+          run (merge (program-row ctx run))))))))
 
 (defn targets
   "Result<[{:project :services :profiles}]>: what can be named as a target in each

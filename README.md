@@ -54,11 +54,58 @@ sisf-web:
 With that, `up target=sisf-web` brings envoy and envoy's own closure (auth,
 keycloak, postgres, redis...) and nothing else.
 
+## Host programs: what runs beside the containers
+
+A dev stack is rarely containers alone: a shadow-cljs watch or a JVM runs on the
+host and the containers proxy to it. Declare those as programs of the project,
+and a section starts them once its containers are up:
+
+```clojure
+{:compose/projects
+ [{:project/id "sisf"
+   :project/dir "~/PP/funeraria/dc"
+   :project/programs
+   [{:program/id "sisf-web"
+     :program/dir "../sisf-web"          ; relative to :project/dir, or absolute, or ~
+     :program/with ["envoy"]}            ; starts with a section that runs envoy
+    {:program/id "inventory"
+     :program/dir "../inventory"
+     :program/kind :deps                 ; the directory also has a shadow-cljs.edn
+     :program/with ["inventory-frontend-dev"]}]}]}
+```
+
+A directory with a Clojure build file needs no command. The build file decides
+how it starts, and it always starts with an nREPL:
+
+| build file | starts as | nREPL port |
+|---|---|---|
+| `shadow-cljs.edn` | `npx shadow-cljs watch <every build>` | its `:nrepl {:port N}` |
+| `deps.edn` with an `:nrepl` alias | `clojure -M:nrepl` | the alias's `--port` |
+| `deps.edn` without one | `clojure -Sdeps <nrepl + cider-nrepl> -M -m nrepl.cmdline` | `:program/nrepl-port`, else the `.nrepl-port` it writes |
+| `project.clj` | `lein repl :headless` | `:program/nrepl-port` |
+| `bb.edn` | `bb nrepl-server` | `:program/nrepl-port` (1667) |
+
+`:program/command` (an argv or a shell string) replaces the detected command,
+and the port is still read from the build file; any other directory needs one.
+`:program/kind` picks the build file when a directory has several,
+`:program/env` adds environment, `:program/with` names the services the program
+pairs with (none: every section of the project).
+
+`up` answers each program's pid, log and nREPL port; `status` and `programs`
+say whether the process lives and whether the port answers yet. A program two
+sections want runs once and stops with the last of them, on `down`, `stop`,
+`switch` or the reaper. It runs detached in its own process group, with output
+appended to `~/.local/state/hive-compose/logs/<project>-<program>.log`, and is
+tracked by pid, so it survives a restart of the host and is still stopped
+afterwards. A program that fails to start is reported and never fails the
+section.
+
 ## Tool `compose`
 
 | command | effect |
 |---|---|
 | `targets` | what each configured project offers |
+| `programs` | the host programs each project declares, how each starts, and whether its nREPL answers |
 | `up target=… \| profile=…` | start a section alongside whatever runs |
 | `switch target=…` | make it current; stop what only the previous section needed |
 | `down` / `stop` | remove / stop a section's containers, sparing services other active sections need |
@@ -102,7 +149,8 @@ Named presets in `~/.config/hive-mcp/compose-profiles.edn`, used with `profile=I
 `:compose/default-idle-action` (`:stop`), `:compose/tick-seconds` (60),
 `:compose/profiles`, `:compose/profiles-file`, `:compose/state-file`,
 `:compose/timeout-ms` (60000), `:compose/up-timeout-ms` (600000),
-`:compose/adopt?` (true).
+`:compose/adopt?` (true), `:compose/programs?` (true), `:compose/log-dir`,
+`:compose/stop-grace-ms` (5000, before a program's group is killed).
 
 ## Development
 
