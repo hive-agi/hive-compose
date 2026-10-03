@@ -4,7 +4,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.stub :as stub]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [hive-compose.promote.profile :as profile]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -109,6 +110,47 @@
     (swap! (:clock c) + (* 61 minute))
     (ops/reap! c)
     (is (= #{} (stub/running (:engine c) "shop")))))
+
+(deftest reaping-a-section-spares-what-an-adopted-one-depends-on
+  (let [c (ctx {"shop" #{"auth" "redis"}})]
+    (up-target! c "postgres")
+    (is (= ["shop/adopted"] (ops/adopt! c)))
+    (is (= ["auth" "postgres" "redis"] (get-in @(:state c) [:active "shop/adopted" :needs]))
+        "auth depends on postgres, which shop/postgres started")
+    (swap! (:clock c) + (* 30 minute))
+    (ops/touch! c "shop/adopted")
+    (swap! (:clock c) + (* 31 minute))
+    (is (= ["shop/postgres"] (mapv :profile/id (:reaped (ops/reap! c)))))
+    (is (contains? (stub/running (:engine c) "shop") "postgres")
+        "the idle postgres section leaves postgres to the section still using it")
+    (swap! (:clock c) + (* 61 minute))
+    (ops/reap! c)
+    (is (= #{} (stub/running (:engine c) "shop")) "the last user takes it down")))
+
+(deftest no-deps-starts-only-the-named-services-but-still-needs-the-rest
+  (let [c (ctx)
+        res (r/bind (ops/subject c {:target "web"})
+                    #(ops/up-profile! c (profile/with-call-options % {:no-deps? true})))]
+    (is (= ["web"] (:services (:ok res))))
+    (is (= [:up "shop" ["web"]] (last (stub/calls (:engine c)))))
+    (is (= ["auth" "envoy" "keycloak" "postgres" "redis" "web"]
+           (get-in @(:state c) [:active "shop/web" :needs])))))
+
+(deftest projects-sharing-a-compose-project-adopt-each-stray-once
+  (let [c (assoc (ctx {"shop" #{"ledger"}})
+                 :settings (assoc-in settings [:compose/projects "shop-live"]
+                                     {:project/id "shop-live" :project/dir "/w/shop"}))]
+    (is (= ["shop/adopted"] (ops/adopt! c)))
+    (is (= ["shop/adopted"] (keys (:active @(:state c)))))))
+
+(deftest touch-without-a-target-touches-every-active-section
+  (let [c (ctx)]
+    (up-target! c "web")
+    (up-target! c "ghost")
+    (swap! (:clock c) + (* 10 minute))
+    (is (= ["blog/ghost"] (:touched (:ok (ops/touch-all! c "blog")))))
+    (is (= ["blog/ghost" "shop/web"] (:touched (:ok (ops/touch-all! c nil)))))
+    (is (every? #(= (* 10 minute) (:last-touch %)) (vals (:active @(:state c)))))))
 
 (deftest targets-lists-what-each-project-offers
   (let [rows (:ok (ops/targets (ctx)))]

@@ -49,6 +49,7 @@
   (-> (base-argv p)
       (into ["up" "-d"])
       (cond-> (:profile/wait? p) (conj "--wait"))
+      (cond-> (:profile/no-deps? p) (conj "--no-deps"))
       (into services)))
 
 (defn stop-argv [p services]

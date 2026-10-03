@@ -53,6 +53,7 @@
    [:profile/programs {:optional true} [:vector Program]]
    [:profile/env {:optional true} [:map-of :string :string]]
    [:profile/wait? {:optional true} :boolean]
+   [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
    [:profile/description {:optional true} :string]])
@@ -60,11 +61,14 @@
 (def Active
   "A profile this addon brought up (or adopted) and still answers for. `:profile`
    is the Profile it ran with, so it can be released after leaving the config.
-   `:programs` are the host programs it holds, by program id."
+   `:needs` is the depends_on closure of `:services` when it is wider (a section
+   started with no-deps, an adopted one); release spares what any other entry
+   needs. `:programs` are the host programs it holds, by program id."
   [:map
    [:profile/id ProfileId]
    [:project :string]
    [:services [:vector :string]]
+   [:needs {:optional true} [:vector :string]]
    [:started-at :int]
    [:last-touch :int]
    [:programs {:optional true} [:map-of :string Running]]

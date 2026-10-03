@@ -34,6 +34,11 @@
   (testing "down never removes volumes"
     (is (not-any? #{"-v" "--volumes"} (cli/down-argv profile ["api"])))))
 
+(deftest up-argv-carries-the-call-options
+  (is (= ["up" "-d" "--wait" "--no-deps" "api"]
+         (take-last 5 (cli/up-argv (assoc profile :profile/wait? true :profile/no-deps? true) ["api"]))))
+  (is (not-any? #{"--no-deps"} (cli/up-argv (assoc profile :profile/no-deps? false) ["api"]))))
+
 (deftest parses-both-ps-formats
   (let [ndjson "{\"Service\":\"db\",\"State\":\"running\"}\n{\"Service\":\"api\",\"State\":\"exited\"}\n"
         array "[{\"Service\":\"db\",\"State\":\"running\"},{\"Service\":\"web\",\"State\":\"running\"}]"]
