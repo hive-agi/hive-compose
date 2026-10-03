@@ -6,21 +6,27 @@
 
 ;; SPDX-License-Identifier: MIT
 
+(defn footprint
+  "What active entry `a` keeps alive: the services it runs and the depends_on
+   closure they need (`:needs`), which may hold services another entry started."
+  [a]
+  (into (set (:services a)) (:needs a)))
+
 (defn needed-by-others
   "Services of `project` that active profiles other than `id` need."
   [active project id]
   (into #{}
         (comp (remove (fn [[k _]] (= k id)))
               (filter (fn [[_ a]] (= project (:project a))))
-              (mapcat (fn [[_ a]] (:services a))))
+              (mapcat (fn [[_ a]] (footprint a))))
         active))
 
 (defn release-services
-  "Sorted services of active profile `id` that no other active profile of its
-   project needs."
+  "Sorted services of active profile `id`'s footprint that no other active
+   profile of its project needs."
   [active id]
-  (let [{:keys [project services]} (get active id)]
-    (vec (sort (remove (needed-by-others active project id) services)))))
+  (let [{:keys [project] :as a} (get active id)]
+    (vec (sort (remove (needed-by-others active project id) (footprint a))))))
 
 (defn switch-releases
   "Release steps for moving from `current` to `next-id`, which needs

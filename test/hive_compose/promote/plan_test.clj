@@ -30,6 +30,15 @@
     (is (= ["web"] (plan/release-services active "web")))
     (is (= ["api"] (plan/release-services active "x")) "other projects never share")))
 
+(deftest release-spares-what-another-entry-depends-on
+  (let [active {"db" (active-entry "db" "shop" ["postgres"] 0)
+                "adopted" (assoc (active-entry "adopted" "shop" ["api"] 0) :needs ["api" "postgres"])}]
+    (is (= [] (plan/release-services active "db"))
+        "postgres stays: the adopted api depends on it though db started it")
+    (is (= ["api"] (plan/release-services active "adopted")))
+    (testing "the last entry needing a dependency releases it"
+      (is (= ["api" "postgres"] (plan/release-services (dissoc active "db") "adopted"))))))
+
 (deftest switch-releases-only-what-next-does-not-share
   (let [active {"api" (active-entry "api" "shop" ["api" "postgres" "redis"] 0)}]
     (testing "same project: shared services stay"

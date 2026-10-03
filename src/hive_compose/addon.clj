@@ -21,7 +21,8 @@
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
             [hive-compose.port :as port]
-            [hive-dsl.result :as r])
+            [hive-dsl.result :as r]
+            [hive-compose.promote.profile :as profile])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -93,35 +94,76 @@
 (defn- param [params k]
   (or (get params k) (get params (keyword k))))
 
+(def command-help
+  "One line per command: what it does and the params it reads."
+  (array-map
+   "help" "this list"
+   "status" "active sections: services, idle time, reaper countdown, host programs"
+   "targets" "what each configured project offers as a target: services and native profiles"
+   "programs" "host programs each project declares, how each starts, whether its nREPL answers"
+   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value}"
+   "switch" "make a section current, stopping what only the previous one needed. same params as up"
+   "down" "remove a section's containers (never volumes), keeping what other sections need. target|profile"
+   "stop" "stop a section's containers, keeping what other sections need. target|profile"
+   "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
+   "ps" "what a section needs and which of it runs. target|profile"
+   "logs" "last log lines of a section. target|profile; tail"
+   "reap" "run the idle reaper now"
+   "adopt" "take charge of running containers no section owns"
+   "projects" "every compose project on the host"
+   "reload" "re-read the config"))
+
 (def commands
-  ["status" "targets" "programs" "up" "switch" "down" "stop" "touch" "ps" "logs" "reap" "adopt" "projects" "reload"])
+  (vec (keys command-help)))
 
 (declare reload!)
+
+(defn- flag
+  "A boolean param as sent over MCP (true, \"true\"), nil when absent."
+  [params k]
+  (let [v (param params k)]
+    (cond (nil? v) nil
+          (string? v) (= "true" (str/lower-case v))
+          :else (boolean v))))
+
+(defn- call-options
+  "The per-call options of `up`/`switch`, from the tool params."
+  [params]
+  {:no-deps? (flag params "no_deps")
+   :wait? (flag params "wait")
+   :env (some->> (param params "env")
+                 (into {} (map (fn [[k v]] [(name k) (str v)]))))})
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
-        on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))]
-    (if (nil? ctx)
-      (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
-                                       :errors (:errors @(:state a))})
+        on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))
+        opts (call-options params)]
+    (cond
+      (= "help" command) (r/ok {:commands command-help})
+      (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
+                                                  :errors (:errors @(:state a))})
+      :else
       (case command
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (on-subject #(ops/up-profile! ctx %))
-        "switch" (on-subject #(ops/switch-profile! ctx %))
+        "up" (on-subject #(ops/up-profile! ctx (profile/with-call-options % opts)))
+        "switch" (on-subject #(ops/switch-profile! ctx (profile/with-call-options % opts)))
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
-        "touch" (on-subject #(ops/touch! ctx (:profile/id %)))
+        "touch" (if (or tgt id)
+                  (on-subject #(ops/touch! ctx (:profile/id %)))
+                  (ops/touch-all! ctx (some-> (param params "project") str)))
         "ps" (on-subject #(ops/ps-profile ctx %))
         "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
         "reload" (reload! a)
-        (r/err :compose/unknown-command {:command command :known commands})))))
+        (r/err :compose/unknown-command {:command command :known commands
+                                         :hint "command=help lists what each does"})))))
 
 (defn tool [a]
   {:name "compose"
@@ -131,17 +173,19 @@
                      "the section's id is <project>/<targets>. Presets from compose-profiles.edn work via profile=ID. "
                      "A section also starts the host PROGRAMS its project pairs with its services (a shadow-cljs "
                      "watch, a JVM): a Clojure directory starts with its nREPL, and up/status answer the port. "
-                     "targets: what each project offers. programs: the host programs each project declares, how "
-                     "each starts and whether its nREPL answers. status: active sections, idle time, reaper countdown. "
-                     "up: start alongside others. switch: make current, stopping what only the previous one needed. "
-                     "down/stop: remove/stop a section's containers (volumes never) and stop its programs, keeping "
-                     "what other active sections need. touch: reset the idle clock (ps/logs touch too). reap: run "
-                     "the idle reaper now. adopt: take charge of running stacks nobody owns. projects: every compose "
-                     "project on the host. reload: re-read config.")
+                     "A section keeps alive everything its services depend on, so releasing or reaping another "
+                     "section never stops a dependency this one needs. "
+                     "up/switch take no_deps (start only the named services, e.g. past a failing migration), "
+                     "wait (until healthy) and env. touch with no target resets every active section. "
+                     "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
                               "target" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] preset or active section id"}
+                              "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
+                              "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
+                              "env" {:type "object" :description "[up|switch] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}"}
+                              "project" {:type "string" :description "[touch] with no target: only the sections of this project"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
    :handler (fn [params]

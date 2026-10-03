@@ -228,12 +228,14 @@
 
 (defn- bring-up!
   "Start `services` of `p`, then the programs paired with them (`carried` are
-   live ones to reuse), and track the profile as active."
-  [ctx p services carried]
+   live ones to reuse), and track the profile as active. `needs` is the
+   depends_on closure of `services`, kept when wider so release spares it."
+  [ctx p services needs carried]
   (let [id (:profile/id p)]
     (r/let-ok [out (port/-up! (:engine ctx) p services)]
       (let [now ((:now ctx))
-            {:keys [held report]} (start-programs! ctx p services carried)]
+            {:keys [held report]} (start-programs! ctx p services carried)
+            wider (seq (remove (set services) needs))]
         (swap! (:state ctx) update-in [:active id]
                (fn [a] (cond-> {:profile/id id
                                 :project (profile/project p)
@@ -241,15 +243,18 @@
                                 :profile p
                                 :started-at (or (:started-at a) now)
                                 :last-touch now}
+                         wider (assoc :needs (vec needs))
                          (seq held) (assoc :programs held))))
         (r/ok (cond-> {:profile id :project (profile/project p) :services services :out (:out out)}
+                wider (assoc :needs (vec needs))
                 (seq report) (assoc :programs report)))))))
 
 (defn up-profile!
   "Bring `p` up alongside whatever is active. Becomes current when nothing is."
   [ctx p]
-  (r/let-ok [services (port/-closure (:engine ctx) p)
-             up (bring-up! ctx p services (live-programs ctx (profile/project p)))]
+  (r/let-ok [closure (port/-closure (:engine ctx) p)
+             up (bring-up! ctx p (profile/up-services p closure) closure
+                           (live-programs ctx (profile/project p)))]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
     (persist! ctx)
     (r/ok up)))
@@ -258,17 +263,18 @@
   "Make `p` current: release what only the previous current profile needs, then
    bring `p` up. Shared services and the programs `p` wants stay up throughout."
   [ctx p]
-  (r/let-ok [services (port/-closure (:engine ctx) p)]
+  (r/let-ok [closure (port/-closure (:engine ctx) p)]
     (let [id (:profile/id p)
           project (profile/project p)
+          services (profile/up-services p closure)
           {:keys [active current]} @(:state ctx)
           carried (live-programs ctx project)
           keep (if (= project (get-in active [current :project]))
                  (into #{} (map :program/id) (program/wanted (:profile/programs p) services))
                  #{})
           released (mapv #(step-report (release! ctx % keep))
-                         (plan/switch-releases active current id project services))
-          up (bring-up! ctx p services carried)]
+                         (plan/switch-releases active current id project closure))
+          up (bring-up! ctx p services closure carried)]
       (when (r/ok? up) (swap! (:state ctx) assoc :current id))
       (persist! ctx)
       (r/map-ok up #(assoc % :released released)))))
@@ -300,6 +306,23 @@
       (persist! ctx)
       (r/ok {:profile id :last-touch now}))
     (r/err :compose/not-active {:profile id})))
+
+(defn touch-all!
+  "Reset the idle clock of every active profile, or only those of compose
+   project `project` (the configured project id is accepted too)."
+  [ctx project]
+  (let [compose-name (some->> project
+                              (get (get-in ctx [:settings :compose/projects]))
+                              target/project-profile
+                              profile/project)
+        names (set (remove nil? [project compose-name]))
+        wanted? (fn [a] (or (nil? project) (contains? names (:project a))))
+        ids (vec (sort (for [[id a] (:active @(:state ctx)) :when (wanted? a)] id)))
+        now ((:now ctx))]
+    (swap! (:state ctx) update :active
+           (fn [m] (reduce #(assoc-in %1 [%2 :last-touch] now) m ids)))
+    (when (seq ids) (persist! ctx))
+    (r/ok {:touched ids :last-touch now})))
 
 (defn- touch-if-active! [ctx p]
   (when (active-entry ctx (:profile/id p)) (touch! ctx (:profile/id p))))
@@ -356,15 +379,20 @@
     (when (seq reaped) (persist! ctx))
     {:reconciled reconciled :reaped reaped}))
 
-(defn- adopt-entry [p services now]
-  {:profile/id (:profile/id p) :project (profile/project p) :services (vec services)
-   :profile p :started-at now :last-touch now})
+(defn- adopt-entry
+  ([p services now] (adopt-entry p services services now))
+  ([p services needs now]
+   (cond-> {:profile/id (:profile/id p) :project (profile/project p) :services (vec services)
+            :profile p :started-at now :last-touch now}
+     (seq (remove (set services) needs)) (assoc :needs (vec needs)))))
 
 (defn adopt!
   "Take charge, with a fresh idle clock, of what runs without an owner:
    configured presets that are running, and the running services of configured
    compose projects that no active profile accounts for (as section
-   `<project>/adopted`). Answers the adopted ids."
+   `<project>/adopted`, needing their depends_on closure). Configured projects
+   that share one compose project adopt each stray once, in id order. Answers
+   the adopted ids."
   [ctx]
   (let [{:keys [engine settings]} ctx
         now ((:now ctx))
@@ -376,20 +404,32 @@
                            :when (and (r/ok? running) (some (:ok running) (:ok closure)))]
                        (adopt-entry p (:ok closure) now)))
         _ (swap! (:state ctx) update :active into (map (juxt :profile/id identity)) presets)
-        owned (fn [project] (into #{} (comp (filter #(= project (:project %))) (mapcat :services))
-                                  (vals (:active @(:state ctx)))))
-        strays (vec (for [[_ proj] (sort-by key (:compose/projects settings))
-                          :let [whole (target/project-profile proj)
-                                running (port/-running engine whole)]
-                          :when (r/ok? running)
-                          :let [unowned (remove (owned (profile/project whole)) (:ok running))]
-                          :when (seq unowned)]
-                      (adopt-entry (target/section proj ["adopted"] unowned) unowned now)))
+        owned (fn [project taken]
+                (into #{} (comp (filter #(= project (:project %))) (mapcat :services))
+                      (concat (vals (:active @(:state ctx))) taken)))
+        strays (reduce (fn [taken [_ proj]]
+                         (let [whole (target/project-profile proj)
+                               running (port/-running engine whole)
+                               unowned (when (r/ok? running)
+                                         (vec (remove (owned (profile/project whole) taken) (:ok running))))]
+                           (if (seq unowned)
+                             (let [closure (port/-closure engine (assoc whole :profile/services unowned))
+                                   needs (if (r/ok? closure) (:ok closure) unowned)]
+                               (conj taken (adopt-entry (target/section proj ["adopted"] unowned)
+                                                        unowned needs now)))
+                             taken)))
+                       []
+                       (sort-by key (:compose/projects settings)))
+        merge-entry (fn [old e]
+                      (if old
+                        (cond-> (update old :services (comp vec distinct into) (:services e))
+                          (or (:needs old) (:needs e))
+                          (update :needs (comp vec distinct into) (or (:needs e) (:services e))))
+                        e))
         adopted (into presets strays)]
     (when (seq strays)
       (swap! (:state ctx) update :active
-             (fn [active] (reduce (fn [m e] (update m (:profile/id e)
-                                                     #(if % (update % :services (comp vec distinct into) (:services e)) e)))
+             (fn [active] (reduce (fn [m e] (update m (:profile/id e) merge-entry e))
                                   active strays))))
     (when (seq adopted) (persist! ctx))
     (mapv :profile/id adopted)))
