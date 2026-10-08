@@ -1,0 +1,29 @@
+{:fresh
+ {:profile/id "shop/adopted",
+  :project "shop",
+  :services ["minio"],
+  :profile #:profile{:id "shop/adopted", :services ["minio"]},
+  :started-at 5,
+  :last-touch 5},
+ :merge
+ {:profile/id "shop/adopted",
+  :project "shop",
+  :services ["ledger" "minio"],
+  :profile #:profile{:id "shop/adopted", :services ["ledger" "minio"]},
+  :started-at 0,
+  :last-touch 0},
+ :needs
+ {:profile/id "shop/adopted",
+  :project "shop",
+  :services ["ledger" "minio"],
+  :profile #:profile{:id "shop/adopted", :services ["ledger" "minio"]},
+  :started-at 0,
+  :last-touch 0,
+  :needs ["ledger" "postgres" "minio" "redis"]},
+ :overlap
+ {:profile/id "shop/adopted",
+  :project "shop",
+  :services ["ledger" "minio"],
+  :profile #:profile{:id "shop/adopted", :services ["ledger" "minio"]},
+  :started-at 0,
+  :last-touch 0}}

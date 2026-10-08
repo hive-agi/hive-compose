@@ -386,6 +386,22 @@
             :profile p :started-at now :last-touch now}
      (seq (remove (set services) needs)) (assoc :needs (vec needs)))))
 
+(defn merge-adopted
+  "Active entry `old` with the newly adopted strays of entry `e` folded in;
+   `e` itself when there is no `old`. Pure.
+
+   The `:profile` snapshot's `:profile/services` follows the merged
+   `:services`: logs and ps address a section through that snapshot, so a
+   stale one would keep naming the subset adopted first."
+  [old e]
+  (if old
+    (let [services (vec (distinct (into (:services old) (:services e))))]
+      (cond-> (assoc old :services services)
+        (:profile old) (assoc-in [:profile :profile/services] services)
+        (or (:needs old) (:needs e))
+        (update :needs (comp vec distinct into) (or (:needs e) (:services e)))))
+    e))
+
 (defn adopt!
   "Take charge, with a fresh idle clock, of what runs without an owner:
    configured presets that are running, and the running services of configured
@@ -420,16 +436,10 @@
                              taken)))
                        []
                        (sort-by key (:compose/projects settings)))
-        merge-entry (fn [old e]
-                      (if old
-                        (cond-> (update old :services (comp vec distinct into) (:services e))
-                          (or (:needs old) (:needs e))
-                          (update :needs (comp vec distinct into) (or (:needs e) (:services e))))
-                        e))
         adopted (into presets strays)]
     (when (seq strays)
       (swap! (:state ctx) update :active
-             (fn [active] (reduce (fn [m e] (update m (:profile/id e) merge-entry e))
+             (fn [active] (reduce (fn [m e] (update m (:profile/id e) merge-adopted e))
                                   active strays))))
     (when (seq adopted) (persist! ctx))
     (mapv :profile/id adopted)))
