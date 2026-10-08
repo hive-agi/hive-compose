@@ -30,7 +30,8 @@
            :merge [old-entry new-entry]
            :overlap [old-entry (assoc new-entry :services ["ledger" "minio"])]
            :needs [(assoc old-entry :needs ["ledger" "postgres"])
-                   (assoc new-entry :needs ["minio" "redis"])]}
+                   (assoc new-entry :needs ["minio" "redis"])]
+           :needs-new-only [old-entry (assoc new-entry :needs ["minio" "redis"])]}
    :gen (gen/fmap (fn [[a b]]
                     [(assoc old-entry :services a :profile {:profile/services a})
                      (assoc new-entry :services b)])
@@ -46,4 +47,7 @@
                (is (= ["ledger" "minio"] (get-in r [:profile :profile/services]))
                    "the snapshot logs/ps read follows the merged services")
                (is (= 0 (:started-at r)) "the existing entry keeps its clock"))
+             (is (= ["ledger" "minio" "redis"]
+                    (:needs (ops/merge-adopted old-entry (assoc new-entry :needs ["minio" "redis"]))))
+                 "an entry without :needs still needs its own services")
              (is (= new-entry (ops/merge-adopted nil new-entry))))})

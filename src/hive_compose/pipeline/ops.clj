@@ -392,14 +392,17 @@
 
    The `:profile` snapshot's `:profile/services` follows the merged
    `:services`: logs and ps address a section through that snapshot, so a
-   stale one would keep naming the subset adopted first."
+   stale one would keep naming the subset adopted first. An entry without
+   `:needs` needs exactly its `:services`, so a merged `:needs` starts from
+   whichever of the two `old` carries."
   [old e]
   (if old
     (let [services (vec (distinct (into (:services old) (:services e))))]
       (cond-> (assoc old :services services)
         (:profile old) (assoc-in [:profile :profile/services] services)
         (or (:needs old) (:needs e))
-        (update :needs (comp vec distinct into) (or (:needs e) (:services e)))))
+        (assoc :needs (vec (distinct (into (or (:needs old) (:services old))
+                                           (or (:needs e) (:services e))))))))
     e))
 
 (defn adopt!
