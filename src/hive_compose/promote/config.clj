@@ -6,6 +6,9 @@
      :compose/profiles             [Profile ..] or {id Profile}, inline
      :compose/profiles-file        EDN file of the same shape
                                    (default ~/.config/hive-mcp/compose-profiles.edn)
+     :compose/projects             {id Project}: compose projects whose services
+                                   and native profiles are addressable as targets
+                                   (`<project>/<target>`)
      :compose/default-ttl-minutes  idle minutes before the reaper acts (default 60)
      :compose/default-idle-action  :stop | :down | :none (default :stop)
      :compose/tick-seconds         reaper period (default 60)
