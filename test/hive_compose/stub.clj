@@ -69,6 +69,11 @@
     (or (fault world :down)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
+  (-restart! [_ p services recreate?]
+    (record! world [(if recreate? :recreate :restart) (profile/project p) (vec services)])
+    (or (fault world :restart)
+        (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
+            (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
     (r/ok {:out "log"})))

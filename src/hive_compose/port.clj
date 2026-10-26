@@ -22,6 +22,9 @@
     "Result<{:out}>: stop `services`, keeping containers and volumes. Empty is a no-op.")
   (-down! [e profile services]
     "Result<{:out}>: remove the containers of `services`, never volumes. Empty is a no-op.")
+  (-restart! [e profile services recreate?]
+    "Result<{:out}>: restart the containers of `services` in place, or, when
+     `recreate?`, recreate them (never their depends_on, never volumes). Empty is a no-op.")
   (-logs [e profile services tail]
     "Result<{:out}>: the last `tail` log lines of `services` (all when empty)."))
 

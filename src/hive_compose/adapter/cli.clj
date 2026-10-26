@@ -58,6 +58,15 @@
 (defn down-argv [p services]
   (-> (base-argv p) (conj "down") (into services)))
 
+(defn restart-argv
+  "`compose restart` of `services`, or when `recreate?` an `up -d
+   --force-recreate --no-deps` of exactly them: their dependencies are left
+   as they are."
+  [p services recreate?]
+  (-> (base-argv p)
+      (into (if recreate? ["up" "-d" "--force-recreate" "--no-deps"] ["restart"]))
+      (into services)))
+
 (defn logs-argv [p services tail]
   (-> (base-argv p) (into ["logs" "--no-color" "--tail" (str tail)]) (into services)))
 
@@ -141,6 +150,8 @@
     (act exec p (stop-argv p services) timeout-ms services))
   (-down! [_ p services]
     (act exec p (down-argv p services) timeout-ms services))
+  (-restart! [_ p services recreate?]
+    (act exec p (restart-argv p services recreate?) (if recreate? up-timeout-ms timeout-ms) services))
   (-logs [_ p services tail]
     (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)}))))
 

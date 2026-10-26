@@ -22,7 +22,8 @@
             [hive-compose.promote.config :as config]
             [hive-compose.port :as port]
             [hive-dsl.result :as r]
-            [hive-compose.promote.profile :as profile])
+            [hive-compose.promote.profile :as profile]
+            [hive-compose.pipeline.restart :as restart])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -103,8 +104,9 @@
    "programs" "host programs each project declares, how each starts, whether its nREPL answers"
    "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value}"
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
-   "down" "remove a section's containers (never volumes), keeping what other sections need. target|profile"
-   "stop" "stop a section's containers, keeping what other sections need. target|profile"
+   "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
+   "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
+   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on). target|profile; env"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
@@ -153,6 +155,8 @@
         "switch" (on-subject #(ops/switch-profile! ctx (profile/with-call-options % opts)))
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
+        "restart" (on-subject #(restart/restart-profile! ctx (profile/with-call-options % opts)
+                                                         (flag params "recreate")))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -174,17 +178,20 @@
                      "A section also starts the host PROGRAMS its project pairs with its services (a shadow-cljs "
                      "watch, a JVM): a Clojure directory starts with its nREPL, and up/status answer the port. "
                      "A section keeps alive everything its services depend on, so releasing or reaping another "
-                     "section never stops a dependency this one needs. "
+                     "section never stops a dependency this one needs; down/stop name what they kept and why. "
+                     "restart recycles the named services in place (recreate=true recreates them) even when "
+                     "another section needs them. "
                      "up/switch take no_deps (start only the named services, e.g. past a failing migration), "
                      "wait (until healthy) and env. touch with no target resets every active section. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
-                              "target" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
-                              "profile" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] preset or active section id"}
+                              "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
+                              "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
                               "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
-                              "env" {:type "object" :description "[up|switch] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}"}
+                              "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
+                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
