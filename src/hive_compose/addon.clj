@@ -11,7 +11,8 @@
 
    Config: see `hive-compose.promote.config`. `:compose/engine` injects an
    IComposeEngine in place of the docker CLI, `:compose/runner` an
-   IProgramRunner in place of the host one."
+   IProgramRunner in place of the host one, `:compose/resolver` the
+   {scheme ISecretBackend} env references are read through in place of `pass`."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [hive-addon.protocol :as addon]
@@ -20,7 +21,9 @@
             [hive-compose.boundary.files :as files]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
+            [hive-compose.promote.env :as env]
             [hive-compose.port :as port]
+            [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
             [hive-compose.promote.profile :as profile]
             [hive-compose.pipeline.restart :as restart])
@@ -51,7 +54,8 @@
       (config/settings cfg file-profiles home))))
 
 (defn- build-ctx [cfg settings persisted]
-  {:engine (or (:compose/engine cfg) (cli/make-engine settings))
+  {:engine (or (:compose/engine cfg)
+               (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
    :runner (or (:compose/runner cfg) (host/make-runner cfg))
    :settings settings
    :state (atom (merge {:active {} :current nil} (select-keys persisted [:active :current])))
@@ -102,7 +106,7 @@
    "status" "active sections: services, idle time, reaper countdown, host programs"
    "targets" "what each configured project offers as a target: services and native profiles"
    "programs" "host programs each project declares, how each starts, whether its nREPL answers"
-   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value}"
+   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value | VAR {\"pass\": path}}"
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
    "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
    "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
@@ -129,19 +133,31 @@
           :else (boolean v))))
 
 (defn- call-options
-  "The per-call options of `up`/`switch`, from the tool params."
+  "The per-call options of `up`/`switch`/`restart`, from the tool params. An
+   env value {\"pass\" path} stays a reference, read only when containers are
+   created."
   [params]
   {:no-deps? (flag params "no_deps")
    :wait? (flag params "wait")
    :env (some->> (param params "env")
-                 (into {} (map (fn [[k v]] [(name k) (str v)]))))})
+                 (into {} (map (fn [[k v]] [(name k) (env/from-param v)]))))})
+
+(defn- checked-options
+  "Result<opts>: `opts` when its env is an Env, else why not. The problems
+   name the variable and the rule broken, never a value."
+  [opts]
+  (if-let [problems (some->> (:env opts) (schema/explain schema/Env))]
+    (r/err :compose/invalid-param {:param "env" :problems problems
+                                   :hint "a value is a string or {\"pass\": \"<store path>\"}"})
+    (r/ok opts)))
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
         on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))
-        opts (call-options params)]
+        opts (call-options params)
+        with-opts (fn [f] (r/bind (checked-options opts) (fn [o] (on-subject #(f (profile/with-call-options % o))))))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
@@ -151,12 +167,11 @@
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (on-subject #(ops/up-profile! ctx (profile/with-call-options % opts)))
-        "switch" (on-subject #(ops/switch-profile! ctx (profile/with-call-options % opts)))
+        "up" (with-opts #(ops/up-profile! ctx %))
+        "switch" (with-opts #(ops/switch-profile! ctx %))
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
-        "restart" (on-subject #(restart/restart-profile! ctx (profile/with-call-options % opts)
-                                                         (flag params "recreate")))
+        "restart" (with-opts #(restart/restart-profile! ctx % (flag params "recreate")))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -191,7 +206,7 @@
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
                               "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
-                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}"}
+                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
