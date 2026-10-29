@@ -8,10 +8,15 @@
    is the program's and its process group's. The group is what `-stop!`
    signals, which reaches the JVMs and node processes a watch forks. The pid is
    all that is kept, so a program outlives the addon and is stopped by pid after
-   a restart."
+   a restart.
+
+   Secret references in `:program/env` are read at `-start!` through the
+   injected resolver (see `hive-compose.adapter.secrets`) and handed to the
+   process only; nothing kept about a program carries them."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [hive-compose.adapter.secrets :as secrets]
             [hive-compose.port :as port]
             [hive-compose.promote.program :as program]
             [hive-dsl.result :as r]
@@ -64,19 +69,21 @@
       (<= left 0) false
       :else (do (Thread/sleep 100) (recur (- left 100))))))
 
-(defrecord HostRunner [spawn exec alive? grace-ms]
+(defrecord HostRunner [spawn exec alive? grace-ms resolver]
   port/IProgramRunner
   (-facts [_ dir]
     (r/try-effect* :compose/program-unreadable (facts dir)))
   (-start! [_ p log]
-    (r/bind (r/try-effect* :compose/log-unwritable (io/make-parents (io/file log)) log)
-            (fn [_]
-              (r/map-ok (spawn (program/detached-script (:program/command p) log)
-                               (cond-> {:dir (:program/dir p)}
-                                 (seq (:program/env p)) (assoc :env (:program/env p))))
-                        (fn [handle]
-                          (close-pipes! handle)
-                          {:pid (:pid handle)})))))
+    ;; The env's references are read here, at spawn; one that cannot be read
+    ;; keeps the program from starting and names itself in the error.
+    (r/let-ok [_ (r/try-effect* :compose/log-unwritable (io/make-parents (io/file log)) log)
+               env (secrets/resolve-env resolver (:program/env p))]
+      (r/map-ok (spawn (program/detached-script (:program/command p) log)
+                       (cond-> {:dir (:program/dir p)}
+                         (seq env) (assoc :env env)))
+                (fn [handle]
+                  (close-pipes! handle)
+                  {:pid (:pid handle)}))))
   (-alive? [_ pid] (boolean (alive? pid)))
   (-listening? [_ port]
     ;; A refused or timed-out connect is the answer, not a failure.
@@ -101,9 +108,13 @@
 (defn make-runner
   "HostRunner. `opts`: :spawn (default hive-system `process.core/spawn!`), :exec
    (default `shell.core/exec!`), :alive? (default `process.liveness/alive?`),
-   :compose/stop-grace-ms before a group is killed (default 5000)."
+   :compose/stop-grace-ms before a group is killed (default 5000),
+   :compose/resolver ({scheme ISecretBackend}, default the `pass` one over that
+   exec) for the references in a program's env."
   [opts]
-  (->HostRunner (or (:spawn opts) process/spawn!)
-                (or (:exec opts) shell/exec!)
-                (or (:alive? opts) liveness/alive?)
-                (or (:compose/stop-grace-ms opts) 5000)))
+  (let [exec (or (:exec opts) shell/exec!)]
+    (->HostRunner (or (:spawn opts) process/spawn!)
+                  exec
+                  (or (:alive? opts) liveness/alive?)
+                  (or (:compose/stop-grace-ms opts) 5000)
+                  (or (:compose/resolver opts) (secrets/make-resolver {:exec exec})))))

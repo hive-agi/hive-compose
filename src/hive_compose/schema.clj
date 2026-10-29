@@ -14,6 +14,21 @@
    them (never volumes), :none exempts the profile."
   [:enum :stop :down :none])
 
+(def SecretRef
+  "An env value read from a secret store when a process is spawned, never
+   before, and shown everywhere else as `<scheme>:<path>`. One entry, its
+   scheme: `{:pass \"<store path>\"}` is the first line of `pass <path>`. A new
+   scheme is one more map here and a backend of that id in
+   `hive-compose.adapter.secrets`."
+  [:map {:closed true} [:pass [:string {:min 1}]]])
+
+(def EnvValue
+  "A literal string, or a SecretRef."
+  [:or :string SecretRef])
+
+(def Env
+  [:map-of :string EnvValue])
+
 (def Program
   "A host process a section needs beside its containers. `:program/with` pairs
    it with compose services: it starts with a section running one of them, or
@@ -27,7 +42,7 @@
    [:program/kind {:optional true} [:enum :shadow :deps :lein :bb :plain]]
    [:program/nrepl-port {:optional true} [:int {:min 1 :max 65535}]]
    [:program/with {:optional true} [:vector [:string {:min 1}]]]
-   [:program/env {:optional true} [:map-of :string :string]]
+   [:program/env {:optional true} Env]
    [:program/description {:optional true} :string]])
 
 (def Running
@@ -51,7 +66,7 @@
    [:profile/compose-profiles {:optional true} [:vector ProfileId]]
    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
    [:profile/programs {:optional true} [:vector Program]]
-   [:profile/env {:optional true} [:map-of :string :string]]
+   [:profile/env {:optional true} Env]
    [:profile/wait? {:optional true} :boolean]
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
@@ -86,7 +101,7 @@
    [:project/files {:optional true} [:vector [:string {:min 1}]]]
    [:project/name {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
    [:project/programs {:optional true} [:vector Program]]
-   [:project/env {:optional true} [:map-of :string :string]]
+   [:project/env {:optional true} Env]
    [:project/wait? {:optional true} :boolean]
    [:project/ttl-minutes {:optional true} [:int {:min 1}]]
    [:project/idle-action {:optional true} IdleAction]])

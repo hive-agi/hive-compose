@@ -101,6 +101,36 @@ afterwards. A program that fails to start is reported and never fails the
 section. A program whose nREPL port already answers is somebody else's: it is
 reported as `external?`, not started a second time and never stopped.
 
+## Environment and secrets
+
+`:project/env`, `:profile/env` (presets), `:program/env` and the `env` param of
+`up`/`switch`/`restart` take `{VAR value}`. A value is a string, or a secret
+reference read from [pass](https://www.passwordstore.org/):
+
+```clojure
+{:project/id "dc"
+ :project/dir "~/PP/funeraria/dc"
+ :project/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}
+               "SISF_CRM_SRC" "../../funeraria-wt/dc-staging-view-sisf-crm"}}
+```
+
+```
+compose up target=sisf-crm env={"EXTRA_TOKEN": {"pass": "Funeraria/other"}}
+```
+
+A reference is read (`pass <path>`, first line, trimmed) only when containers
+are created (`up`, `switch`, `restart recreate=true`) or a host program starts,
+and the value goes to that process alone. Every other compose call (`config`,
+`ps`, `stop`, `down`, `logs`, an in-place `restart`) is given the rendering
+`pass:<path>`, so interpolation still works and no store is read. The value is
+never kept in the state file, never shown by `status`, `ps`, `targets`,
+`programs` or `logs`, and what docker prints has it replaced by the rendering.
+An entry that cannot be read (missing, gpg locked, `pass` absent) fails that
+`up` before docker runs, naming the variable, the reference and the reason; a
+program whose env cannot be read is reported and not started.
+`:compose/resolver` injects the stores (`{:pass ISecretBackend}`) in place of
+`pass`.
+
 ## Tool `compose`
 
 | command | effect |
