@@ -78,12 +78,21 @@
     (r/ok {:out "log"}))
 
   port/IDependencyGraph
+  ;; As `compose config --format json [targets]`: the targets' closure when
+  ;; the profile names services, else what its native profiles enable. A
+  ;; graph injected under :graphs answers as is (an engine that disagrees).
   (-dependencies [_ p]
     (or (fault world :dependencies)
-        (r/ok (into {}
-                    (for [[svc {:keys [deps optional]}] (get-in @world [:projects (profile/project p)])]
-                      [svc (merge (zipmap deps (repeat {:required? true}))
-                                  (zipmap optional (repeat {:required? false})))]))))))
+        (if-let [g (get-in @world [:graphs (profile/project p)])]
+          (r/ok g)
+          (let [model (get-in @world [:projects (profile/project p)])
+                shown (set (closure model (or (seq (:profile/services p))
+                                              (enabled model (:profile/compose-profiles p)))))]
+            (r/ok (into {}
+                        (for [[svc {:keys [deps optional]}] model
+                              :when (shown svc)]
+                          [svc (merge (zipmap deps (repeat {:required? true}))
+                                      (zipmap optional (repeat {:required? false})))]))))))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
@@ -97,3 +106,8 @@
 (defn calls [e] (:calls @(:world e)))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
+
+(defn graph!
+  "Make `-dependencies` answer `g` for `project`, whatever the model says."
+  [e project g]
+  (swap! (:world e) assoc-in [:graphs project] g))

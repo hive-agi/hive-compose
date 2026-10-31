@@ -231,47 +231,61 @@
    ({service {dep {:required? bool}}}): {:start [service]} follows only the
    required edges (an edge without :required? is required); {:needs [service]}
    adds the `required: false` dependencies met on the way that are already in
-   `running`, waited on but never started. Pure."
+   `running`, together with everything those require in turn (and the running
+   optional ones they meet), so release never strands a kept service. What
+   :needs adds is waited on and kept, never started. Pure."
   [graph roots running]
-  (loop [seen #{} optional #{} todo (vec roots)]
-    (if-let [[s & more] (seq todo)]
-      (if (seen s)
-        (recur seen optional (vec more))
-        (let [edges (get graph s)
-              optional? (fn [[_ e]] (false? (:required? e)))]
-          (recur (conj seen s)
-                 (into optional (map key) (filter optional? edges))
-                 (into (vec more) (map key) (remove optional? edges)))))
-      {:start (vec (sort seen))
-       :needs (vec (sort (into seen (filter (set running)) optional)))})))
+  (let [running (set running)
+        optional? (fn [[_ e]] (false? (:required? e)))
+        walk (fn [seen roots]
+               (loop [seen seen optional #{} todo (vec roots)]
+                 (if-let [[s & more] (seq todo)]
+                   (if (seen s)
+                     (recur seen optional (vec more))
+                     (let [edges (get graph s)]
+                       (recur (conj seen s)
+                              (into optional (map key) (filter optional? edges))
+                              (into (vec more) (map key) (remove optional? edges)))))
+                   [seen optional])))
+        [start optional] (walk #{} roots)]
+    (loop [kept start optional optional]
+      (let [fresh (vec (sort (remove kept (filter running optional))))]
+        (if (empty? fresh)
+          {:start (vec (sort start)) :needs (vec (sort kept))}
+          (let [[kept more] (walk kept fresh)]
+            (recur kept more)))))))
 
 (defn- up-plan
   "Result<{:start :needs :pin?}> for bringing `p` up. The engine's closure
    follows every depends_on entry; when the engine also answers the dependency
    graph, the entries marked `required: false` are left out of :start (never
-   built or started) and kept in :needs only when already running. :pin? is
-   true when something was left out, so compose must start exactly :start.
-   Without a graph, or with no optional edge in the closure, :start and :needs
-   are the closure, as before."
+   built or started) and kept in :needs only when already running, with what
+   they require. :pin? is true when something was left out, so compose must
+   start exactly :start. Without a graph, with no optional edge in the
+   closure, or with a graph that disagrees with the closure (a closure service
+   it has no entry for, a required dependency outside the closure), :start and
+   :needs are the closure and nothing is pinned, as before."
   [ctx p]
   (let [engine (:engine ctx)
-        whole {:start nil :pin? false}]
+        whole (fn [closure] (r/ok {:start closure :needs closure :pin? false}))]
     (r/let-ok [closure (port/-closure engine p)]
       (if-not (satisfies? port/IDependencyGraph engine)
-        (r/ok (assoc whole :start closure :needs closure))
+        (whole closure)
         (r/let-ok [graph (port/-dependencies engine p)]
           (let [in-closure (set closure)
+                complete? (every? #(contains? graph %) closure)
                 optional? (some (fn [s] (some #(false? (:required? %)) (vals (get graph s))))
                                 closure)]
-            (if-not optional?
-              (r/ok (assoc whole :start closure :needs closure))
+            (if-not (and complete? optional?)
+              (whole closure)
               (r/let-ok [roots (if (seq (:profile/services p))
                                  (r/ok (:profile/services p))
                                  (port/-listed engine p))
                          running (port/-running engine p)]
-                (let [{:keys [start needs]} (required-closure graph (filter in-closure roots) running)
-                      start (filterv in-closure start)]
-                  (r/ok {:start start :needs needs :pin? (not= start closure)}))))))))))
+                (let [{:keys [start needs]} (required-closure graph (filter in-closure roots) running)]
+                  (if-not (and (every? in-closure start) (every? in-closure needs))
+                    (whole closure)
+                    (r/ok {:start start :needs needs :pin? (not= start closure)})))))))))))
 
 (defn- bring-up!
   "Start `services` of `p`, then the programs paired with them (`carried` are

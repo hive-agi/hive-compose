@@ -67,12 +67,13 @@
       (is (= {"postgres" {:required? true} "redis" {:required? true}}
              (get (cli/dependency-graph doc) "worker"))))
     (is (= {} (get (cli/dependency-graph doc) "postgres")))
-    (testing "the engine runs config --format json for the whole project"
+    (testing "the engine runs the same targeted config --format json as -closure"
       (let [calls (atom [])
             e (cli/make-engine {:exec (recording-exec calls (constantly {:exit 0 :stdout doc}))})]
         (is (satisfies? port/IDependencyGraph e))
         (is (= {:required? false} (get-in (:ok (port/-dependencies e profile)) ["crm" "contracts"])))
-        (is (= ["config" "--format" "json"] (take-last 3 (ffirst @calls))))))))
+        (is (= (cli/closure-argv profile) (ffirst @calls)))
+        (is (= ["config" "--format" "json" "api"] (take-last 4 (ffirst @calls))))))))
 
 (deftest engine-runs-in-the-profile-dir-with-its-env
   (let [calls (atom [])

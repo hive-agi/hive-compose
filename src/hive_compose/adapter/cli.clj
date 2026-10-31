@@ -161,8 +161,11 @@
     (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)})))
 
   port/IDependencyGraph
+  ;; The same targeted query as -closure: compose keeps an explicitly targeted
+  ;; service behind a native profile only when it is named, so an untargeted
+  ;; query would drop that service and its edges.
   (-dependencies [_ p]
-    (parsed (run exec p (into (base-argv p) ["config" "--format" "json"]) timeout-ms)
+    (parsed (run exec p (closure-argv p) timeout-ms)
             :compose/unparseable dependency-graph)))
 
 (defn make-engine
