@@ -25,6 +25,13 @@
   (-logs [e profile services tail]
     "Result<{:out}>: the last `tail` log lines of `services` (all when empty)."))
 
+(defprotocol IDependencyGraph
+  "Optional engine capability: the depends_on edges of a project, so `up` can
+   leave out what the compose file marks `required: false`. An engine without
+   it closes over every depends_on entry, as before."
+  (-dependencies [e profile]
+    "Result<{service {dep {:required? bool}}}>: the depends_on edges of the services the profile's project defines."))
+
 (defprotocol IProgramRunner
   "Host programs: the processes a section runs outside compose."
   (-facts [r dir]

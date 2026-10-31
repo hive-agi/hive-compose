@@ -22,13 +22,16 @@
           svc)))
 
 (defn- closure
-  "`targets` plus everything they transitively depend on in `model`."
+  "`targets` plus everything they transitively depend on in `model`, the
+   `required: false` (:optional) entries included, as `compose config` does."
   [model targets]
   (loop [seen (sorted-set) todo (vec targets)]
     (if-let [[s & more] (seq todo)]
       (if (seen s)
         (recur seen (vec more))
-        (recur (conj seen s) (into (vec more) (get-in model [s :deps]))))
+        (recur (conj seen s) (-> (vec more)
+                                 (into (get-in model [s :deps]))
+                                 (into (get-in model [s :optional])))))
       (vec seen))))
 
 (defrecord StubEngine [world]
@@ -56,6 +59,7 @@
                 (:running @world))))
   (-up! [_ p services]
     (record! world [:up (profile/project p) (vec services)])
+    (swap! world assoc :last-up-no-deps? (boolean (:profile/no-deps? p)))
     (or (fault world :up)
         (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
             (r/ok {:out ""}))))
@@ -71,7 +75,15 @@
             (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
-    (r/ok {:out "log"})))
+    (r/ok {:out "log"}))
+
+  port/IDependencyGraph
+  (-dependencies [_ p]
+    (or (fault world :dependencies)
+        (r/ok (into {}
+                    (for [[svc {:keys [deps optional]}] (get-in @world [:projects (profile/project p)])]
+                      [svc (merge (zipmap deps (repeat {:required? true}))
+                                  (zipmap optional (repeat {:required? false})))]))))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`

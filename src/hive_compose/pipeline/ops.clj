@@ -226,13 +226,62 @@
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
 
+(defn required-closure
+  "What `roots` need under the depends_on edges of `graph`
+   ({service {dep {:required? bool}}}): {:start [service]} follows only the
+   required edges (an edge without :required? is required); {:needs [service]}
+   adds the `required: false` dependencies met on the way that are already in
+   `running`, waited on but never started. Pure."
+  [graph roots running]
+  (loop [seen #{} optional #{} todo (vec roots)]
+    (if-let [[s & more] (seq todo)]
+      (if (seen s)
+        (recur seen optional (vec more))
+        (let [edges (get graph s)
+              optional? (fn [[_ e]] (false? (:required? e)))]
+          (recur (conj seen s)
+                 (into optional (map key) (filter optional? edges))
+                 (into (vec more) (map key) (remove optional? edges)))))
+      {:start (vec (sort seen))
+       :needs (vec (sort (into seen (filter (set running)) optional)))})))
+
+(defn- up-plan
+  "Result<{:start :needs :pin?}> for bringing `p` up. The engine's closure
+   follows every depends_on entry; when the engine also answers the dependency
+   graph, the entries marked `required: false` are left out of :start (never
+   built or started) and kept in :needs only when already running. :pin? is
+   true when something was left out, so compose must start exactly :start.
+   Without a graph, or with no optional edge in the closure, :start and :needs
+   are the closure, as before."
+  [ctx p]
+  (let [engine (:engine ctx)
+        whole {:start nil :pin? false}]
+    (r/let-ok [closure (port/-closure engine p)]
+      (if-not (satisfies? port/IDependencyGraph engine)
+        (r/ok (assoc whole :start closure :needs closure))
+        (r/let-ok [graph (port/-dependencies engine p)]
+          (let [in-closure (set closure)
+                optional? (some (fn [s] (some #(false? (:required? %)) (vals (get graph s))))
+                                closure)]
+            (if-not optional?
+              (r/ok (assoc whole :start closure :needs closure))
+              (r/let-ok [roots (if (seq (:profile/services p))
+                                 (r/ok (:profile/services p))
+                                 (port/-listed engine p))
+                         running (port/-running engine p)]
+                (let [{:keys [start needs]} (required-closure graph (filter in-closure roots) running)
+                      start (filterv in-closure start)]
+                  (r/ok {:start start :needs needs :pin? (not= start closure)}))))))))))
+
 (defn- bring-up!
   "Start `services` of `p`, then the programs paired with them (`carried` are
    live ones to reuse), and track the profile as active. `needs` is the
-   depends_on closure of `services`, kept when wider so release spares it."
-  [ctx p services needs carried]
+   depends_on closure of `services`, kept when wider so release spares it.
+   `pin?` starts exactly `services` (compose --no-deps), so compose does not
+   pull in the optional dependencies the closure left out."
+  [ctx p services needs carried pin?]
   (let [id (:profile/id p)]
-    (r/let-ok [out (port/-up! (:engine ctx) p services)]
+    (r/let-ok [out (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services)]
       (let [now ((:now ctx))
             {:keys [held report]} (start-programs! ctx p services carried)
             wider (seq (remove (set services) needs))]
@@ -250,31 +299,34 @@
                 (seq report) (assoc :programs report)))))))
 
 (defn up-profile!
-  "Bring `p` up alongside whatever is active. Becomes current when nothing is."
+  "Bring `p` up alongside whatever is active. Becomes current when nothing is.
+   A depends_on entry marked `required: false` is neither built nor started;
+   it is only needed when already running."
   [ctx p]
-  (r/let-ok [closure (port/-closure (:engine ctx) p)
-             up (bring-up! ctx p (profile/up-services p closure) closure
-                           (live-programs ctx (profile/project p)))]
+  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)
+             up (bring-up! ctx p (profile/up-services p start) needs
+                           (live-programs ctx (profile/project p)) pin?)]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
     (persist! ctx)
     (r/ok up)))
 
 (defn switch-profile!
   "Make `p` current: release what only the previous current profile needs, then
-   bring `p` up. Shared services and the programs `p` wants stay up throughout."
+   bring `p` up. Shared services and the programs `p` wants stay up throughout.
+   Optional (`required: false`) dependencies are treated as in `up-profile!`."
   [ctx p]
-  (r/let-ok [closure (port/-closure (:engine ctx) p)]
+  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)]
     (let [id (:profile/id p)
           project (profile/project p)
-          services (profile/up-services p closure)
+          services (profile/up-services p start)
           {:keys [active current]} @(:state ctx)
           carried (live-programs ctx project)
           keep (if (= project (get-in active [current :project]))
                  (into #{} (map :program/id) (program/wanted (:profile/programs p) services))
                  #{})
           released (mapv #(step-report (release! ctx % keep))
-                         (plan/switch-releases active current id project closure))
-          up (bring-up! ctx p services closure carried)]
+                         (plan/switch-releases active current id project needs))
+          up (bring-up! ctx p services needs carried pin?)]
       (when (r/ok? up) (swap! (:state ctx) assoc :current id))
       (persist! ctx)
       (r/map-ok up #(assoc % :released released)))))
