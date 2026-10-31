@@ -50,6 +50,31 @@
   (is (= ["api" "db" "migrate"]
          (cli/closure-services "{\"name\":\"shop\",\"services\":{\"migrate\":{},\"api\":{},\"db\":{}}}"))))
 
+(deftest dependency-graph-reads-required-flags
+  (let [doc (str "{\"services\":{"
+                 "\"crm\":{\"depends_on\":{"
+                 "\"postgres\":{\"condition\":\"service_healthy\",\"required\":true},"
+                 "\"contracts\":{\"condition\":\"service_started\",\"required\":false},"
+                 "\"notes\":{\"condition\":\"service_started\"}}},"
+                 "\"worker\":{\"depends_on\":[\"postgres\",\"redis\"]},"
+                 "\"postgres\":{}}}")]
+    (testing "map form: required:false is optional, a missing required is required"
+      (is (= {"postgres" {:required? true}
+              "contracts" {:required? false}
+              "notes" {:required? true}}
+             (get (cli/dependency-graph doc) "crm"))))
+    (testing "list form: every entry is required"
+      (is (= {"postgres" {:required? true} "redis" {:required? true}}
+             (get (cli/dependency-graph doc) "worker"))))
+    (is (= {} (get (cli/dependency-graph doc) "postgres")))
+    (testing "the engine runs the same targeted config --format json as -closure"
+      (let [calls (atom [])
+            e (cli/make-engine {:exec (recording-exec calls (constantly {:exit 0 :stdout doc}))})]
+        (is (satisfies? port/IDependencyGraph e))
+        (is (= {:required? false} (get-in (:ok (port/-dependencies e profile)) ["crm" "contracts"])))
+        (is (= (cli/closure-argv profile) (ffirst @calls)))
+        (is (= ["config" "--format" "json" "api"] (take-last 4 (ffirst @calls))))))))
+
 (deftest engine-runs-in-the-profile-dir-with-its-env
   (let [calls (atom [])
         e (cli/make-engine {:exec (recording-exec calls (constantly {:exit 0 :stdout "{\"services\":{\"api\":{}}}"}))})]

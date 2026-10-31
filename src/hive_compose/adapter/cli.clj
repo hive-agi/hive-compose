@@ -100,6 +100,22 @@
   [s]
   (vec (sort (keys (get (json/read-str s) "services")))))
 
+(defn dependency-graph
+  "{service {dep {:required? bool}}} of a `config --format json` document.
+   Map-form depends_on reads each entry's \"required\" (absent = true);
+   list-form depends_on makes every entry required."
+  [s]
+  (letfn [(edge [e]
+            (if (map? e)
+              (not (false? (get e "required" true)))
+              true))
+          (edges [deps]
+            (if (map? deps)
+              (into {} (for [[d e] deps] [d {:required? (edge e)}]))
+              (into {} (for [d deps] [d {:required? true}]))))]
+    (into {} (for [[svc m] (get (json/read-str s) "services")]
+               [svc (edges (get m "depends_on"))]))))
+
 (defn projects
   "Project summaries of `ls` rows."
   [rows]
@@ -153,7 +169,15 @@
   (-restart! [_ p services recreate?]
     (act exec p (restart-argv p services recreate?) (if recreate? up-timeout-ms timeout-ms) services))
   (-logs [_ p services tail]
-    (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)}))))
+    (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)})))
+
+  port/IDependencyGraph
+  ;; The same targeted query as -closure: compose keeps an explicitly targeted
+  ;; service behind a native profile only when it is named, so an untargeted
+  ;; query would drop that service and its edges.
+  (-dependencies [_ p]
+    (parsed (run exec p (closure-argv p) timeout-ms)
+            :compose/unparseable dependency-graph)))
 
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),
