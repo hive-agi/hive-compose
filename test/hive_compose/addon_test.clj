@@ -81,3 +81,25 @@
       (is (= ["blog"] (:adopted (sut/tick! a))))
       (is (nil? (:adopted (sut/tick! a))) "adoption runs once")
       (finally (addon/shutdown! a)))))
+
+(deftest reload-reads-the-config-declared-now
+  (testing "an addon block edited after init (config A -> B) is what reload! runs on"
+    (let [dir (temp-dir)
+          declared (io/file dir "addon-config.edn")
+          block-a {:compose/profiles [{:profile/id "api" :profile/dir "/w/shop"}]}
+          block-b {:compose/profiles [{:profile/id "escala-dev" :profile/dir "/w/escala"}]}
+          _ (spit declared (pr-str block-a))
+          a (sut/make-addon (assoc (config dir (stub/engine {}))
+                                   :compose/profiles nil
+                                   :compose/config-source #(edn/read-string (slurp declared))))]
+      ;; the host hands initialize! the block declared at that time merged in
+      (is (:success? (addon/initialize! a block-a)))
+      (try
+        (is (= ["api"] (:profiles (:body (call a {"command" "reload"})))))
+        (spit declared (pr-str block-b))
+        (let [res (sut/reload! a)]
+          (is (= {:ok {:profiles ["escala-dev"]}} (select-keys res [:ok])))
+          (is (= ["escala-dev"] (:profiles (:body (call a {"command" "reload"})))))
+          (is (= #{"escala-dev"} (set (keys (get-in (:ctx @(:state a)) [:settings :compose/profiles]))))
+              "B's profile is in the running settings and A's is gone"))
+        (finally (addon/shutdown! a))))))

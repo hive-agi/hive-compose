@@ -26,7 +26,8 @@
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
             [hive-compose.promote.profile :as profile]
-            [hive-compose.pipeline.restart :as restart])
+            [hive-compose.pipeline.restart :as restart]
+            [hive-addon.host :as addon-host])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -52,6 +53,37 @@
   (let [home (System/getProperty "user.home")]
     (r/let-ok [file-profiles (files/read-profiles (config/profiles-file cfg home))]
       (config/settings cfg file-profiles home))))
+
+(def ^:private host-declared-config
+  "The host's reader of an addon's declared config block (`:addons <id>` in
+   config.edn), the same one its init path merges into the config `initialize!`
+   receives. Soft-resolved: the published addon never requires hive-mcp, and
+   with no host it answers {}."
+  (addon-host/soft 'hive-mcp.addons.core/addon-declared-config (constantly {})))
+
+(defn- declared-config
+  "The addon config block as declared NOW: `:compose/config-source` (a 0-arity
+   fn, for tests and non-MCP hosts) when `base` carries one, else the host's
+   declared-config reader. Anything but a map counts as {}."
+  [base]
+  (let [m ((or (:compose/config-source base) #(host-declared-config addon-id-value)))]
+    (if (map? m) m {})))
+
+(defn- merged-config
+  "The config the addon runs on: `seed`, then the declared block, then the
+   caller's own options. `runtime-config` is what `initialize!` received; the
+   host built it by merging the block declared at that time (`declared-then`)
+   under its options, so the entries it still holds unchanged from that block
+   are dropped and the block declared now takes their place. One function for
+   init and reload, so a reload sees exactly what a fresh init would."
+  [seed runtime-config declared-then]
+  (let [base (merge (:addon/config seed) seed (:addon/config runtime-config))
+        own (into {} (remove (fn [[k v]] (and (contains? declared-then k)
+                                              (= v (get declared-then k)))))
+                  runtime-config)
+        declared (declared-config (merge base own))]
+    {:cfg (merge base declared own)
+     :declared declared}))
 
 (defn- build-ctx [cfg settings persisted]
   {:engine (or (:compose/engine cfg)
@@ -239,12 +271,19 @@
 
 (defn reload!
   "Re-read config and profiles file into the running context, keeping the
-   active map. Result<{:profiles n}>."
-  [{:keys [state]}]
+   active map. Result<{:profiles n}>.
+
+   The addon block is read again through `merged-config`, the path init takes,
+   so an edit to config.edn followed by `config reload` takes effect here (new
+   projects, files, programs); rebuilding from the config captured at init
+   would keep the old block until a restart. `:declared` stays the block of
+   init time: it is what the host merged into `runtime-config`."
+  [{:keys [state seed]}]
   (locking state
-    (let [{:keys [cfg ctx]} @state]
+    (let [{:keys [runtime-config declared ctx]} @state
+          {:keys [cfg]} (merged-config seed runtime-config declared)]
       (r/let-ok [settings (build-settings cfg)]
-        (swap! state assoc :ctx (assoc ctx :settings settings))
+        (swap! state assoc :cfg cfg :ctx (assoc ctx :settings settings))
         (r/ok {:profiles (vec (sort (keys (:compose/profiles settings))))})))))
 
 (defn- initialize-addon! [a seed runtime-config]
@@ -252,8 +291,9 @@
     (locking state
       (if (= :active (:lifecycle @state))
         {:success? true :already-initialized? true}
-        (let [cfg (merge (:addon/config seed) seed (:addon/config runtime-config) runtime-config)
+        (let [{:keys [cfg declared]} (merged-config seed runtime-config {})
               settings (build-settings cfg)]
+          (swap! state assoc :runtime-config runtime-config :declared declared)
           (if (r/err? settings)
             (do (swap! state assoc :lifecycle :error :errors [(pr-str settings)])
                 {:success? false :errors [(str "invalid hive.compose config: " (pr-str settings))]})
