@@ -31,3 +31,22 @@
     (is (= :compose/invalid-config
            (:error (config/settings {:compose/profiles [{:profile/id "a" :profile/dir "/w" :profile/idle-action :nuke}]}
                                     nil home))))))
+
+(deftest a-preset-carries-an-overlay-file-and-pass-env-of-its-own
+  (testing "an overlay -f file and {:pass} env on a preset apply to that preset only, not to the project"
+    (let [files ["docker-compose.yml" "docker-compose.override.yml" "docker-compose.crm-whatsapp.yml"]
+          s (:ok (config/settings
+                  {:compose/projects [{:project/id "dc" :project/dir "~/dc"
+                                       :project/files ["docker-compose.yml" "docker-compose.override.yml"]}]}
+                  [{:profile/id "crm-whatsapp" :profile/dir "~/dc" :profile/project "dc"
+                    :profile/files files
+                    :profile/services ["sisf-crm"]
+                    :profile/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}}}]
+                  home))
+          p (get-in s [:compose/profiles "crm-whatsapp"])]
+      (is (= files (:profile/files p)))
+      (is (= {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}} (:profile/env p)))
+      (is (= "dc" (:profile/project p)) "same compose project, so it shares and replaces dc's containers")
+      (is (= ["docker-compose.yml" "docker-compose.override.yml"]
+             (get-in s [:compose/projects "dc" :project/files])))
+      (is (nil? (get-in s [:compose/projects "dc" :project/env]))))))

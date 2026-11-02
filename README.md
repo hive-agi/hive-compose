@@ -162,6 +162,26 @@ Named presets in `~/.config/hive-mcp/compose-profiles.edn`, used with `profile=I
   :profile/idle-action :stop}]      ; :stop (default) | :down | :none
 ```
 
+A preset carries its own `:profile/files` and `:profile/env` (`{:pass ..}`
+values included), so an overlay compose file and the secrets it needs apply
+only when that preset runs, never to the project's targets. To run the
+overlay against the same containers, give it the project's compose name:
+
+```clojure
+{:profile/id "crm-whatsapp"
+ :profile/dir "~/PP/funeraria/dc"
+ :profile/project "dc"
+ :profile/files ["docker-compose.yml" "docker-compose.override.yml"
+                 "docker-compose.crm-whatsapp.yml"]
+ :profile/services ["sisf-crm"]
+ :profile/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}}}
+```
+
+`compose up profile=crm-whatsapp` then runs
+`docker compose -p dc -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.crm-whatsapp.yml up -d sisf-crm`
+with the token read from pass at that moment. `compose down profile=crm-whatsapp`
+releases it.
+
 ## Safety
 
 - Only sections the addon started or adopted are ever reaped. Adoption covers
