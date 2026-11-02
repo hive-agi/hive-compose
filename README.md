@@ -182,6 +182,10 @@ overlay against the same containers, give it the project's compose name:
 with the token read from pass at that moment. `compose down profile=crm-whatsapp`
 releases it.
 
+`:profile/project` only names the compose project. A preset does not inherit that
+project's `:project/env` from the addon config, so repeat in `:profile/env` every
+value the preset's services need.
+
 ## Safety
 
 - Only sections the addon started or adopted are ever reaped. Adoption covers
