@@ -21,7 +21,8 @@
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
             [hive-compose.promote.target :as target]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [clojure.string :as str]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -118,6 +119,30 @@
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
+
+(defn rebase-sections!
+  "After the configured projects changed from `old-projects` to the ones in
+   `ctx`'s settings, re-base the snapshot of every active section of a changed
+   project on its project as configured now, so a release, ps or logs by id
+   runs with the new files and env. Answers {:rebased [id] :kept [{:id :reason}]};
+   a section whose project left the config keeps the snapshot it ran with."
+  [ctx old-projects]
+  (let [new-projects (get-in ctx [:settings :compose/projects])
+        rows (for [[id a] (sort-by key (:active @(:state ctx)))
+                   :let [pid (first (str/split id #"/" 2))]
+                   :when (and (:profile a) (str/includes? id "/") (not (configured ctx id))
+                              (contains? old-projects pid)
+                              (not= (get old-projects pid) (get new-projects pid)))]
+               (if-let [proj (get new-projects pid)]
+                 {:id id :profile (target/rebase-section (get old-projects pid) proj (:profile a))}
+                 {:id id :reason :project-removed}))
+        rebased (filter :profile rows)]
+    (when (seq rebased)
+      (swap! (:state ctx) update :active
+             (fn [m] (reduce (fn [m {:keys [id profile]}] (assoc-in m [id :profile] profile)) m rebased)))
+      (persist! ctx))
+    (cond-> {:rebased (mapv :id rebased)}
+      (seq (remove :profile rows)) (assoc :kept (vec (remove :profile rows))))))
 
 ;; ---------------------------------------------------------------------------
 ;; release
