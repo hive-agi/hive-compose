@@ -85,3 +85,28 @@
     (is (r/ok? res))
     (is (= ["app" "db"] (:services (:ok res))) "db must start")
     (is (= ["up" "-d" "--no-deps" "app" "db"] (take-last 5 (last @ups))))))
+
+(defn- requiring
+  "`exec` failing, as compose interpolation does, every call whose env lacks `var`."
+  [exec var calls]
+  (fn [argv opts]
+    (swap! calls conj [argv (contains? (:env opts) var)])
+    (if (contains? (:env opts) var)
+      (exec argv opts)
+      (r/ok {:exit 1 :stdout "" :stderr (str "required variable " var " is missing a value")}))))
+
+(deftest the-call-env-reaches-the-target-preflight
+  (let [ups (atom [])
+        calls (atom [])
+        c (assoc (ctx {"app" {:depends_on {"db" {"required" true}}} "db" {}} ups)
+                 :engine (cli/make-engine {:exec (requiring (compose-exec {"app" {:depends_on {"db" {"required" true}}} "db" {}} ups)
+                                                            "SRC" calls)}))
+        env {"SRC" "/w/src"}]
+    (is (r/err? (ops/subject c {:target "app"})) "without the env the preflight fails")
+    (reset! calls [])
+    (let [res (r/bind (ops/subject c {:target "app" :env env})
+                      #(ops/up-profile! c (assoc % :profile/env env)))]
+      (is (r/ok? res))
+      (is (seq @calls))
+      (is (every? second @calls) "config --profiles, --services, --format json and up all carried SRC")
+      (is (some #(= ["config" "--profiles"] (take-last 2 (first %))) @calls)))))
