@@ -95,11 +95,48 @@
       ;; the host hands initialize! the block declared at that time merged in
       (is (:success? (addon/initialize! a block-a)))
       (try
-        (is (= ["api"] (:profiles (:body (call a {"command" "reload"})))))
+        (let [same (:body (call a {"command" "reload"}))]
+          (is (= ["api"] (:profiles same)))
+          (is (= {} (:changed same)))
+          (is (string? (:note same)) "an unchanged reload says nothing changed"))
         (spit declared (pr-str block-b))
         (let [res (sut/reload! a)]
-          (is (= {:ok {:profiles ["escala-dev"]}} (select-keys res [:ok])))
+          (is (= ["escala-dev"] (:profiles (:ok res))))
+          (is (= :config-source (:source (:ok res))))
+          (is (= {:profiles {:added ["escala-dev"] :removed ["api"]}} (:changed (:ok res))))
+          (is (seq (:not-reloaded (:ok res))) "what a reload cannot apply is stated")
           (is (= ["escala-dev"] (:profiles (:body (call a {"command" "reload"})))))
           (is (= #{"escala-dev"} (set (keys (get-in (:ctx @(:state a)) [:settings :compose/profiles]))))
               "B's profile is in the running settings and A's is gone"))
+        (finally (addon/shutdown! a))))))
+
+(deftest reload-applies-project-env-and-files-to-active-sections
+  (testing "an edited :project/env and :project/files reach new targets and the sections already up"
+    (let [dir (temp-dir)
+          declared (io/file dir "addon-config.edn")
+          proj (fn [env files] {:compose/projects [{:project/id "dc" :project/dir "/w/dc"
+                                                   :project/files files :project/env env}]})
+          block-a (proj {"SRC" "/a"} ["base.yml"])
+          block-b (proj {"SRC" "/b" "TOKEN" {:pass "x/token"}} ["base.yml" "extra.yml"])
+          engine (stub/engine {} {} {"dc" {"web" {} "db" {}}})
+          _ (spit declared (pr-str block-a))
+          a (sut/make-addon (assoc (config dir engine)
+                                   :compose/profiles nil
+                                   :compose/config-source #(edn/read-string (slurp declared))))]
+      (is (:success? (addon/initialize! a block-a)))
+      (try
+        (is (not (:error? (call a {"command" "up" "target" "dc/web" "env" {"CALL" "1"}}))))
+        (spit declared (pr-str block-b))
+        (let [rep (:body (call a {"command" "reload"}))
+              snap (get-in @(:state (:ctx @(:state a))) [:active "dc/web" :profile])]
+          (is (= {:changed ["dc"]} (get-in rep [:changed :projects])))
+          (is (= ["dc/web"] (get-in rep [:sections :rebased])))
+          (is (= ["base.yml" "extra.yml"] (:profile/files snap)))
+          (is (= {"SRC" "/b" "TOKEN" {:pass "x/token"} "CALL" "1"} (:profile/env snap))
+              "project env follows the config; the call's own env stays")
+          (is (not (re-find #"x/token" (pr-str (:changed rep))))
+              "the report names projects, never env values"))
+        (let [p (:ok (hive-compose.pipeline.ops/resolve-target (:ctx @(:state a)) "dc/db"))]
+          (is (= {"SRC" "/b" "TOKEN" {:pass "x/token"}} (:profile/env p)))
+          (is (= ["base.yml" "extra.yml"] (:profile/files p))))
         (finally (addon/shutdown! a))))))

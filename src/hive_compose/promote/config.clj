@@ -112,3 +112,37 @@
     (if-let [problems (schema/explain schema/Settings s)]
       (r/err :compose/invalid-config {:problems problems})
       (r/ok s))))
+
+(defn- keyed-diff
+  "{:added :removed :changed} ids between maps `old` and `new`, each sorted;
+   empty keys left out."
+  [old new]
+  (let [ks (fn [m] (set (keys m)))
+        added (sort (remove (ks old) (keys new)))
+        removed (sort (remove (ks new) (keys old)))
+        changed (sort (for [[k v] new :when (and (contains? old k) (not= v (get old k)))] k))]
+    (cond-> {}
+      (seq added) (assoc :added (vec added))
+      (seq removed) (assoc :removed (vec removed))
+      (seq changed) (assoc :changed (vec changed)))))
+
+(def ^:private live-only
+  "Settings a running addon keeps from init: the reaper period and where its
+   state lives. A change to them applies at the next initialize!."
+  [:compose/tick-seconds :compose/state-file])
+
+(defn settings-diff
+  "What differs between Settings `old` and `new`: projects and profiles by id,
+   other settings by key, and among those the ones a reload cannot apply
+   (`:restart-required`). Pure."
+  [old new]
+  (let [others (remove #{:compose/projects :compose/profiles} (distinct (concat (keys old) (keys new))))
+        changed (vec (sort (filter #(not= (get old %) (get new %)) others)))
+        pinned (vec (filter (set live-only) changed))]
+    (cond-> {}
+      (seq (keyed-diff (:compose/projects old) (:compose/projects new)))
+      (assoc :projects (keyed-diff (:compose/projects old) (:compose/projects new)))
+      (seq (keyed-diff (:compose/profiles old) (:compose/profiles new)))
+      (assoc :profiles (keyed-diff (:compose/profiles old) (:compose/profiles new)))
+      (seq changed) (assoc :settings changed)
+      (seq pinned) (assoc :restart-required pinned))))

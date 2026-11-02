@@ -62,12 +62,17 @@
   (addon-host/soft 'hive-mcp.addons.core/addon-declared-config (constantly {})))
 
 (defn- declared-config
-  "The addon config block as declared NOW: `:compose/config-source` (a 0-arity
-   fn, for tests and non-MCP hosts) when `base` carries one, else the host's
-   declared-config reader. Anything but a map counts as {}."
+  "{:block m :source s}: the addon config block as declared NOW and where it
+   came from. `:compose/config-source` (a 0-arity fn, for tests and non-MCP
+   hosts) when `base` carries one, else the host's declared-config reader.
+   Anything but a map counts as {}."
   [base]
-  (let [m ((or (:compose/config-source base) #(host-declared-config addon-id-value)))]
-    (if (map? m) m {})))
+  (let [own (:compose/config-source base)
+        m (if own (own) (host-declared-config addon-id-value))]
+    {:block (if (map? m) m {})
+     :source (cond own :config-source
+                   (map? m) :host-config
+                   :else :none)}))
 
 (defn- merged-config
   "The config the addon runs on: `seed`, then the declared block, then the
@@ -81,9 +86,10 @@
         own (into {} (remove (fn [[k v]] (and (contains? declared-then k)
                                               (= v (get declared-then k)))))
                   runtime-config)
-        declared (declared-config (merge base own))]
-    {:cfg (merge base declared own)
-     :declared declared}))
+        {:keys [block source]} (declared-config (merge base own))]
+    {:cfg (merge base block own)
+     :declared block
+     :source source}))
 
 (defn- build-ctx [cfg settings persisted]
   {:engine (or (:compose/engine cfg)
@@ -270,21 +276,36 @@
                 :tick-seconds tick}}))
 
 (defn reload!
-  "Re-read config and profiles file into the running context, keeping the
-   active map. Result<{:profiles n}>.
-
-   The addon block is read again through `merged-config`, the path init takes,
-   so an edit to config.edn followed by `config reload` takes effect here (new
-   projects, files, programs); rebuilding from the config captured at init
-   would keep the old block until a restart. `:declared` stays the block of
-   init time: it is what the host merged into `runtime-config`."
+  "Re-read the addon config block declared now and the profiles file into the
+   running context, keeping the active map; the engine and program runner are
+   rebuilt from the new config. Answers Result<report>: :source (where the
+   block came from), :profiles and :projects (ids now), :changed (projects,
+   profiles and settings that differ, by id or key, never by value),
+   :sections (active sections re-based on their changed project: :rebased
+   ids, :kept with why) and :not-reloaded (what applies only at the next
+   initialize!, and that running containers keep the env they were created
+   with until recreated)."
   [{:keys [state seed]}]
   (locking state
     (let [{:keys [runtime-config declared ctx]} @state
-          {:keys [cfg]} (merged-config seed runtime-config declared)]
+          {:keys [cfg source]} (merged-config seed runtime-config declared)
+          old (:settings ctx)]
       (r/let-ok [settings (build-settings cfg)]
-        (swap! state assoc :cfg cfg :ctx (assoc ctx :settings settings))
-        (r/ok {:profiles (vec (sort (keys (:compose/profiles settings))))})))))
+        (let [fresh (build-ctx cfg settings {})
+              ctx' (assoc ctx :settings settings :engine (:engine fresh) :runner (:runner fresh))
+              diff (config/settings-diff old settings)
+              _ (swap! state assoc :cfg cfg :ctx ctx')
+              sections (ops/rebase-sections! ctx' (:compose/projects old))]
+          (r/ok (cond-> {:source source
+                         :profiles (vec (sort (keys (:compose/profiles settings))))
+                         :projects (vec (sort (keys (:compose/projects settings))))
+                         :changed diff
+                         :sections sections
+                         :not-reloaded (cond-> ["env and files of running containers: they apply when the containers are recreated (up after the change, restart recreate=true)"]
+                                         (seq (:restart-required diff))
+                                         (conj (str "settings applied at the next initialize!: "
+                                                    (str/join ", " (map name (:restart-required diff))))))}
+                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed"))))))))
 
 (defn- initialize-addon! [a seed runtime-config]
   (let [{:keys [state]} a]
