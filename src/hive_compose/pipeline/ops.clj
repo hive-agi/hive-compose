@@ -558,33 +558,59 @@
       port (assoc :nrepl-port port)
       (and rn port) (assoc :nrepl-ready? (port/-listening? rn port)))))
 
+(defn config-health
+  "{project-id {:compose-project name :ok? bool :error ..}}: whether `docker
+   compose config` accepts each configured project as configured now (its
+   files and env; references rendered, never read). A missing required
+   variable, a bad file or an absent overlay shows here."
+  [ctx]
+  (into (sorted-map)
+        (for [[id proj] (get-in ctx [:settings :compose/projects])
+              :let [whole (target/project-profile proj)
+                    res (port/-listed (:engine ctx) whole)]]
+          [id (cond-> {:compose-project (profile/project whole) :ok? (r/ok? res)}
+                (r/err? res) (assoc :error (select-keys res [:error :exit :stderr])))])))
+
 (defn status
   "Every configured preset and every active section, with activity, reaper
-   countdown and the host programs it holds."
+   countdown and the host programs it holds. Up front, :ok? and :config say
+   whether compose accepts each configured project now; a row of a project it
+   rejects carries :config-ok? false, and an active one :reap-blocked? true,
+   since no compose call on that project, the reaper's included, can run."
   [ctx]
   (let [{:keys [settings]} ctx
         {:keys [active current]} @(:state ctx)
         now ((:now ctx))
+        health (config-health ctx)
+        broken (into {} (for [[id h] health :when (not (:ok? h))] [(:compose-project h) id]))
         row (fn [id p]
               (let [a (get active id)
-                    ttl (profile/ttl-ms settings p)]
+                    ttl (profile/ttl-ms settings p)
+                    bad (get broken (profile/project p))]
                 (cond-> {:id id
                          :project (profile/project p)
                          :active? (some? a)
                          :ttl-minutes (quot ttl 60000)
                          :idle-action (profile/idle-action settings p)}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
+                  (and a bad) (assoc :reap-blocked? true)
                   (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
                                                              (sort-by key (:programs a)))))))]
-    {:current current
-     :projects (vec (sort (keys (:compose/projects settings))))
-     :profiles (into (mapv (fn [[id p]] (row id p)) (sort-by key (:compose/profiles settings)))
-                     (for [[id a] (sort-by key active)
-                           :when (not (configured ctx id))]
-                       (assoc (row id (:profile a)) :section? true)))}))
+    (cond-> {:ok? (empty? broken)
+             :config health
+             :current current
+             :projects (vec (sort (keys (:compose/projects settings))))
+             :profiles (into (mapv (fn [[id p]] (row id p)) (sort-by key (:compose/profiles settings)))
+                             (for [[id a] (sort-by key active)
+                                   :when (not (configured ctx id))]
+                               (assoc (row id (:profile a)) :section? true)))}
+      (seq broken) (assoc :problem (str "compose rejects the config of "
+                                        (str/join ", " (sort (vals broken)))
+                                        "; every compose call on it fails, the reaper's included (see :config)")))))
 
 (defn programs
   "Result<[row]>: every program the configured projects declare, as it would
@@ -624,9 +650,47 @@
             (r/ok [])
             (sort-by key (get-in ctx [:settings :compose/projects])))))
 
+(defn- label-files
+  "The compose files docker recorded on a project's containers (`ls`
+   ConfigFiles, comma-separated absolute paths)."
+  [s]
+  (vec (remove str/blank? (map str/trim (str/split (or s "") #",")))))
+
+(defn- configured-files
+  "Absolute compose files configured project `proj` runs with: its
+   :project/files resolved against its dir, else compose's own defaults (nil)."
+  [proj]
+  (when-let [fs (seq (:project/files proj))]
+    (mapv #(if (str/starts-with? % "/") % (str (str/replace (:project/dir proj) #"/+$" "") "/" %)) fs)))
+
 (defn projects
-  "Result<[project]>: every compose project on the host, managed ones marked."
+  "Result<[project]>: every compose project on the host, managed ones marked.
+   :label-files are the files docker recorded when its containers were
+   created. For a project a configured one runs as, :configured lists those
+   with their :files as configured now, and :stale-files the label files
+   no configured project of that name uses (a different checkout, an overlay
+   since dropped); :files-match? false says the running containers were not
+   created from the files configured now."
   [ctx]
-  (let [managed (into #{} (map :project) (vals (:active @(:state ctx))))]
+  (let [managed (into #{} (map :project) (vals (:active @(:state ctx))))
+        by-name (group-by (comp profile/project target/project-profile)
+                          (vals (get-in ctx [:settings :compose/projects])))]
     (r/map-ok (port/-projects (:engine ctx))
-              (fn [ps] (mapv #(assoc % :managed? (contains? managed (:name %))) ps)))))
+              (fn [ps]
+                (mapv (fn [{nm :name :as row}]
+                        (let [labels (label-files (:config-files row))
+                              confs (get by-name nm)
+                              conf-rows (vec (for [p (sort-by :project/id confs)]
+                                               (cond-> {:id (:project/id p)}
+                                                 (configured-files p) (assoc :files (configured-files p)))))
+                              known (set (mapcat :files conf-rows))
+                              explicit? (every? :files conf-rows)
+                              stale (when (and (seq confs) explicit?) (vec (remove known labels)))]
+                          (cond-> (-> row
+                                      (dissoc :config-files)
+                                      (assoc :managed? (contains? managed nm) :label-files labels))
+                            (seq confs) (assoc :configured conf-rows)
+                            (and (seq confs) explicit?)
+                            (assoc :stale-files stale
+                                   :files-match? (boolean (some #(= (set labels) (set (:files %))) conf-rows))))))
+                      ps)))))

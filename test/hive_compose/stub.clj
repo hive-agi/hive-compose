@@ -48,15 +48,17 @@
               (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " missing)})
               (r/ok (closure model targets)))))))
   (-listed [_ p]
-    (r/ok (vec (enabled (get-in @world [:projects (profile/project p)]) (:profile/compose-profiles p)))))
+    (or (fault world :listed)
+        (r/ok (vec (enabled (get-in @world [:projects (profile/project p)]) (:profile/compose-profiles p))))))
   (-profiles [_ p]
     (r/ok (into #{} (mapcat :profiles) (vals (get-in @world [:projects (profile/project p)])))))
   (-running [_ p]
     (or (fault world :running)
         (r/ok (into (sorted-set) (get-in @world [:running (profile/project p)])))))
   (-projects [_]
-    (r/ok (mapv (fn [[k v]] {:name k :status (str "running(" (count v) ")") :config-files ""})
-                (:running @world))))
+    (r/ok (or (:ls @world)
+              (mapv (fn [[k v]] {:name k :status (str "running(" (count v) ")") :config-files ""})
+                    (:running @world)))))
   (-up! [_ p services]
     (record! world [:up (profile/project p) (vec services)])
     (swap! world assoc :last-up-no-deps? (boolean (:profile/no-deps? p)))
