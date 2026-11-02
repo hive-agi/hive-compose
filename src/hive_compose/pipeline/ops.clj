@@ -50,9 +50,11 @@
 (defn- expand-name
   "Result<[service] | nil>: what `nm` stands for in project `proj`: itself when
    it is a service, the members of the native profile when it is one, nil when
-   the project defines neither."
-  [engine proj nm]
-  (let [whole (target/project-profile proj)]
+   the project defines neither. `env` is the call's own, added to the
+   project's for these compose queries too."
+  [engine proj nm env]
+  (let [whole (cond-> (target/project-profile proj)
+                (seq env) (update :profile/env merge env))]
     (r/let-ok [profiles (port/-profiles engine whole)]
       (if (contains? profiles nm)
         (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
@@ -66,9 +68,9 @@
 
 (defn- expand-names
   "Result<[service] | nil> for all `names` in `proj`; nil when one is unknown there."
-  [engine proj names]
+  [engine proj names env]
   (reduce (fn [acc nm]
-            (let [x (expand-name engine proj nm)]
+            (let [x (expand-name engine proj nm env)]
               (cond
                 (r/err? x) (reduced x)
                 (nil? (:ok x)) (reduced (r/ok nil))
@@ -80,40 +82,44 @@
   "Result<Profile>: the section running exactly what `target-str` names
    (services or native compose profiles, see `promote.target/parse`), in the
    first configured project that defines all of them. Its services close over
-   the compose file's depends_on when brought up."
-  [ctx target-str]
-  (let [{:keys [project names]} (target/parse target-str)
-        projects (get-in ctx [:settings :compose/projects])
-        candidates (if project
-                     (some-> (get projects project) vector)
-                     (map val (sort-by key projects)))]
-    (cond
-      (empty? names) (r/err :compose/missing-param {:param "target"})
-      (and project (empty? candidates)) (r/err :compose/unknown-project
-                                                {:project project :known (vec (sort (keys projects)))})
-      (empty? candidates) (r/err :compose/no-projects
-                                 {:hint "declare compose projects under :compose/projects"})
-      :else
-      (loop [[proj & more] candidates]
-        (if-not proj
-          (r/err :compose/unknown-target {:target target-str :projects (vec (sort (keys projects)))})
-          (let [x (expand-names (:engine ctx) proj names)]
-            (cond
-              (r/err? x) x
-              (nil? (:ok x)) (recur more)
-              :else (r/ok (target/section proj names (:ok x))))))))))
+   the compose file's depends_on when brought up. `env`, the call's own, is
+   given to the compose queries that resolve the target, so a variable the
+   YAML requires can come from the call."
+  ([ctx target-str] (resolve-target ctx target-str nil))
+  ([ctx target-str env]
+   (let [{:keys [project names]} (target/parse target-str)
+         projects (get-in ctx [:settings :compose/projects])
+         candidates (if project
+                      (some-> (get projects project) vector)
+                      (map val (sort-by key projects)))]
+     (cond
+       (empty? names) (r/err :compose/missing-param {:param "target"})
+       (and project (empty? candidates)) (r/err :compose/unknown-project
+                                                 {:project project :known (vec (sort (keys projects)))})
+       (empty? candidates) (r/err :compose/no-projects
+                                  {:hint "declare compose projects under :compose/projects"})
+       :else
+       (loop [[proj & more] candidates]
+         (if-not proj
+           (r/err :compose/unknown-target {:target target-str :projects (vec (sort (keys projects)))})
+           (let [x (expand-names (:engine ctx) proj names env)]
+             (cond
+               (r/err? x) x
+               (nil? (:ok x)) (recur more)
+               :else (r/ok (target/section proj names (:ok x)))))))))))
 
 (defn subject
   "Result<Profile> for a tool call: `target` resolves a section, else `id`
    looks up a preset or an active section. A target is resolved against the
    config as it is now, so an active section picks up what its project gained
    since (a program, a TTL); the snapshot it ran with answers only when the
-   target no longer resolves."
-  [ctx {:keys [target id]}]
+   target no longer resolves. `env` is the call's env, used by the compose
+   queries that resolve the target."
+  [ctx {:keys [target id env]}]
   (cond
     (seq target) (let [{:keys [project names]} (target/parse target)
                        sid (when project (target/section-id project names))
-                       fresh (resolve-target ctx target)]
+                       fresh (resolve-target ctx target env)]
                    (if (and (r/err? fresh) sid (active-entry ctx sid))
                      (lookup ctx sid)
                      fresh))

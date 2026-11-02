@@ -193,9 +193,14 @@
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
-        on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))
         opts (call-options params)
-        with-opts (fn [f] (r/bind (checked-options opts) (fn [o] (on-subject #(f (profile/with-call-options % o))))))]
+        on-subject* (fn [f adjust]
+                      (r/bind (checked-options opts)
+                              (fn [o]
+                                (r/bind (ops/subject ctx {:target tgt :id id :env (:env o)})
+                                        #(f (adjust % o))))))
+        on-subject (fn [f] (on-subject* f (fn [p o] (profile/with-call-options p (select-keys o [:env])))))
+        with-opts (fn [f] (on-subject* f profile/with-call-options))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
