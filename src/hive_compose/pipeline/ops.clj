@@ -40,9 +40,18 @@
 
 (defn lookup
   "Result<Profile> for `id`: the configured preset, else the snapshot an active
-   entry (a preset or a section) ran with."
+   entry (a preset or a section) ran with. The snapshot of a section whose
+   project is still configured is re-based on the project as configured now, so
+   a release that follows a restart interpolates the files it names with the
+   variables they need. What the snapshot's env says wins over the project's."
   [ctx id]
-  (if-let [p (or (configured ctx id) (:profile (active-entry ctx id)))]
+  (if-let [p (or (configured ctx id)
+                 (when-let [snap (:profile (active-entry ctx id))]
+                   (let [[pid section?] (str/split id #"/" 2)
+                         proj (get-in ctx [:settings :compose/projects pid])]
+                     (if (and section? proj)
+                       (target/rebase-section nil proj snap)
+                       snap))))]
     (r/ok p)
     (r/err :compose/unknown-profile
            {:profile id :known (vec (sort (keys (get-in ctx [:settings :compose/profiles]))))})))
