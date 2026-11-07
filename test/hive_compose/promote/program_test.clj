@@ -96,3 +96,16 @@
          (program/detached-script ["npx" "shadow-cljs" "watch" "app"] "/l/x.log")))
   (is (= "exec setsid 'sh' '-c' 'echo '\\''hi'\\''' >> '/l/x.log' 2>&1 < /dev/null"
          (program/detached-script "echo 'hi'" "/l/x.log"))))
+
+(deftest a-unit-moves-the-program-into-a-systemd-user-scope
+  ;; systemd-run execs in place, so the pid stays the program's; setsid still
+  ;; makes it a group leader; the scope takes it out of hive's cgroup, which
+  ;; is what an OOM kill of hive takes down.
+  (is (= (str "exec systemd-run --user --scope --quiet --collect --unit='hc-web-1' -- "
+              "setsid 'npx' 'shadow-cljs' 'watch' 'app' >> '/l/x.log' 2>&1 < /dev/null")
+         (program/detached-script ["npx" "shadow-cljs" "watch" "app"] "/l/x.log"
+                                  {:unit "hc-web-1"})))
+  (testing "no unit, or a nil opts map, is the plain setsid script"
+    (is (= (program/detached-script "x" "/l")
+           (program/detached-script "x" "/l" nil)
+           (program/detached-script "x" "/l" {})))))
