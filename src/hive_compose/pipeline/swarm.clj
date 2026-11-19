@@ -10,8 +10,10 @@
      agent leaves the swarm.
    * observe!: one pass of the reaper. It expires claims, counts as use the
      claims that hold, the agents whose cwd lies in the section's project and
-     the connections newly opened to its nREPL (and, opt-in, published) ports,
-     touches what is in use, marks a section whose last claim ended orphaned
+     the connections newly opened to its nREPL (and, opt-in per project with
+     :project/activity, published) ports, the connections its own containers
+     hold to those left out, touches what is in use, records which source
+     counted (:usage :sources), marks a section whose last claim ended orphaned
      (reaped after the shorter orphan TTL), and tells each agent once which
      shared nREPL drives the module it works in.
 
@@ -144,6 +146,39 @@
           #{}))
       #{})))
 
+(defn- container-addresses
+  "The addresses the running containers of active entry `a`'s project hold:
+   peers from there are the project talking to itself, not use. #{} when the
+   engine cannot tell."
+  [ctx a]
+  (let [engine (:engine ctx) p (:profile a)]
+    (if (and p (satisfies? port/IContainerAddresses engine))
+      (let [res (port/-addresses engine p)]
+        (if (r/ok? res) (set (:ok res)) #{}))
+      #{})))
+
+(defn- section-profile
+  "The Profile of active entry `sid`/`a`: as configured now, else as it ran."
+  [ctx sid a]
+  (or (get-in ctx [:settings :compose/profiles sid]) (:profile a)))
+
+(defn section-activity
+  "Which new connections count as use of active section `sid`/`a`: its
+   project's :project/activity (a preset's :profile/activity), else the
+   global :compose/activity."
+  [ctx sid a]
+  (profile/activity (merge config/defaults (:settings ctx)) (section-profile ctx sid a)))
+
+(defn- watched-ports
+  "{port source} the pass watches for active entry `a` under activity
+   `kinds`: the nREPLs of its running routes `srs` (:nrepl) and the host ports
+   its containers publish (:published). A port that is both is :nrepl."
+  [ctx a srs kinds]
+  (merge (when (contains? kinds :published)
+           (zipmap (published-ports ctx a) (repeat :published)))
+         (when (contains? kinds :nrepl)
+           (zipmap (keep #(when (:running? %) (:nrepl-port %)) srs) (repeat :nrepl)))))
+
 ;; ---------------------------------------------------------------------------
 ;; observe
 
@@ -178,7 +213,6 @@
         found (agents ctx)
         live (when found (into #{} (map :agent/id) found))
         claim-ttl (* 60000 (setting ctx :compose/claim-ttl-minutes))
-        kinds (set (setting ctx :compose/activity))
         rs (routes ctx)
         active (:active @(:state ctx))
         seen (into (sorted-map)
@@ -186,22 +220,24 @@
                          :let [srs (section-routes rs a)]]
                      [sid {:routes srs
                            :agents (if found (sw/agents-in found (section-dirs ctx srs a)) [])
-                           :ports (into (set (when (contains? kinds :nrepl)
-                                               (keep #(when (:running? %) (:nrepl-port %)) srs)))
-                                        (when (contains? kinds :published) (published-ports ctx a)))
+                           :ports (watched-ports ctx a srs (section-activity ctx sid a))
                            :expired (sw/expired-claims (:claims a) live now claim-ttl)}]))
-        all-ports (into #{} (mapcat :ports) (vals seen))
+        all-ports (into #{} (mapcat (comp keys :ports)) (vals seen))
         peers-now (if (and (:activity ctx) (seq all-ports))
                     (try (port/-peers (:activity ctx) all-ports) (catch Throwable _probe-threw {}))
                     {})
         fresh (sw/fresh-peers (or (:peers @(:state ctx)) {}) peers-now)
         verdicts (into (sorted-map)
                        (for [[sid {:keys [agents ports expired]}] seen
-                             :let [claims (apply dissoc (get-in active [sid :claims]) (keys expired))]]
+                             :let [claims (apply dissoc (get-in active [sid :claims]) (keys expired))
+                                   own (if (sw/published-peers? fresh ports)
+                                         (container-addresses ctx (get active sid))
+                                         #{})]]
                          [sid {:claims claims
                                :expired expired
                                :usage (sw/usage {:claims claims :agents agents
-                                                 :fresh (select-keys fresh ports)})}]))
+                                                 :fresh (sw/section-fresh fresh ports own)
+                                                 :sources ports})}]))
         orphaned (vec (for [[sid {:keys [claims expired usage]}] verdicts
                             :when (and (seq expired) (empty? claims) (not (:in-use? usage)))]
                         sid))]
@@ -337,6 +373,8 @@
                                                (:claims a))
                                  :in-use? (boolean (get-in a [:usage :in-use?]))
                                  :used-by (get-in a [:usage :by] [])
+                                 :in-use-via (get-in a [:usage :sources] [])
+                                 :activity (vec (sort (section-activity ctx sid a)))
                                  :idle-seconds (quot (- now (:last-touch a)) 1000)
                                  :reap-in-seconds (reap-in-seconds ctx p a)}
                           (:orphaned-at a) (assoc :orphaned? true)

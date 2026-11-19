@@ -99,17 +99,70 @@
                   (when (seq new) [p new]))))
         now))
 
+(defn peer-host
+  "The address of `peer` (\"ip:port\", or \"[ip6]:port\"), nil when it has no port."
+  [peer]
+  (let [s (str peer)
+        i (str/last-index-of s ":")]
+    (when (and i (pos? i))
+      (let [h (subs s 0 i)]
+        (if (and (str/starts-with? h "[") (str/ends-with? h "]"))
+          (subs h 1 (dec (count h)))
+          h)))))
+
+(defn without-hosts
+  "{port #{peer}} of `peers` with the peers whose address is one of `hosts`
+   left out, and the ports left with none dropped. The connections a
+   project's own containers hold to its published ports are not its use."
+  [peers hosts]
+  (let [hosts (set hosts)]
+    (if (empty? hosts)
+      (into {} (filter (comp seq val)) peers)
+      (into {}
+            (keep (fn [[p ps]]
+                    (let [left (into #{} (remove #(contains? hosts (peer-host %))) ps)]
+                      (when (seq left) [p left]))))
+            peers))))
+
+(defn published-peers?
+  "True when `fresh` ({port #{peer}}) holds a peer on a port `ports` ({port
+   source}) marks :published: only then is it worth asking who the project's
+   own containers are."
+  [fresh ports]
+  (boolean (some (fn [[p s]] (and (= :published s) (seq (get fresh p)))) ports)))
+
+(defn section-fresh
+  "The fresh peers ({port #{peer}}) of a section watching `ports` ({port
+   source}): those on its ports, with the peers its own containers hold
+   (addresses `own`) left out on its :published ones, where a container's
+   pool to a sibling's port would otherwise look like use."
+  [fresh ports own]
+  (let [mine (into {} (filter (comp seq val)) (select-keys fresh (keys ports)))
+        published (into [] (keep (fn [[p s]] (when (= :published s) p))) ports)]
+    (merge (apply dissoc mine published)
+           (without-hosts (select-keys mine published) own))))
+
 (defn usage
-  "{:in-use? bool :by [reason]} of an active section from what one pass saw:
-   `claims` still holding, `agents` working in its project's directories and
-   `fresh` ({port #{peer}}) connections opened to its ports since the last
-   pass. A reason is {:claim agent}, {:agent id} or {:port p :peers n}."
-  [{:keys [claims agents fresh]}]
-  (let [by (vec (concat (map (fn [a] {:claim a}) (sort (keys claims)))
+  "{:in-use? bool :by [reason] :sources [source]} of an active section from
+   what one pass saw: `claims` still holding, `agents` working in its
+   project's directories and `fresh` ({port #{peer}}) connections opened to
+   its ports since the last pass, each port's source (:nrepl, :published)
+   given by `sources` ({port source}). A reason is {:claim agent}, {:agent id}
+   or {:port p :peers n :source s}; :sources names, in that order and once
+   each, what the reasons came from: :claim, :agent, or a port's source
+   (:port when `sources` does not name it)."
+  [{:keys [claims agents fresh sources]}]
+  (let [ports (for [[p peers] (sort-by key fresh) :when (seq peers)]
+                (cond-> {:port p :peers (count peers)}
+                  (get sources p) (assoc :source (get sources p))))
+        by (vec (concat (map (fn [a] {:claim a}) (sort (keys claims)))
                         (map (fn [a] {:agent (:agent/id a)}) agents)
-                        (for [[p peers] (sort-by key fresh) :when (seq peers)]
-                          {:port p :peers (count peers)})))]
-    {:in-use? (boolean (seq by)) :by by}))
+                        ports))]
+    {:in-use? (boolean (seq by))
+     :by by
+     :sources (vec (distinct (concat (when (seq claims) [:claim])
+                                     (when (seq agents) [:agent])
+                                     (map #(or (:source %) :port) ports))))}))
 
 ;; ---------------------------------------------------------------------------
 ;; nREPL routes

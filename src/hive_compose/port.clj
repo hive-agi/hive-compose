@@ -41,6 +41,13 @@
   (-published [e profile]
     "Result<{service #{port}}>: the host ports published by the running containers of the profile's project."))
 
+(defprotocol IContainerAddresses
+  "Optional engine capability: the addresses the running containers of a
+   project hold on their networks, so the connections they open to the
+   project's own published ports are not taken for use of it."
+  (-addresses [e profile]
+    "Result<#{ip}>: the network addresses of the running containers of the profile's project."))
+
 (defprotocol ISwarm
   "The agents working beside the addon and the channel that reaches them."
   (-agents [s]
