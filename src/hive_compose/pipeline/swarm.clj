@@ -147,17 +147,31 @@
 ;; ---------------------------------------------------------------------------
 ;; observe
 
-(defn- notice-data [{:keys [agent section routes]}]
+(defn- notice-data
+  "The :nrepl/route notice for one agent, addressed to it (:to)."
+  [{:keys [agent section routes]}]
   {:message (str agent " works in " section "'s project: "
                  (str/join "; " (map sw/route-advice routes)))
+   :to agent
    :agent agent
    :section section
    :nrepl (mapv #(select-keys % [:dir :program/id :nrepl-port]) routes)})
 
+(defn- notice-channel
+  "The channel a delivered notice result `res` went out on: :direct or
+   :broadcast (an ISwarm answering a bare true counts as :broadcast)."
+  [res]
+  (let [v (:ok res)]
+    (or (when (map? v) (:channel v)) :broadcast)))
+
 (defn observe!
   "One usage pass over the active sections (see the ns doc). Answers
    {:swarm :ok|:absent|:off :agents n :in-use [id] :expired [{:section :agent
-   :reason}] :orphaned [id] :notified [{:agent :section}]}."
+   :reason}] :orphaned [id] :notified [{:agent :section :channel}]}, where
+   :channel says how the agent's route notice went out: :direct to it, or
+   :broadcast when no directed channel resolved. A route notice goes to the
+   agents a section concerns: those holding a claim on it and those whose
+   cwd lies in its project's directories."
   [ctx]
   (let [now ((:now ctx))
         wired (swarm ctx)
@@ -210,16 +224,23 @@
                                                                         (dissoc :orphaned-at)))))))
                                    m verdicts))))))
     (let [told (or (:told @(:state ctx)) #{})
-          working (into {} (for [[sid {:keys [agents]}] seen :when (seq agents)] [sid agents]))
+          working (into {} (for [[sid {:keys [agents]}] seen
+                                 :let [concerned (sw/concerned agents (keys (get-in verdicts [sid :claims])))]
+                                 :when (seq concerned)]
+                             [sid concerned]))
           due (when (and wired (setting ctx :compose/notify?))
                 (sw/notices working (into {} (map (fn [[sid v]] [sid (:routes v)])) seen) told))
           sent (vec (for [n due
                           :let [res (notify! ctx :nrepl/route (notice-data n))]
                           :when (and res (r/ok? res))]
-                      [(:agent n) (:section n)]))
-          active-now (set (keys (:active @(:state ctx))))
-          keep? (fn [[agent sid]] (and (contains? active-now sid) (or (nil? live) (contains? live agent))))]
-      (swap! (:state ctx) assoc :told (into #{} (filter keep?) (into told sent)))
+                      {:agent (:agent n) :section (:section n) :channel (notice-channel res)}))
+          active-now (:active @(:state ctx))
+          keep? (fn [[agent sid]]
+                  (and (contains? active-now sid)
+                       (or (nil? live) (contains? live agent)
+                           (contains? (get-in active-now [sid :claims]) agent))))]
+      (swap! (:state ctx) assoc :told (into #{} (filter keep?)
+                                            (into told (map (juxt :agent :section)) sent)))
       (persist! ctx)
       {:swarm (cond (nil? wired) :off found :ok :else :absent)
        :agents (count found)
@@ -227,7 +248,7 @@
        :expired (vec (for [[sid v] verdicts [agent reason] (:expired v)]
                        {:section sid :agent agent :reason reason}))
        :orphaned orphaned
-       :notified (mapv (fn [[a s]] {:agent a :section s}) sent)})))
+       :notified sent})))
 
 ;; ---------------------------------------------------------------------------
 ;; claims

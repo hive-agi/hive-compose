@@ -30,6 +30,14 @@
     (is (= ["a" "b"] (map :agent/id (sw/agents-in agents ["/w/shop"])))
         "a coordinator above the project does not count as working in it")))
 
+(deftest concerned-joins-claimants-and-working-agents
+  (let [working [{:agent/id "b" :agent/cwd "/w/shop/api"}]]
+    (is (= [{:agent/id "a"} {:agent/id "b" :agent/cwd "/w/shop/api"}]
+           (sw/concerned working ["b" "a" nil]))
+        "a claimant also working keeps its row; one the swarm does not list stands by id")
+    (is (= [] (sw/concerned [] [])))
+    (is (= working (sw/concerned working nil)))))
+
 (deftest a-claim-renews-and-keeps-its-start
   (let [c1 (sw/claim {} "ling-1" 100 {:note "fix login" :swarm? true})
         c2 (sw/claim c1 "ling-1" 500 {})]
