@@ -94,16 +94,25 @@
      :declared block
      :source source}))
 
-(defn- build-ctx [cfg settings persisted]
-  {:engine (or (:compose/engine cfg)
-               (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
-   :runner (or (:compose/runner cfg) (host/make-runner cfg))
-   :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
-   :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
-   :settings settings
-   :state (atom (merge {:active {} :current nil} (select-keys persisted [:active :current])))
-   :now (or (:compose/now cfg) now-ms)
-   :save! (or (:compose/save! cfg) #(files/save-state! (:compose/state-file settings) %))})
+(defn- build-ctx
+  "The context. Unless `:compose/save!` is injected, every save merges with the
+   state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
+   so an instance sharing the file through a hot remount loses nothing."
+  [cfg settings persisted]
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current]))
+        state (atom st)
+        base (atom st)
+        sync! #(files/sync-state! (:compose/state-file settings) base state)]
+    {:engine (or (:compose/engine cfg)
+                 (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
+     :runner (or (:compose/runner cfg) (host/make-runner cfg))
+     :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
+     :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
+     :settings settings
+     :state state
+     :now (or (:compose/now cfg) now-ms)
+     :save! (or (:compose/save! cfg) (fn [_] (sync!)))
+     :sync! (when-not (:compose/save! cfg) sync!)}))
 
 ;; ---------------------------------------------------------------------------
 ;; reaper
@@ -118,7 +127,8 @@
       (not (.compareAndSet busy false true)) {:skipped :busy}
       :else
       (try
-        (let [adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
+        (let [_ (when-let [sync! (:sync! ctx)] (sync!))
+              adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
                         (ops/adopt! ctx))
               observed (swarm/observe! ctx)
               reaped (ops/reap! ctx)
