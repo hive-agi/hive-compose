@@ -71,6 +71,8 @@
     (is (r/ok? res))
     (is (= #{"api" "postgres"} (stub/running (:engine c) "shop")) "claim started what it needs")
     (is (= ["ling-1"] (:claims (:ok res))))
+    (is (some? (:started (:ok res))))
+    (is (not (contains? (:started (:ok res)) :out)) "docker's own output stays out of the claim answer")
     (let [[route] (:nrepl (:ok res))]
       (is (= repl-port (:nrepl-port route)))
       (is (= "/w/shop/api" (:dir route)))

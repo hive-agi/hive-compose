@@ -226,10 +226,38 @@
           (sort-by key (program/release-programs (:active @(:state ctx)) id keep)))
     []))
 
-(defn- execute! [{:keys [engine]} p {:keys [action services]}]
+(defn- execute-once! [{:keys [engine]} p {:keys [action services]}]
   (case action
     :stop (port/-stop! engine p services)
     :down (port/-down! engine p services)))
+
+(def ^:private no-such-service "no such service: ")
+
+(defn unknown-service-name
+  "The service compose named in a `no such service: <name>` refusal, nil for
+   any other result."
+  [res]
+  (when (target/unknown-service? res)
+    (let [s (str (:stderr res))
+          i (str/index-of s no-such-service)]
+      (when i
+        (first (str/split-lines (str/trim (subs s (+ i (count no-such-service))))))))))
+
+(defn- execute!
+  "Run Release `step` on `p`. A service compose no longer defines (a stale
+   snapshot: an adopted section, a file edited since) is dropped and the
+   step retried, so one unknown name never keeps the rest running. Answers
+   the result, with :unknown [service] when any were dropped."
+  [ctx p step]
+  (loop [step step dropped []]
+    (let [res (execute-once! ctx p step)
+          svc (unknown-service-name res)]
+      (if (and svc (some #{svc} (:services step)) (< (count dropped) 64))
+        (let [left (vec (remove #{svc} (:services step)))]
+          (if (empty? left)
+            (r/ok {:out "" :skipped :no-services :unknown (conj dropped svc)})
+            (recur (assoc step :services left) (conj dropped svc))))
+        (cond-> res (and (seq dropped) (r/ok? res)) (update :ok assoc :unknown dropped))))))
 
 (defn- forget [st id]
   (-> st
@@ -252,7 +280,8 @@
 
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
-    (r/err? result) (assoc :error result)))
+    (r/err? result) (assoc :error result)
+    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))))
 
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile

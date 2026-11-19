@@ -14,13 +14,13 @@
 ;; paths
 
 (defn clean-dir
-  "`dir` without trailing slashes (\"/\" stays itself); nil when blank."
+  "`dir` normalized: `.` and `..` segments resolved lexically (no filesystem
+   read, links untouched) and no trailing slash (\"/\" stays itself); nil
+   when blank. A configured dir like `dc/../../wt/app` and an agent's cwd
+   `/wt/app/src` then compare as the same tree."
   [dir]
   (when-not (str/blank? dir)
-    (loop [d dir]
-      (if (and (> (count d) 1) (str/ends-with? d "/"))
-        (recur (subs d 0 (dec (count d))))
-        d))))
+    (str (.normalize (java.nio.file.Paths/get ^String dir (make-array String 0))))))
 
 (defn under?
   "True when `path` is `dir` or lies below it."
