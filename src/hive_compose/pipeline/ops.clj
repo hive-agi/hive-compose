@@ -17,6 +17,7 @@
    once its containers are up and stop when the last section holding them is
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
@@ -162,7 +163,7 @@
 ;; ---------------------------------------------------------------------------
 ;; release
 
-(defn- runner
+(defn runner
   "The program runner, nil when the context has none or programs are off."
   [ctx]
   (when (get-in ctx [:settings :compose/programs?] true) (:runner ctx)))
@@ -176,6 +177,35 @@
           (filter (fn [[_ run]] (port/-alive? rn (:pid run))))
           (program/running-in (:active @(:state ctx)) project nil))
     {}))
+
+(def ^:private tail-lines
+  "How many log lines an exited program reports."
+  20)
+
+(defn- exit-facts
+  "{:status :exited :exited? true :exit-code :log-tail :advice} of started
+   program `run` whose process is gone. The code and the tail come from a
+   runner that keeps them (IProgramOutcome); without one only the death shows."
+  [rn run]
+  (let [outcome? (satisfies? port/IProgramOutcome rn)
+        code (when outcome? (port/-exit-code rn (:pid run)))
+        tail (if (and outcome? (:log run)) (port/-log-tail rn (:log run) tail-lines) [])]
+    (cond-> {:status :exited :exited? true :log-tail tail
+             :advice (program/exit-advice run code tail)}
+      (some? code) (assoc :exit-code code))))
+
+(defn- await-exit
+  "True when `pid` is gone within the program grace (`:compose/program-grace-ms`,
+   0 when the settings carry none): a program that dies right after its start."
+  [ctx rn pid]
+  (let [grace (get-in ctx [:settings :compose/program-grace-ms] 0)]
+    (loop [left grace]
+      (cond
+        (not (port/-alive? rn pid)) true
+        (<= left 0) false
+        :else (let [step (min 100 left)]
+                (Thread/sleep (long step))
+                (recur (- left step)))))))
 
 (defn- start-program!
   "Result<Running>: Program `p` of compose project `project`, completed from the
@@ -192,13 +222,16 @@
           (r/ok {:program/id (:program/id p) :external? true :nrepl-port nrepl
                  :dir (:program/dir p) :kind (:program/kind ready)})
           (r/let-ok [started (port/-start! rn ready log)]
-            (r/ok (cond-> {:program/id (:program/id p)
-                           :pid (:pid started)
-                           :log log
-                           :dir (:program/dir p)
-                           :kind (:program/kind ready)
-                           :started-at ((:now ctx))}
-                    nrepl (assoc :nrepl-port nrepl)))))))))
+            (let [run (cond-> {:program/id (:program/id p)
+                               :pid (:pid started)
+                               :log log
+                               :dir (:program/dir p)
+                               :kind (:program/kind ready)
+                               :started-at ((:now ctx))}
+                        nrepl (assoc :nrepl-port nrepl))]
+              (r/ok (if (await-exit ctx rn (:pid run))
+                      (merge run (exit-facts rn run))
+                      run)))))))))
 
 (defn- start-programs!
   "Start the programs `p` pairs with `services`, reusing the live ones in
@@ -217,6 +250,8 @@
                     (cond
                       (r/err? res) (update acc :report conj {:program/id id :error res})
                       (:external? (:ok res)) (update acc :report conj (:ok res))
+                      ;; died within the grace: reported, never held
+                      (:exited? (:ok res)) (update acc :report conj (:ok res))
                       :else (-> acc
                                 (assoc-in [:held id] (:ok res))
                                 (update :report conj (assoc (:ok res) :started? true))))))))
@@ -235,10 +270,38 @@
           (sort-by key (program/release-programs (:active @(:state ctx)) id keep)))
     []))
 
-(defn- execute! [{:keys [engine]} p {:keys [action services]}]
+(defn- execute-once! [{:keys [engine]} p {:keys [action services]}]
   (case action
     :stop (port/-stop! engine p services)
     :down (port/-down! engine p services)))
+
+(def ^:private no-such-service "no such service: ")
+
+(defn unknown-service-name
+  "The service compose named in a `no such service: <name>` refusal, nil for
+   any other result."
+  [res]
+  (when (target/unknown-service? res)
+    (let [s (str (:stderr res))
+          i (str/index-of s no-such-service)]
+      (when i
+        (first (str/split-lines (str/trim (subs s (+ i (count no-such-service))))))))))
+
+(defn- execute!
+  "Run Release `step` on `p`. A service compose no longer defines (a stale
+   snapshot: an adopted section, a file edited since) is dropped and the
+   step retried, so one unknown name never keeps the rest running. Answers
+   the result, with :unknown [service] when any were dropped."
+  [ctx p step]
+  (loop [step step dropped []]
+    (let [res (execute-once! ctx p step)
+          svc (unknown-service-name res)]
+      (if (and svc (some #{svc} (:services step)) (< (count dropped) 64))
+        (let [left (vec (remove #{svc} (:services step)))]
+          (if (empty? left)
+            (r/ok {:out "" :skipped :no-services :unknown (conj dropped svc)})
+            (recur (assoc step :services left) (conj dropped svc))))
+        (cond-> res (and (seq dropped) (r/ok? res)) (update :ok assoc :unknown dropped))))))
 
 (defn- forget [st id]
   (-> st
@@ -261,7 +324,8 @@
 
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
-    (r/err? result) (assoc :error result)))
+    (r/err? result) (assoc :error result)
+    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))))
 
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
@@ -347,7 +411,8 @@
                                 :started-at (or (:started-at a) now)
                                 :last-touch now}
                          wider (assoc :needs (vec needs))
-                         (seq held) (assoc :programs held))))
+                         (seq held) (assoc :programs held)
+                         (seq (:claims a)) (assoc :claims (:claims a)))))
         (r/ok (cond-> {:profile id :project (profile/project p) :services services :out (:out out)}
                 wider (assoc :needs (vec needs))
                 (seq report) (assoc :programs report)))))))
@@ -556,14 +621,18 @@
 ;; ---------------------------------------------------------------------------
 ;; reads
 
-(defn- program-row
+(defn program-row
   "What is known of started program `run` right now: alive, and whether its
-   nREPL answers. A port the program chose itself is read from its .nrepl-port."
+   nREPL answers. A port the program chose itself is read from its .nrepl-port.
+   One whose process is gone is :status :exited, with its exit code when the
+   runner kept it and the last lines of its log."
   [ctx run]
   (let [rn (runner ctx)
+        alive? (when rn (port/-alive? rn (:pid run)))
         port (or (:nrepl-port run) (when rn (port/-nrepl-port rn (:dir run))))]
     (cond-> (select-keys run [:program/id :pid :kind :log :dir])
-      rn (assoc :alive? (port/-alive? rn (:pid run)))
+      rn (assoc :alive? alive? :status (if alive? :running :exited))
+      (and rn (not alive?)) (merge (exit-facts rn run))
       port (assoc :nrepl-port port)
       (and rn port) (assoc :nrepl-ready? (port/-listening? rn port)))))
 
@@ -594,19 +663,26 @@
         broken (into {} (for [[id h] health :when (not (:ok? h))] [(:compose-project h) id]))
         row (fn [id p]
               (let [a (get active id)
-                    ttl (profile/ttl-ms settings p)
+                    ttl (if a (plan/effective-ttl-ms settings p a) (profile/ttl-ms settings p))
                     bad (get broken (profile/project p))]
                 (cond-> {:id id
                          :project (profile/project p)
                          :active? (some? a)
                          :ttl-minutes (quot ttl 60000)
-                         :idle-action (profile/idle-action settings p)}
+                         :idle-action (profile/idle-action settings p)
+                         :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
                   (and a bad) (assoc :reap-blocked? true)
+                  (seq (:claims a)) (assoc :claims (into (sorted-map)
+                                                         (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
+                                                         (:claims a)))
+                  (:orphaned-at a) (assoc :orphaned? true)
+                  (:usage a) (assoc :usage (:usage a)
+                                    :in-use-via (get-in a [:usage :sources] []))
                   (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
                                                              (sort-by key (:programs a)))))))]
     (cond-> {:ok? (empty? broken)

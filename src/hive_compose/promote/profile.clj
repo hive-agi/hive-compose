@@ -30,6 +30,13 @@
   [settings p]
   (or (:profile/idle-action p) (:compose/default-idle-action settings)))
 
+(defn activity
+  "Which new connections count as use of `p`: its own :profile/activity (from
+   its project's :project/activity for a section), else the global
+   :compose/activity. A set of :nrepl and :published."
+  [settings p]
+  (set (or (:profile/activity p) (:compose/activity settings))))
+
 (defn with-call-options
   "`p` adjusted for one `up`/`switch` call: `no-deps?` starts only its named
    services (their dependencies must already run), `wait?` waits until they

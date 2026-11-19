@@ -41,6 +41,14 @@
 (defn ps-argv [p]
   (into (base-argv p) ["ps" "--format" "json"]))
 
+(defn ids-argv
+  "The ids of the running containers of `p`'s project."
+  [p]
+  (into (base-argv p) ["ps" "-q"]))
+
+(defn inspect-argv [ids]
+  (into ["docker" "inspect" "--type" "container"] ids))
+
 (defn listed-argv [p]
   (into (base-argv p) ["config" "--services"]))
 
@@ -100,6 +108,33 @@
   (into (sorted-set)
         (comp (filter #(= "running" (get % "State")))
               (keep #(get % "Service")))
+        rows))
+
+(defn published-ports
+  "{service #{host-port}} of the running containers in `ps` rows: the
+   PublishedPort of each of their Publishers that publishes one."
+  [rows]
+  (reduce (fn [acc row]
+            (let [svc (get row "Service")
+                  ports (into #{} (keep (fn [pub]
+                                          (let [p (get pub "PublishedPort")]
+                                            (when (and (int? p) (pos? p)) (long p)))))
+                              (get row "Publishers"))]
+              (if (and svc (= "running" (get row "State")) (seq ports))
+                (update acc svc (fnil into #{}) ports)
+                acc)))
+          {}
+          rows))
+
+(defn container-addresses
+  "#{ip} of `docker inspect` rows: the IPv4 and global IPv6 address each
+   running container holds on each of its networks."
+  [rows]
+  (into (sorted-set)
+        (comp (filter #(true? (get-in % ["State" "Running"])))
+              (mapcat #(vals (get-in % ["NetworkSettings" "Networks"])))
+              (mapcat (juxt #(get % "IPAddress") #(get % "GlobalIPv6Address")))
+              (remove str/blank?))
         rows))
 
 (defn closure-services
@@ -208,7 +243,20 @@
   ;; query would drop that service and its edges.
   (-dependencies [_ p]
     (parsed (run exec p (closure-argv p) timeout-ms)
-            :compose/unparseable dependency-graph)))
+            :compose/unparseable dependency-graph))
+
+  port/IPublishedPorts
+  (-published [_ p]
+    (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
+            (comp published-ports parse-json-rows)))
+
+  port/IContainerAddresses
+  (-addresses [_ p]
+    (r/let-ok [ids (r/map-ok (run exec p (ids-argv p) timeout-ms) lines)]
+      (if (empty? ids)
+        (r/ok #{})
+        (parsed (run exec p (inspect-argv ids) timeout-ms) :compose/unparseable
+                (comp container-addresses parse-json-rows))))))
 
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),

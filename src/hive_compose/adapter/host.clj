@@ -23,7 +23,8 @@
             [hive-system.process.core :as process]
             [hive-system.process.liveness :as liveness]
             [hive-system.shell.core :as shell])
-  (:import (java.net InetSocketAddress Socket)))
+  (:import (java.io RandomAccessFile)
+           (java.net InetSocketAddress Socket)))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -69,7 +70,28 @@
       (<= left 0) false
       :else (do (Thread/sleep 100) (recur (- left 100))))))
 
-(defrecord HostRunner [spawn exec alive? grace-ms resolver]
+(defn- tail-lines
+  "The last `n` non-blank lines of file `log`, read from its last 16 KiB; []
+   when it is absent or unreadable."
+  [log n]
+  (let [f (io/file log)]
+    (if-not (.isFile f)
+      []
+      (try (with-open [raf (RandomAccessFile. f "r")]
+             (let [len (.length raf)
+                   start (max 0 (- len 16384))
+                   buf (byte-array (- len start))]
+               (.seek raf start)
+               (.readFully raf buf)
+               (->> (str/split-lines (String. buf "UTF-8"))
+                    (remove str/blank?)
+                    (take-last n)
+                    vec)))
+           (catch java.io.IOException _unreadable-log-has-no-tail [])))))
+
+(declare scope-unit)
+
+(defrecord HostRunner [spawn exec alive? grace-ms resolver systemd-scope? procs]
   port/IProgramRunner
   (-facts [_ dir]
     (r/try-effect* :compose/program-unreadable (facts dir)))
@@ -78,11 +100,18 @@
     ;; keeps the program from starting and names itself in the error.
     (r/let-ok [_ (r/try-effect* :compose/log-unwritable (io/make-parents (io/file log)) log)
                env (secrets/resolve-env resolver (:program/env p))]
-      (r/map-ok (spawn (program/detached-script (:program/command p) log)
+      (r/map-ok (spawn (program/detached-script
+                        (:program/command p) log
+                        (when systemd-scope?
+                          {:unit (scope-unit p (System/currentTimeMillis))}))
                        (cond-> {:dir (:program/dir p)}
                          (seq env) (assoc :env env)))
                 (fn [handle]
                   (close-pipes! handle)
+                  ;; The JVM handle is kept so the exit code of a program
+                  ;; that dies can be read; a pid from before a restart has none.
+                  (when (instance? Process (:process handle))
+                    (swap! procs assoc (:pid handle) (:process handle)))
                   {:pid (:pid handle)}))))
   (-alive? [_ pid] (boolean (alive? pid)))
   (-listening? [_ port]
@@ -103,18 +132,49 @@
         (when-not (await-death alive? pid grace-ms)
           (signal-group! exec pid "KILL")
           (await-death alive? pid 2000))
-        {:pid pid :stopped? (not (alive? pid))}))))
+        {:pid pid :stopped? (not (alive? pid))})))
+  port/IProgramOutcome
+  (-exit-code [_ pid]
+    (let [p (get @procs pid)]
+      (when (and (instance? Process p) (not (.isAlive ^Process p)))
+        (.exitValue ^Process p))))
+  (-log-tail [_ log n] (tail-lines log n)))
+
+(defn- systemd-user-scope?
+  "True when a systemd user manager answers here: `systemd-run` is on PATH and
+   the manager's private socket exists under XDG_RUNTIME_DIR."
+  []
+  (boolean
+   (and (some-> (System/getenv "XDG_RUNTIME_DIR")
+                (io/file "systemd" "private")
+                (.exists))
+        (some (fn [d] (.canExecute (io/file d "systemd-run")))
+              (str/split (or (System/getenv "PATH") "") #":")))))
+
+(defn scope-unit
+  "Name of the transient systemd scope a program runs in: `hc-<id>-<ms>`. The
+   time keeps a restarted program from colliding with a scope not yet collected."
+  [p now-ms]
+  (str "hc-" (:program/id p) "-" now-ms))
 
 (defn make-runner
   "HostRunner. `opts`: :spawn (default hive-system `process.core/spawn!`), :exec
    (default `shell.core/exec!`), :alive? (default `process.liveness/alive?`),
    :compose/stop-grace-ms before a group is killed (default 5000),
    :compose/resolver ({scheme ISecretBackend}, default the `pass` one over that
-   exec) for the references in a program's env."
+   exec) for the references in a program's env, :compose/systemd-scope? (default:
+   whether a systemd user manager answers) to start each program in a transient
+   `systemd-run --user --scope` of its own, outside the hive JVM's cgroup, so an
+   OOM kill of hive does not take the programs with it. Without a user manager
+   the program starts under setsid alone, as before."
   [opts]
   (let [exec (or (:exec opts) shell/exec!)]
     (->HostRunner (or (:spawn opts) process/spawn!)
                   exec
                   (or (:alive? opts) liveness/alive?)
                   (or (:compose/stop-grace-ms opts) 5000)
-                  (or (:compose/resolver opts) (secrets/make-resolver {:exec exec})))))
+                  (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
+                  (if (contains? opts :compose/systemd-scope?)
+                    (boolean (:compose/systemd-scope? opts))
+                    (systemd-user-scope?))
+                  (atom {}))))

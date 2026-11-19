@@ -57,6 +57,12 @@
    [:kind {:optional true} :keyword]
    [:nrepl-port {:optional true} :int]])
 
+(def Activity
+  "Which new connections to a section's ports count as use of it: :nrepl (the
+   shared nREPLs of its programs) and :published (the host ports its
+   containers publish, a browser or any host-side client)."
+  [:set [:enum :nrepl :published]])
+
 (def Profile
   [:map
    [:profile/id ProfileId]
@@ -71,7 +77,28 @@
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
+   [:profile/activity {:optional true} Activity]
    [:profile/description {:optional true} :string]])
+
+(def Claim
+  "An agent's declaration that it works on a section: since when, when it was
+   last renewed, what for, and whether the agent was in the swarm when it
+   claimed (then the claim ends with the agent)."
+  [:map
+   [:since :int]
+   [:seen :int]
+   [:note {:optional true} :string]
+   [:swarm? {:optional true} :boolean]])
+
+(def Usage
+  "What the last reaper pass saw using a section. A reason is {:claim agent},
+   {:agent id} or {:port p :peers n :source :nrepl|:published}; :sources names
+   once each what the reasons came from (:claim :agent :nrepl :published)."
+  [:map
+   [:at :int]
+   [:in-use? :boolean]
+   [:by [:vector :map]]
+   [:sources {:optional true} [:vector :keyword]]])
 
 (def Active
   "A profile this addon brought up (or adopted) and still answers for. `:profile`
@@ -87,7 +114,10 @@
    [:started-at :int]
    [:last-touch :int]
    [:programs {:optional true} [:map-of :string Running]]
-   [:profile {:optional true} Profile]])
+   [:profile {:optional true} Profile]
+   [:claims {:optional true} [:map-of :string Claim]]
+   [:orphaned-at {:optional true} :int]
+   [:usage {:optional true} Usage]])
 
 (def ActiveMap [:map-of :string Active])
 
@@ -104,7 +134,8 @@
    [:project/env {:optional true} Env]
    [:project/wait? {:optional true} :boolean]
    [:project/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:project/idle-action {:optional true} IdleAction]])
+   [:project/idle-action {:optional true} IdleAction]
+   [:project/activity {:optional true} Activity]])
 
 (def Settings
   [:map
@@ -118,7 +149,13 @@
    [:compose/timeout-ms [:int {:min 1000}]]
    [:compose/up-timeout-ms [:int {:min 1000}]]
    [:compose/adopt? :boolean]
-   [:compose/programs? :boolean]])
+   [:compose/programs? :boolean]
+   [:compose/swarm? :boolean]
+   [:compose/notify? :boolean]
+   [:compose/activity Activity]
+   [:compose/claim-ttl-minutes [:int {:min 1}]]
+   [:compose/orphan-ttl-minutes [:int {:min 1}]]
+   [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."

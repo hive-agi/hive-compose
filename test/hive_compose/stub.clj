@@ -14,6 +14,17 @@
   (when (contains? (:fail @world) method)
     (r/err :stub/fault {:method method})))
 
+(defn- undefined
+  "compose's refusal when `services` names one the world marks :undefined."
+  [world services]
+  (when-let [s (first (filter (or (:undefined @world) #{}) services))]
+    (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " s "\n")})))
+
+(defn undefine!
+  "Make compose refuse `services` as no longer defined."
+  [e & services]
+  (swap! (:world e) update :undefined (fnil into #{}) services))
+
 (defn- enabled
   "Services of `model` enabled under native `profiles`: always-on plus members."
   [model profiles]
@@ -68,11 +79,13 @@
   (-stop! [_ p services]
     (record! world [:stop (profile/project p) (vec services)])
     (or (fault world :stop)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-down! [_ p services]
     (record! world [:down (profile/project p) (vec services)])
     (or (fault world :down)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-restart! [_ p services recreate?]
@@ -99,7 +112,21 @@
                         (for [[svc {:keys [deps optional]}] model
                               :when (shown svc)]
                           [svc (merge (zipmap deps (repeat {:required? true}))
-                                      (zipmap optional (repeat {:required? false})))]))))))))
+                                      (zipmap optional (repeat {:required? false})))])))))))
+
+  port/IPublishedPorts
+  ;; {service #{port}} set with `published!`, of the services running now.
+  (-published [_ p]
+    (or (fault world :published)
+        (let [project (profile/project p)
+              running (get-in @world [:running project] #{})]
+          (r/ok (select-keys (get-in @world [:published project] {}) running)))))
+
+  port/IContainerAddresses
+  ;; #{ip} set with `addresses!`.
+  (-addresses [_ p]
+    (or (fault world :addresses)
+        (r/ok (get-in @world [:addresses (profile/project p)] #{})))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
@@ -113,6 +140,16 @@
 (defn calls [e] (:calls @(:world e)))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
+
+(defn published!
+  "Make the running services of `project` publish host ports `m` ({service #{port}})."
+  [e project m]
+  (swap! (:world e) assoc-in [:published project] m))
+
+(defn addresses!
+  "Make the containers of `project` hold network addresses `ips`."
+  [e project ips]
+  (swap! (:world e) assoc-in [:addresses project] (set ips)))
 
 (defn graph!
   "Make `-dependencies` answer `g` for `project`, whatever the model says."
