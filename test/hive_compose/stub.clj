@@ -20,6 +20,21 @@
   (when-let [s (first (filter (or (:undefined @world) #{}) services))]
     (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " s "\n")})))
 
+(defn- unset
+  "compose's refusal to load a project whose files need a variable the
+   world marks unset (`unset!`)."
+  [world p]
+  (when-let [v (get-in @world [:unset (profile/project p)])]
+    (r/err :compose/command-failed
+           {:exit 1 :stderr (str "error while interpolating services: required variable "
+                                 v " is missing a value: set it\n")})))
+
+(defn unset!
+  "Make every compose call that loads `project`'s files refuse, naming `var`
+   as a required variable with no value. Container calls by name still work."
+  [e project var]
+  (swap! (:world e) assoc-in [:unset project] var))
+
 (defn undefine!
   "Make compose refuse `services` as no longer defined."
   [e & services]
@@ -79,12 +94,14 @@
   (-stop! [_ p services]
     (record! world [:stop (profile/project p) (vec services)])
     (or (fault world :stop)
+        (unset world p)
         (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-down! [_ p services]
     (record! world [:down (profile/project p) (vec services)])
     (or (fault world :down)
+        (unset world p)
         (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
@@ -113,6 +130,17 @@
                               :when (shown svc)]
                           [svc (merge (zipmap deps (repeat {:required? true}))
                                       (zipmap optional (repeat {:required? false})))])))))))
+
+  port/IContainerControl
+  ;; By name: neither an unset variable nor an undefined service refuses it;
+  ;; only a service with a running container is acted on.
+  (-stop-containers! [_ p services action]
+    (record! world [(if (= :down action) :rm-by-name :stop-by-name) (profile/project p) (vec services)])
+    (or (fault world :stop-containers)
+        (let [project (profile/project p)
+              hit (vec (sort (filter (get-in @world [:running project] #{}) services)))]
+          (swap! world update-in [:running project] #(reduce disj (or % #{}) hit))
+          (r/ok {:out "" :containers (mapv #(str project "-" % "-1") hit)}))))
 
   port/IPublishedPorts
   ;; {service #{port}} set with `published!`, of the services running now.

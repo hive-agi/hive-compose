@@ -85,6 +85,32 @@
 (defn logs-argv [p services tail]
   (-> (base-argv p) (into ["logs" "--no-color" "--tail" (str tail)]) (into services)))
 
+(defn containers-argv
+  "Every container of `p`'s compose project, running or not, found by its
+   compose labels, one `<name>\t<service>` line each. Loads no compose file."
+  [p]
+  ["docker" "ps" "-a" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   "--format" "{{.Names}}\t{{.Label \"com.docker.compose.service\"}}"])
+
+(defn container-names
+  "Sorted names of the containers of `services` in `containers-argv` output."
+  [s services]
+  (let [wanted (set services)]
+    (vec (sort (for [line (lines s)
+                     :let [[nm svc] (str/split line #"\t" 2)]
+                     :when (and (seq nm) (wanted svc))]
+                 nm)))))
+
+(defn stop-containers-argv
+  "`docker stop` of container `names`."
+  [names]
+  (into ["docker" "stop"] names))
+
+(defn rm-containers-argv
+  "`docker rm` of stopped container `names`: their anonymous volumes stay."
+  [names]
+  (into ["docker" "rm"] names))
+
 (def ls-argv ["docker" "compose" "ls" "--all" "--format" "json"])
 
 (def version-argv ["docker" "compose" "version" "--short"])
@@ -244,6 +270,22 @@
   (-dependencies [_ p]
     (parsed (run exec p (closure-argv p) timeout-ms)
             :compose/unparseable dependency-graph))
+
+  port/IContainerControl
+  ;; By label and name only: no compose file is loaded, so neither a service
+  ;; the project's files no longer define nor a variable nobody set stops it.
+  (-stop-containers! [_ p services action]
+    (if (empty? services)
+      (r/ok {:out "" :skipped :no-services :containers []})
+      (r/let-ok [names (r/map-ok (run exec nil (containers-argv p) timeout-ms)
+                                 #(container-names % services))]
+        (if (empty? names)
+          (r/ok {:out "" :skipped :no-containers :containers []})
+          (r/let-ok [stopped (run exec nil (stop-containers-argv names) timeout-ms)
+                     removed (if (= :down action)
+                               (run exec nil (rm-containers-argv names) timeout-ms)
+                               (r/ok ""))]
+            (r/ok {:out (clip (str stopped removed)) :containers names}))))))
 
   port/IPublishedPorts
   (-published [_ p]
