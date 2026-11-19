@@ -263,7 +263,7 @@
                            :claim-ttl-minutes (setting ctx :compose/claim-ttl-minutes)
                            :renew "claim again (or touch) before the claim TTL runs out; release when done"
                            :nrepl (with-advice (section-routes (routes ctx) a))}
-                    up (assoc :started (:ok up))))))))))
+                    up (assoc :started (dissoc (:ok up) :out))))))))))
 
 (defn release-claim!
   "Result: `agent` gives up its claim on section `p`. When no claim is left the

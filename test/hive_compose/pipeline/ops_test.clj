@@ -65,6 +65,22 @@
     (is (= #{} (stub/running (:engine c) "shop")))
     (is (= #{"ghost" "mysql"} (stub/running (:engine c) "blog")))))
 
+(deftest a-service-compose-no-longer-defines-does-not-keep-the-rest-up
+  (let [c (ctx)]
+    (ops/up! c "api")
+    (stub/undefine! (:engine c) "api")
+    (advance! c (* 61 minute))
+    (let [[step] (:reaped (ops/reap! c))]
+      (is (:ok? step))
+      (is (= ["api"] (:unknown step)) "the stale name is dropped and named")
+      (is (= [:stop "shop" ["postgres"]] (last (filterv #(= :stop (first %)) (stub/calls (:engine c))))))
+      (is (not (contains? (:active @(:state c)) "api")) "released, so the reaper does not retry it every tick"))))
+
+(deftest unknown-service-name-reads-composes-refusal
+  (is (= "fluxo-api" (ops/unknown-service-name (r/err :compose/command-failed {:stderr "no such service: fluxo-api\n"}))))
+  (is (nil? (ops/unknown-service-name (r/err :compose/command-failed {:stderr "permission denied"}))))
+  (is (nil? (ops/unknown-service-name (r/ok {:out ""})))))
+
 (deftest a-failed-release-keeps-the-profile-tracked
   (let [c (ctx)]
     (ops/up! c "api")

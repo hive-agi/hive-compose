@@ -12,7 +12,15 @@
   (is (sw/under? "/w/shop/" "/w/shop/src/a.clj"))
   (is (not (sw/under? "/w/shop" "/w/shopping/src")) "a sibling sharing the prefix is not inside")
   (is (not (sw/under? "/w/shop" nil)))
-  (is (sw/under? "/" "/anything")))
+  (is (sw/under? "/" "/anything"))
+  (testing "a configured dir with .. segments matches the real tree it names"
+    (is (sw/under? "/home/u/PP/funeraria/dc/../../funeraria-wt/app" "/home/u/PP/funeraria-wt/app/src/core.cljs"))
+    (is (= "/home/u/PP/funeraria-wt/app" (sw/clean-dir "/home/u/PP/funeraria/dc/../../funeraria-wt/app/")))
+    (is (not (sw/under? "/w/a/../b" "/w/a/src")))))
+
+(deftest best-route-resolves-dotdot-dirs
+  (let [routes [{:dir "/home/u/PP/funeraria/dc/../../funeraria-wt/escala" :nrepl-port 7909}]]
+    (is (= 7909 (:nrepl-port (sw/best-route routes "/home/u/PP/funeraria-wt/escala/src/app/core.cljs"))))))
 
 (deftest agents-in-picks-agents-whose-cwd-lies-in-the-dirs
   (let [agents [{:agent/id "b" :agent/cwd "/w/shop/api"}

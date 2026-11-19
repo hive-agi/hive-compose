@@ -14,6 +14,17 @@
   (when (contains? (:fail @world) method)
     (r/err :stub/fault {:method method})))
 
+(defn- undefined
+  "compose's refusal when `services` names one the world marks :undefined."
+  [world services]
+  (when-let [s (first (filter (or (:undefined @world) #{}) services))]
+    (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " s "\n")})))
+
+(defn undefine!
+  "Make compose refuse `services` as no longer defined."
+  [e & services]
+  (swap! (:world e) update :undefined (fnil into #{}) services))
+
 (defn- enabled
   "Services of `model` enabled under native `profiles`: always-on plus members."
   [model profiles]
@@ -68,11 +79,13 @@
   (-stop! [_ p services]
     (record! world [:stop (profile/project p) (vec services)])
     (or (fault world :stop)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-down! [_ p services]
     (record! world [:down (profile/project p) (vec services)])
     (or (fault world :down)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-restart! [_ p services recreate?]
