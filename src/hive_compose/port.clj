@@ -60,6 +60,14 @@
   (-addresses [e profile]
     "Result<#{ip}>: the network addresses of the running containers of the profile's project."))
 
+(defprotocol IContainerLoad
+  "Optional engine capability: how busy the running containers of a project
+   are, so a section working with no client connected (a batch job, a queue
+   worker) can count as use."
+  (-cpu [e profile]
+    "Result<{service percent}>: the CPU use, in percent of one core, of each
+     running service of the profile's project (the busiest of its containers)."))
+
 (defprotocol ISwarm
   "The agents working beside the addon and the channel that reaches them."
   (-agents [s]

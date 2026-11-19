@@ -12,7 +12,8 @@
      claims that hold, the agents whose cwd lies in the section's project and
      the connections newly opened to its nREPL (and, opt-in per project with
      :project/activity, published) ports, the connections its own containers
-     hold to those left out, touches what is in use, records which source
+     hold to those left out, and (opt-in with :cpu) its services busier than
+     :compose/cpu-busy-percent, touches what is in use, records which source
      counted (:usage :sources), marks a section whose last claim ended orphaned
      (reaped after the shorter orphan TTL), and tells each agent once which
      shared nREPL drives the module it works in.
@@ -179,6 +180,19 @@
          (when (contains? kinds :nrepl)
            (zipmap (keep #(when (:running? %) (:nrepl-port %)) srs) (repeat :nrepl)))))
 
+(defn- busy
+  "{service percent} of active entry `a`'s services busier than
+   :compose/cpu-busy-percent, when activity `kinds` holds :cpu; {} otherwise
+   and when the engine cannot tell."
+  [ctx a kinds]
+  (let [engine (:engine ctx) p (:profile a)]
+    (if (and p (contains? kinds :cpu) (satisfies? port/IContainerLoad engine))
+      (let [res (try (port/-cpu engine p) (catch Throwable _probe-threw nil))]
+        (if (and res (r/ok? res))
+          (sw/busy-services (:ok res) (setting ctx :compose/cpu-busy-percent) (plan/footprint a))
+          {}))
+      {})))
+
 ;; ---------------------------------------------------------------------------
 ;; observe
 
@@ -217,10 +231,12 @@
         active (:active @(:state ctx))
         seen (into (sorted-map)
                    (for [[sid a] active
-                         :let [srs (section-routes rs a)]]
+                         :let [srs (section-routes rs a)
+                               kinds (section-activity ctx sid a)]]
                      [sid {:routes srs
                            :agents (if found (sw/agents-in found (section-dirs ctx srs a)) [])
-                           :ports (watched-ports ctx a srs (section-activity ctx sid a))
+                           :ports (watched-ports ctx a srs kinds)
+                           :busy (busy ctx a kinds)
                            :expired (sw/expired-claims (:claims a) live now claim-ttl)}]))
         all-ports (into #{} (mapcat (comp keys :ports)) (vals seen))
         peers-now (if (and (:activity ctx) (seq all-ports))
@@ -228,7 +244,7 @@
                     {})
         fresh (sw/fresh-peers (or (:peers @(:state ctx)) {}) peers-now)
         verdicts (into (sorted-map)
-                       (for [[sid {:keys [agents ports expired]}] seen
+                       (for [[sid {:keys [agents ports busy expired]}] seen
                              :let [claims (apply dissoc (get-in active [sid :claims]) (keys expired))
                                    own (if (sw/published-peers? fresh ports)
                                          (container-addresses ctx (get active sid))
@@ -237,7 +253,8 @@
                                :expired expired
                                :usage (sw/usage {:claims claims :agents agents
                                                  :fresh (sw/section-fresh fresh ports own)
-                                                 :sources ports})}]))
+                                                 :sources ports
+                                                 :busy busy})}]))
         orphaned (vec (for [[sid {:keys [claims expired usage]}] verdicts
                             :when (and (seq expired) (empty? claims) (not (:in-use? usage)))]
                         sid))]

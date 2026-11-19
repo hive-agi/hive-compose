@@ -164,7 +164,15 @@
   ;; #{ip} set with `addresses!`.
   (-addresses [_ p]
     (or (fault world :addresses)
-        (r/ok (get-in @world [:addresses (profile/project p)] #{})))))
+        (r/ok (get-in @world [:addresses (profile/project p)] #{}))))
+
+  port/IContainerLoad
+  ;; {service percent} set with `load!`, of the services running now.
+  (-cpu [_ p]
+    (or (fault world :cpu)
+        (let [project (profile/project p)
+              running (get-in @world [:running project] #{})]
+          (r/ok (select-keys (get-in @world [:load project] {}) running))))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
@@ -183,6 +191,11 @@
   "Make the running services of `project` publish host ports `m` ({service #{port}})."
   [e project m]
   (swap! (:world e) assoc-in [:published project] m))
+
+(defn load!
+  "Make the running services of `project` use CPU `m` ({service percent})."
+  [e project m]
+  (swap! (:world e) assoc-in [:load project] m))
 
 (defn addresses!
   "Make the containers of `project` hold network addresses `ips`."

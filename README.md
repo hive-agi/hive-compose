@@ -270,7 +270,8 @@ that exits within it is reported `:status :exited` with `:exit-code`,
 `:log-tail` and `:advice`, and is not held; `status` reports a held program
 that died since the same way),
 `:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
-(`#{:nrepl}`), `:compose/claim-ttl-minutes` (30), `:compose/orphan-ttl-minutes` (10).
+(`#{:nrepl}`), `:compose/cpu-busy-percent` (5), `:compose/claim-ttl-minutes` (30),
+`:compose/orphan-ttl-minutes` (10).
 
 `:compose/activity` says which new connections count as use; a project
 overrides it for its sections with `:project/activity` (a preset with
@@ -281,6 +282,15 @@ running containers (`docker inspect`) are left out, so pools do not count, and
 a keep-alive connection counts once, when first seen. `who` and `status` name
 the source that counted (`:in-use-via`, e.g. `[:published]`) and each
 section's `:activity`.
+
+`:cpu` in the activity counts a section's running services busier than
+`:compose/cpu-busy-percent` (5, percent of one core) as use, whether or not a
+client is connected: a batch job or a queue worker that nobody touches is not
+reaped while it works. Each reaper pass takes one `docker stats --no-stream`
+sample of the project's running containers (found by compose label) and keeps
+the busiest container per service; `who` shows the reason as
+`{:service "worker" :cpu 80.0 :source :cpu}`. An engine that cannot read the
+load counts nothing, as before.
 
 ## Development
 

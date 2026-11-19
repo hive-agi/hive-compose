@@ -101,6 +101,50 @@
                      :when (and (seq nm) (wanted svc))]
                  nm)))))
 
+(defn running-containers-argv
+  "The running containers of `p`'s compose project, as `containers-argv`."
+  [p]
+  ["docker" "ps" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   "--filter" "status=running"
+   "--format" "{{.Names}}\t{{.Label \"com.docker.compose.service\"}}"])
+
+(defn container-services
+  "{name service} of `containers-argv` output."
+  [s]
+  (into (sorted-map)
+        (for [line (lines s)
+              :let [[nm svc] (str/split line #"\t" 2)]
+              :when (and (seq nm) (seq svc))]
+          [nm svc])))
+
+(defn stats-argv
+  "One `docker stats` sample of container `names`, one `<name>\t<cpu%>` line each."
+  [names]
+  (into ["docker" "stats" "--no-stream" "--format" "{{.Name}}\t{{.CPUPerc}}"] names))
+
+(defn cpu-percent
+  "The number in a `docker stats` CPU column (\"12.5%\"), nil when there is
+   none (\"--\" for a container that just stopped)."
+  [s]
+  (let [t (str/replace (str/trim (str s)) #"%$" "")]
+    (when (re-matches #"\d+(\.\d+)?" t)
+      (Double/parseDouble t))))
+
+(defn service-cpu
+  "{service percent} of `stats-argv` output `s` for containers `names`
+   ({name service}): the busiest container of each service. A container
+   whose reading is no number is left out."
+  [names s]
+  (reduce (fn [acc line]
+            (let [[nm col] (str/split line #"\t" 2)
+                  svc (get names nm)
+                  pct (cpu-percent col)]
+              (if (and svc pct)
+                (update acc svc (fnil max 0.0) pct)
+                acc)))
+          (sorted-map)
+          (lines s)))
+
 (defn stop-containers-argv
   "`docker stop` of container `names`."
   [names]
@@ -336,7 +380,17 @@
       (if (empty? ids)
         (r/ok #{})
         (parsed (run exec p (inspect-argv ids) timeout-ms) :compose/unparseable
-                (comp container-addresses parse-json-rows))))))
+                (comp container-addresses parse-json-rows)))))
+
+  port/IContainerLoad
+  ;; By label, like -stop-containers!: no compose file is loaded.
+  (-cpu [_ p]
+    (r/let-ok [names (r/map-ok (run exec nil (running-containers-argv p) timeout-ms)
+                               container-services)]
+      (if (empty? names)
+        (r/ok {})
+        (r/map-ok (run exec nil (stats-argv (keys names)) timeout-ms)
+                  #(service-cpu names %))))))
 
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),
