@@ -150,6 +150,16 @@
               running (get-in @world [:running project] #{})]
           (r/ok (select-keys (get-in @world [:published project] {}) running)))))
 
+  port/IContainerOwnership
+  ;; #{id} set with `live!`; {service {:volumes :ports}} set with `holds!`.
+  (-live-containers [_]
+    (or (fault world :live-containers) (r/ok (get @world :live #{}))))
+  (-resources [_ p services]
+    (or (fault world :resources)
+        (let [m (get-in @world [:holds (profile/project p)] {})]
+          (r/ok {:volumes (into #{} (mapcat #(get-in m [% :volumes])) services)
+                 :ports (into #{} (mapcat #(get-in m [% :ports])) services)}))))
+
   port/IContainerAddresses
   ;; #{ip} set with `addresses!`.
   (-addresses [_ p]
@@ -183,3 +193,9 @@
   "Make `-dependencies` answer `g` for `project`, whatever the model says."
   [e project g]
   (swap! (:world e) assoc-in [:graphs project] g))
+
+(defn holds!
+  "Make the services of `project` mount volumes and publish ports `m`
+   ({service {:volumes #{name} :ports #{port}}})."
+  [e project m]
+  (swap! (:world e) assoc-in [:holds project] m))

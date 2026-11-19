@@ -103,3 +103,22 @@
      it lives or when this runner did not start it (a pid kept across a restart).")
   (-log-tail [r log n]
     "[line]: the last `n` non-blank lines of the program log `log`, [] when it is absent."))
+
+(defprotocol IProcessTable
+  "The host's processes, as a value: what a dead rootless dockerd left
+   running is read from it (see `hive-compose.promote.orphan`)."
+  (-snapshot [t]
+    "Result<Snapshot>: {:manager-pid :subuid :procs}, see
+     `hive-compose.promote.orphan`. An error when the table cannot be read
+     (another OS, no /proc), never a throw."))
+
+(defprotocol IContainerOwnership
+  "Optional engine capability: which containers the daemon runs and what a
+   section's services hold, so a process can be told apart from the
+   containers that own it, and its holdings matched to a section."
+  (-live-containers [e]
+    "Result<#{id}>: full ids of every container the daemon reports running.")
+  (-resources [e profile services]
+    "Result<{:volumes #{name} :ports #{port}}>: the docker volumes (their real
+     names) mounted by `services` of the profile's project and the host ports
+     they publish."))
