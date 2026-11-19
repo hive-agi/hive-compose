@@ -51,6 +51,26 @@
     (is (not (contains? (stub/running (:engine c) "shop") "ledger"))
         "always-on services outside the closure stay down")))
 
+(deftest a-stale-section-snapshot-releases-with-the-env-its-project-has-now
+  (let [c (ctx)
+        env-proj (assoc-in (get-in settings [:compose/projects "shop"])
+                           [:project/env] {"OVERLAY_SRC" "/now" "SHARED" "project"})
+        c (assoc-in c [:settings :compose/projects "shop"] env-proj)
+        snap {:profile/id "shop/web" :profile/dir "/old" :profile/services ["web"]
+              :profile/env {"CALL_ONLY" "x" "SHARED" "snapshot"}}]
+    (swap! (:state c) assoc-in [:active "shop/web" :profile] snap)
+    (testing "a variable the project gained after the snapshot is present"
+      (is (= {"OVERLAY_SRC" "/now" "CALL_ONLY" "x" "SHARED" "snapshot"}
+             (:profile/env (:ok (ops/lookup c "shop/web"))))))
+    (testing "the id and services stay, the project-derived dir follows the project"
+      (is (= "shop/web" (:profile/id (:ok (ops/lookup c "shop/web")))))
+      (is (= ["web"] (:profile/services (:ok (ops/lookup c "shop/web")))))
+      (is (= "/w/shop" (:profile/dir (:ok (ops/lookup c "shop/web"))))))
+    (testing "a section whose project left the config keeps its snapshot"
+      (swap! (:state c) assoc-in [:active "gone/web" :profile]
+             (assoc snap :profile/id "gone/web"))
+      (is (= "/old" (:profile/dir (:ok (ops/lookup c "gone/web"))))))))
+
 (deftest a-native-profile-target-means-its-own-members
   (let [res (up-target! (ctx) "frontend")]
     (is (= "shop/frontend" (:profile (:ok res))))
