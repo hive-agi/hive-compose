@@ -99,8 +99,9 @@
       (testing "a profile-gated service with a soft dependency"
         (let [p (:ok (ops/subject c {:target "api"}))]
           (is (= "it/api" (:profile/id p)))
-          (is (= ["api" "cache" "db"] (:services (:ok (ops/up-profile! c p)))))
-          (is (= #{"api" "cache" "db"} (:ok (port/-running engine whole))) "worker stays down")))
+          (is (= ["api" "db"] (:services (:ok (ops/up-profile! c p))))
+              "cache is `required: false` and not running, so it is neither built nor started")
+          (is (= #{"api" "db"} (:ok (port/-running engine whole))) "worker and cache stay down")))
       (testing "the native profile name resolves to the same section content"
         (is (= ["api"] (:profile/services (:ok (ops/subject c {:target "backend"}))))))
       (testing "down takes only that section"

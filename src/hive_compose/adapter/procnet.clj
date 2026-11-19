@@ -33,8 +33,13 @@
             {}
             (rest (str/split-lines (or text ""))))))
 
-(defn- slurp-quiet [f]
-  (try (slurp f) (catch Exception _unreadable "")))
+(defn- slurp-quiet
+  "The text of `f`, \"\" when it cannot be read. Read line by line: `slurp`
+   fails on procfs files (FileInputStream.available answers EINVAL)."
+  [f]
+  (try (with-open [r (java.io.BufferedReader. (java.io.FileReader. (str f)))]
+         (str/join "\n" (doall (line-seq r))))
+       (catch Exception _unreadable "")))
 
 (defrecord ProcNet [files]
   port/IActivity

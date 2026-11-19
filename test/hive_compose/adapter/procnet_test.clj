@@ -22,6 +22,16 @@
   (is (= {} (procnet/peers tcp [9999])))
   (is (= {} (procnet/peers nil [7888]))))
 
+(deftest the-default-probe-reads-the-kernel-table
+  ;; Linux only: a live connection to a port the OS chose shows as one peer.
+  (when (.exists (io/file "/proc/net/tcp"))
+    (with-open [ss (java.net.ServerSocket. 0)]
+      (let [p (.getLocalPort ss)
+            accepted (future (.accept ss))]
+        (with-open [_client (java.net.Socket. "127.0.0.1" (int p))
+                    _server ^java.net.Socket @accepted]
+          (is (= 1 (count (get (port/-peers (procnet/make-activity) #{p}) p)))))))))
+
 (deftest the-probe-merges-both-tables-and-survives-a-missing-one
   (let [f (doto (java.io.File/createTempFile "tcp" ".txt") (.deleteOnExit))]
     (spit f tcp)
