@@ -153,7 +153,7 @@
 ;; ---------------------------------------------------------------------------
 ;; release
 
-(defn- runner
+(defn runner
   "The program runner, nil when the context has none or programs are off."
   [ctx]
   (when (get-in ctx [:settings :compose/programs?] true) (:runner ctx)))
@@ -338,7 +338,8 @@
                                 :started-at (or (:started-at a) now)
                                 :last-touch now}
                          wider (assoc :needs (vec needs))
-                         (seq held) (assoc :programs held))))
+                         (seq held) (assoc :programs held)
+                         (seq (:claims a)) (assoc :claims (:claims a)))))
         (r/ok (cond-> {:profile id :project (profile/project p) :services services :out (:out out)}
                 wider (assoc :needs (vec needs))
                 (seq report) (assoc :programs report)))))))
@@ -547,7 +548,7 @@
 ;; ---------------------------------------------------------------------------
 ;; reads
 
-(defn- program-row
+(defn program-row
   "What is known of started program `run` right now: alive, and whether its
    nREPL answers. A port the program chose itself is read from its .nrepl-port."
   [ctx run]
@@ -585,7 +586,7 @@
         broken (into {} (for [[id h] health :when (not (:ok? h))] [(:compose-project h) id]))
         row (fn [id p]
               (let [a (get active id)
-                    ttl (profile/ttl-ms settings p)
+                    ttl (if a (plan/effective-ttl-ms settings p a) (profile/ttl-ms settings p))
                     bad (get broken (profile/project p))]
                 (cond-> {:id id
                          :project (profile/project p)
@@ -598,6 +599,11 @@
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
                   (and a bad) (assoc :reap-blocked? true)
+                  (seq (:claims a)) (assoc :claims (into (sorted-map)
+                                                         (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
+                                                         (:claims a)))
+                  (:orphaned-at a) (assoc :orphaned? true)
+                  (:usage a) (assoc :usage (:usage a))
                   (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
                                                              (sort-by key (:programs a)))))))]
     (cond-> {:ok? (empty? broken)

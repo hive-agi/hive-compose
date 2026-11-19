@@ -73,6 +73,24 @@
    [:profile/idle-action {:optional true} IdleAction]
    [:profile/description {:optional true} :string]])
 
+(def Claim
+  "An agent's declaration that it works on a section: since when, when it was
+   last renewed, what for, and whether the agent was in the swarm when it
+   claimed (then the claim ends with the agent)."
+  [:map
+   [:since :int]
+   [:seen :int]
+   [:note {:optional true} :string]
+   [:swarm? {:optional true} :boolean]])
+
+(def Usage
+  "What the last reaper pass saw using a section. A reason is {:claim agent},
+   {:agent id} or {:port p :peers n}."
+  [:map
+   [:at :int]
+   [:in-use? :boolean]
+   [:by [:vector :map]]])
+
 (def Active
   "A profile this addon brought up (or adopted) and still answers for. `:profile`
    is the Profile it ran with, so it can be released after leaving the config.
@@ -87,7 +105,10 @@
    [:started-at :int]
    [:last-touch :int]
    [:programs {:optional true} [:map-of :string Running]]
-   [:profile {:optional true} Profile]])
+   [:profile {:optional true} Profile]
+   [:claims {:optional true} [:map-of :string Claim]]
+   [:orphaned-at {:optional true} :int]
+   [:usage {:optional true} Usage]])
 
 (def ActiveMap [:map-of :string Active])
 
@@ -118,7 +139,12 @@
    [:compose/timeout-ms [:int {:min 1000}]]
    [:compose/up-timeout-ms [:int {:min 1000}]]
    [:compose/adopt? :boolean]
-   [:compose/programs? :boolean]])
+   [:compose/programs? :boolean]
+   [:compose/swarm? :boolean]
+   [:compose/notify? :boolean]
+   [:compose/activity [:set [:enum :nrepl :published]]]
+   [:compose/claim-ttl-minutes [:int {:min 1}]]
+   [:compose/orphan-ttl-minutes [:int {:min 1}]]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."

@@ -147,8 +147,46 @@ program whose env cannot be read is reported and not started.
 | `adopt` | take charge of running containers nobody owns |
 | `projects` | every compose project on the host, managed ones marked |
 | `reload` | re-read config |
+| `claim target=… note=…` | an agent declares it works on a section (bringing it up if needed); answers the shared nREPL per module |
+| `release target=… [stop=true]` | give the claim up; with none left the section is orphaned, or stopped now with `stop` |
+| `who` | per section: claims, what is using it, when it is reaped; per agent: the sections it works in |
+| `nrepl path=…` | which shared nREPL drives that file or directory (no path: every route) |
 
-Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`.
+Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`,
+`:compose/claim!`, `:compose/release!`, `:compose/nrepl-for`, `:compose/who`.
+
+## Swarm work
+
+Several agents working on one app should share its running JVMs, not each boot
+their own, and an app nobody works on should not keep holding memory.
+
+- **Claims.** `compose claim target=shop/api note="fix login"` brings the section up
+  if needed and records the claim (the agent is the call's `agent`, else its
+  `agent_id`). The answer lists the section's nREPL **routes**: for each program
+  directory, the port to drive it through (`clojure_eval port=…`) and one line
+  of advice. A claim must be renewed (claim again) within
+  `:compose/claim-ttl-minutes` (30); a claim made by a swarm agent also ends
+  when that agent leaves the swarm.
+- **Routes.** `compose nrepl path=/w/shop/api/src/core.clj` answers the program
+  whose directory holds the file most closely, whether its nREPL answers, and
+  whether somebody outside the addon runs it (`:external?`, shared all the same).
+- **Usage.** Every reaper pass counts as use of a section: claims that hold, swarm
+  agents whose cwd lies in the project's directories, and connections newly opened
+  to its nREPL ports (`/proc/net/tcp`; a connection left open counts once).
+  `:compose/activity #{:nrepl :published}` also counts new connections to the
+  ports its containers publish (opt-in: an app's own connection pool would
+  otherwise look like use). What is in use has its idle clock reset; `who`
+  shows why.
+- **Notices.** When an agent starts working in a project whose section serves a
+  ready nREPL, the swarm is told once which port drives which module. `up` and
+  `switch` announce the routes, and the reaper announces what it freed.
+- **Enforcement.** Nothing in use for the TTL is stopped, as before. A section whose
+  last claim ended (released, stale or its agent gone) is **orphaned** and reaped
+  after `:compose/orphan-ttl-minutes` (10) of disuse instead. `release stop=true`
+  frees it at once, sparing what other sections need.
+
+With no hive host (published standalone), the swarm adapter answers absent and the
+addon runs on claims and connections alone.
 
 ## Presets (optional)
 
@@ -205,7 +243,9 @@ value the preset's services need.
 `:compose/profiles`, `:compose/profiles-file`, `:compose/state-file`,
 `:compose/timeout-ms` (60000), `:compose/up-timeout-ms` (600000),
 `:compose/adopt?` (true), `:compose/programs?` (true), `:compose/log-dir`,
-`:compose/stop-grace-ms` (5000, before a program's group is killed).
+`:compose/stop-grace-ms` (5000, before a program's group is killed),
+`:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
+(`#{:nrepl}`), `:compose/claim-ttl-minutes` (30), `:compose/orphan-ttl-minutes` (10).
 
 ## Development
 
