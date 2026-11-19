@@ -18,17 +18,46 @@
       (try (Long/parseLong (subs col (inc i)) 16)
            (catch NumberFormatException _malformed nil)))))
 
+(defn- hex-bytes
+  "The bytes of hex string `s` (an even number of digits), nil when malformed."
+  [s]
+  (when (and (string? s) (pos? (count s)) (even? (count s)))
+    (try (byte-array (map #(unchecked-byte (Integer/parseInt (subs s % (+ % 2)) 16))
+                          (range 0 (count s) 2)))
+         (catch NumberFormatException _malformed nil))))
+
+(defn- network-order
+  "Kernel address bytes `bs` in network order: /proc/net/tcp(6) prints an
+   address as 32-bit words, each in host (little-endian) order."
+  [^bytes bs]
+  (byte-array (mapcat reverse (partition 4 bs))))
+
+(defn endpoint
+  "\"ip:port\" of a /proc/net/tcp(6) `ADDR:PORT` column (\"[ip6]:port\" for
+   IPv6; an IPv4-mapped IPv6 address reads as its IPv4 form), nil when
+   malformed. Pure: the address is a literal, nothing is looked up."
+  [col]
+  (let [i (str/last-index-of (or col "") ":")
+        p (hex-port col)
+        bs (when i (hex-bytes (subs col 0 i)))]
+    (when (and p bs (contains? #{4 16} (alength ^bytes bs)))
+      (let [addr (java.net.InetAddress/getByAddress ^bytes (network-order bs))]
+        (if (instance? java.net.Inet6Address addr)
+          (str "[" (.getHostAddress addr) "]:" p)
+          (str (.getHostAddress addr) ":" p))))))
+
 (defn peers
   "{port #{peer}} of /proc/net/tcp(6) `text` for local `ports`: the remote
-   column of every socket whose local port is one of them, listening sockets
-   left out. Pure."
+   endpoint (as `endpoint`, \"ip:port\") of every socket whose local port is
+   one of them, listening sockets left out. Pure."
   [text ports]
   (let [ports (set ports)]
     (reduce (fn [acc line]
               (let [[_sl local remote st] (str/split (str/trim line) #"\s+") ;; pattern-exempt: whitespace split of a kernel table
-                    p (hex-port local)]
-                (if (and p (contains? ports p) remote (not= listen-state st))
-                  (update acc p (fnil conj #{}) remote)
+                    p (hex-port local)
+                    peer (endpoint remote)]
+                (if (and p (contains? ports p) peer (not= listen-state st))
+                  (update acc p (fnil conj #{}) peer)
                   acc)))
             {}
             (rest (str/split-lines (or text ""))))))

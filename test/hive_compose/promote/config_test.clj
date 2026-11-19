@@ -24,6 +24,21 @@
     (is (= "/inline" (get-in s [:compose/profiles "api" :profile/dir])))
     (is (= #{"api" "web"} (set (keys (:compose/profiles s)))))))
 
+(deftest activity-is-global-with-a-per-project-override
+  (let [s (:ok (config/settings {:compose/activity ["nrepl"]
+                                 :compose/projects {:shop {:project/dir "/w/shop" :project/activity ["nrepl" "published"]}
+                                                    :blog {:project/dir "/w/blog"}}
+                                 :compose/profiles [{:profile/id "p" :profile/dir "/w/p" :profile/activity ["published"]}]}
+                                nil home))]
+    (is (= #{:nrepl} (:compose/activity s)))
+    (is (= #{:nrepl :published} (get-in s [:compose/projects "shop" :project/activity])) "names from JSON become keywords")
+    (is (nil? (get-in s [:compose/projects "blog" :project/activity])))
+    (is (= #{:published} (get-in s [:compose/profiles "p" :profile/activity]))))
+  (is (= #{:nrepl} (:compose/activity (:ok (config/settings {} nil home)))) "the default")
+  (is (= :compose/invalid-config
+         (:error (config/settings {:compose/projects {:shop {:project/dir "/w" :project/activity [:browser]}}} nil home)))
+      "an unknown kind is refused"))
+
 (deftest invalid-config-is-an-err
   (testing "missing dir"
     (is (= :compose/invalid-config (:error (config/settings {:compose/profiles [{:profile/id "api"}]} nil home)))))

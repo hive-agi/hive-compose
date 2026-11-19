@@ -16,11 +16,21 @@
        "garbage line\n"))
 
 (deftest peers-are-the-accepted-connections-of-a-local-port
-  (is (= {7888 #{"0100007F:A028"}} (procnet/peers tcp [7888]))
+  (is (= {7888 #{"127.0.0.1:41000"}} (procnet/peers tcp [7888]))
       "the listening socket and the client side (local port 41000) are left out")
-  (is (= {5432 #{"0200007F:B000"}} (procnet/peers tcp [5432])) "a closing connection still counts")
+  (is (= {5432 #{"127.0.0.2:45056"}} (procnet/peers tcp [5432])) "a closing connection still counts")
   (is (= {} (procnet/peers tcp [9999])))
   (is (= {} (procnet/peers nil [7888]))))
+
+(deftest an-endpoint-reads-the-kernel-address-as-ip-and-port
+  (is (= "127.0.0.1:41000" (procnet/endpoint "0100007F:A028")))
+  (is (= "172.18.0.3:5432" (procnet/endpoint "030012AC:1538")) "a container address on a docker bridge")
+  (is (= "[0:0:0:0:0:0:0:1]:41000" (procnet/endpoint "00000000000000000000000001000000:A028")) "IPv6 loopback")
+  (is (= "172.18.0.3:5432" (procnet/endpoint "0000000000000000FFFF0000030012AC:1538"))
+      "an IPv4-mapped address reads as IPv4, so it compares with a container's address")
+  (is (nil? (procnet/endpoint "ZZ:1538")))
+  (is (nil? (procnet/endpoint "0100:1538")) "neither 4 nor 16 bytes")
+  (is (nil? (procnet/endpoint nil))))
 
 (deftest the-default-probe-reads-the-kernel-table
   ;; Linux only: a live connection to a port the OS chose shows as one peer.
@@ -36,6 +46,6 @@
   (let [f (doto (java.io.File/createTempFile "tcp" ".txt") (.deleteOnExit))]
     (spit f tcp)
     (let [probe (procnet/make-activity [(str f) "/nonexistent/tcp6"])]
-      (is (= {7888 #{"0100007F:A028"}} (port/-peers probe #{7888})))
+      (is (= {7888 #{"127.0.0.1:41000"}} (port/-peers probe #{7888})))
       (is (= {} (port/-peers probe #{}))))
     (io/delete-file f true)))

@@ -57,6 +57,12 @@
    [:kind {:optional true} :keyword]
    [:nrepl-port {:optional true} :int]])
 
+(def Activity
+  "Which new connections to a section's ports count as use of it: :nrepl (the
+   shared nREPLs of its programs) and :published (the host ports its
+   containers publish, a browser or any host-side client)."
+  [:set [:enum :nrepl :published]])
+
 (def Profile
   [:map
    [:profile/id ProfileId]
@@ -71,6 +77,7 @@
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
+   [:profile/activity {:optional true} Activity]
    [:profile/description {:optional true} :string]])
 
 (def Claim
@@ -85,11 +92,13 @@
 
 (def Usage
   "What the last reaper pass saw using a section. A reason is {:claim agent},
-   {:agent id} or {:port p :peers n}."
+   {:agent id} or {:port p :peers n :source :nrepl|:published}; :sources names
+   once each what the reasons came from (:claim :agent :nrepl :published)."
   [:map
    [:at :int]
    [:in-use? :boolean]
-   [:by [:vector :map]]])
+   [:by [:vector :map]]
+   [:sources {:optional true} [:vector :keyword]]])
 
 (def Active
   "A profile this addon brought up (or adopted) and still answers for. `:profile`
@@ -125,7 +134,8 @@
    [:project/env {:optional true} Env]
    [:project/wait? {:optional true} :boolean]
    [:project/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:project/idle-action {:optional true} IdleAction]])
+   [:project/idle-action {:optional true} IdleAction]
+   [:project/activity {:optional true} Activity]])
 
 (def Settings
   [:map
@@ -142,7 +152,7 @@
    [:compose/programs? :boolean]
    [:compose/swarm? :boolean]
    [:compose/notify? :boolean]
-   [:compose/activity [:set [:enum :nrepl :published]]]
+   [:compose/activity Activity]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
    [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])

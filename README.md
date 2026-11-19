@@ -251,6 +251,16 @@ that died since the same way),
 `:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
 (`#{:nrepl}`), `:compose/claim-ttl-minutes` (30), `:compose/orphan-ttl-minutes` (10).
 
+`:compose/activity` says which new connections count as use; a project
+overrides it for its sections with `:project/activity` (a preset with
+`:profile/activity`). `#{:nrepl :published}` also counts new peers on the host
+ports the section's containers publish, so a browser or any host-side client
+keeps it alive. Peers whose address belongs to one of the project's own
+running containers (`docker inspect`) are left out, so pools do not count, and
+a keep-alive connection counts once, when first seen. `who` and `status` name
+the source that counted (`:in-use-via`, e.g. `[:published]`) and each
+section's `:activity`.
+
 ## Development
 
 ```sh

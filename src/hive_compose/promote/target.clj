@@ -32,7 +32,8 @@
     (:project/env project) (assoc :profile/env (:project/env project))
     (some? (:project/wait? project)) (assoc :profile/wait? (:project/wait? project))
     (:project/ttl-minutes project) (assoc :profile/ttl-minutes (:project/ttl-minutes project))
-    (:project/idle-action project) (assoc :profile/idle-action (:project/idle-action project))))
+    (:project/idle-action project) (assoc :profile/idle-action (:project/idle-action project))
+    (:project/activity project) (assoc :profile/activity (:project/activity project))))
 
 (defn section
   "The Profile of the section of `project` that `names` resolved to `services`."
@@ -44,7 +45,7 @@
 (def ^:private project-derived
   "Profile keys a section takes from its project rather than from the call."
   [:profile/dir :profile/files :profile/project :profile/programs :profile/env
-   :profile/ttl-minutes :profile/idle-action])
+   :profile/ttl-minutes :profile/idle-action :profile/activity])
 
 (defn rebase-section
   "Snapshot `snap` of an active section re-based on its project as configured

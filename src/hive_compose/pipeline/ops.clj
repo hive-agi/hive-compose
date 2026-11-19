@@ -17,6 +17,7 @@
    once its containers are up and stop when the last section holding them is
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
@@ -659,7 +660,8 @@
                          :project (profile/project p)
                          :active? (some? a)
                          :ttl-minutes (quot ttl 60000)
-                         :idle-action (profile/idle-action settings p)}
+                         :idle-action (profile/idle-action settings p)
+                         :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
@@ -670,7 +672,8 @@
                                                          (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
                                                          (:claims a)))
                   (:orphaned-at a) (assoc :orphaned? true)
-                  (:usage a) (assoc :usage (:usage a))
+                  (:usage a) (assoc :usage (:usage a)
+                                    :in-use-via (get-in a [:usage :sources] []))
                   (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
                                                              (sort-by key (:programs a)))))))]
     (cond-> {:ok? (empty? broken)

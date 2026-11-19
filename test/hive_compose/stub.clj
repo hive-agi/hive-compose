@@ -112,7 +112,21 @@
                         (for [[svc {:keys [deps optional]}] model
                               :when (shown svc)]
                           [svc (merge (zipmap deps (repeat {:required? true}))
-                                      (zipmap optional (repeat {:required? false})))]))))))))
+                                      (zipmap optional (repeat {:required? false})))])))))))
+
+  port/IPublishedPorts
+  ;; {service #{port}} set with `published!`, of the services running now.
+  (-published [_ p]
+    (or (fault world :published)
+        (let [project (profile/project p)
+              running (get-in @world [:running project] #{})]
+          (r/ok (select-keys (get-in @world [:published project] {}) running)))))
+
+  port/IContainerAddresses
+  ;; #{ip} set with `addresses!`.
+  (-addresses [_ p]
+    (or (fault world :addresses)
+        (r/ok (get-in @world [:addresses (profile/project p)] #{})))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
@@ -126,6 +140,16 @@
 (defn calls [e] (:calls @(:world e)))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
+
+(defn published!
+  "Make the running services of `project` publish host ports `m` ({service #{port}})."
+  [e project m]
+  (swap! (:world e) assoc-in [:published project] m))
+
+(defn addresses!
+  "Make the containers of `project` hold network addresses `ips`."
+  [e project ips]
+  (swap! (:world e) assoc-in [:addresses project] (set ips)))
 
 (defn graph!
   "Make `-dependencies` answer `g` for `project`, whatever the model says."

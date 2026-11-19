@@ -54,11 +54,38 @@
       (is (= {"ling-1" :gone "ling-2" :gone} (sw/expired-claims claims #{"other"} 1000 5000))))))
 
 (deftest usage-names-every-reason
-  (is (= {:in-use? false :by []} (sw/usage {})))
+  (is (= {:in-use? false :by [] :sources []} (sw/usage {})))
   (is (= {:in-use? true
-          :by [{:claim "a"} {:agent "ling-1"} {:port 7888 :peers 2}]}
+          :by [{:claim "a"} {:agent "ling-1"} {:port 7888 :peers 2}]
+          :sources [:claim :agent :port]}
          (sw/usage {:claims {"a" {}} :agents [{:agent/id "ling-1"}]
                     :fresh {7888 #{"x" "y"} 9000 #{}}}))))
+
+(deftest usage-names-the-source-of-each-port
+  (is (= {:in-use? true
+          :by [{:port 7888 :peers 1 :source :nrepl} {:port 18080 :peers 2 :source :published}]
+          :sources [:nrepl :published]}
+         (sw/usage {:fresh {7888 #{"a"} 18080 #{"b" "c"}}
+                    :sources {7888 :nrepl 18080 :published}})))
+  (is (= [:published] (:sources (sw/usage {:fresh {1 #{"a"} 2 #{"b"}} :sources {1 :published 2 :published}})))
+      "a source is named once"))
+
+(deftest peer-host-is-the-address-of-a-peer
+  (is (= "172.18.0.3" (sw/peer-host "172.18.0.3:5432")))
+  (is (= "::1" (sw/peer-host "[::1]:5432")))
+  (is (nil? (sw/peer-host "nope"))))
+
+(deftest a-sections-own-containers-are-not-its-use
+  (let [ports {7888 :nrepl 18080 :published}
+        fresh {7888 #{"172.18.0.3:1"} 18080 #{"172.18.0.3:2" "127.0.0.1:3"} 9999 #{"x:1"}}]
+    (is (= {7888 #{"172.18.0.3:1"} 18080 #{"127.0.0.1:3"}}
+           (sw/section-fresh fresh ports #{"172.18.0.3"}))
+        "only the published port drops container peers; other sections' ports are not this one's")
+    (is (= {7888 #{"172.18.0.3:1"}} (sw/section-fresh (update fresh 18080 disj "127.0.0.1:3") ports #{"172.18.0.3"}))
+        "a published port left with only container peers is dropped")
+    (is (= {7888 #{"172.18.0.3:1"} 18080 #{"172.18.0.3:2" "127.0.0.1:3"}} (sw/section-fresh fresh ports #{})))
+    (is (sw/published-peers? fresh ports))
+    (is (not (sw/published-peers? fresh {7888 :nrepl})))))
 
 (deftest fresh-peers-counts-a-connection-once
   (is (= {7888 #{"b"}} (sw/fresh-peers {7888 #{"a"}} {7888 #{"a" "b"} 9000 #{}})))
