@@ -20,8 +20,11 @@
   (-start! [_ p log]
     (record! world [:start (:program/id p) (:program/command p) log])
     (or (fault world :start)
-        (let [pid (:next-pid (swap! world update :next-pid inc))]
-          (swap! world update :alive conj pid)
+        (let [pid (:next-pid (swap! world update :next-pid inc))
+              death (get-in @world [:dies (:program/id p)])]
+          (if death
+            (swap! world update :exits assoc pid death)
+            (swap! world update :alive conj pid))
           (r/ok {:pid pid}))))
   (-alive? [_ pid] (contains? (:alive @world) pid))
   (-listening? [_ port] (contains? (:listening @world) port))
@@ -30,7 +33,12 @@
     (record! world [:stop pid])
     (or (fault world :stop)
         (do (swap! world update :alive disj pid)
-            (r/ok {:pid pid :stopped? true})))))
+            (r/ok {:pid pid :stopped? true}))))
+  port/IProgramOutcome
+  (-exit-code [_ pid] (get-in @world [:exits pid :exit-code]))
+  (-log-tail [_ log n]
+    (vec (take-last n (some (fn [[_ d]] (when (= log (:log d)) (:tail d)))
+                            (:exits @world))))))
 
 (defn runner
   "StubRunner over `facts` ({dir {file-name parsed}})."
@@ -46,3 +54,8 @@
 (defn kill! [rn pid] (swap! (:world rn) update :alive disj pid))
 (defn listen! [rn port] (swap! (:world rn) update :listening conj port))
 (defn fail! [rn & methods] (swap! (:world rn) update :fail into methods))
+(defn die-on-start!
+  "Program `program-id` exits at once when started, with `exit-code` and
+   `tail` as the last lines of its log `log`."
+  [rn program-id exit-code log tail]
+  (swap! (:world rn) assoc-in [:dies program-id] {:exit-code exit-code :log log :tail tail}))

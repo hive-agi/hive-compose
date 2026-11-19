@@ -14,6 +14,17 @@
   (when (contains? (:fail @world) method)
     (r/err :stub/fault {:method method})))
 
+(defn- undefined
+  "compose's refusal when `services` names one the world marks :undefined."
+  [world services]
+  (when-let [s (first (filter (or (:undefined @world) #{}) services))]
+    (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " s "\n")})))
+
+(defn undefine!
+  "Make compose refuse `services` as no longer defined."
+  [e & services]
+  (swap! (:world e) update :undefined (fnil into #{}) services))
+
 (defn- enabled
   "Services of `model` enabled under native `profiles`: always-on plus members."
   [model profiles]
@@ -22,13 +33,16 @@
           svc)))
 
 (defn- closure
-  "`targets` plus everything they transitively depend on in `model`."
+  "`targets` plus everything they transitively depend on in `model`, the
+   `required: false` (:optional) entries included, as `compose config` does."
   [model targets]
   (loop [seen (sorted-set) todo (vec targets)]
     (if-let [[s & more] (seq todo)]
       (if (seen s)
         (recur seen (vec more))
-        (recur (conj seen s) (into (vec more) (get-in model [s :deps]))))
+        (recur (conj seen s) (-> (vec more)
+                                 (into (get-in model [s :deps]))
+                                 (into (get-in model [s :optional])))))
       (vec seen))))
 
 (defrecord StubEngine [world]
@@ -45,33 +59,74 @@
               (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " missing)})
               (r/ok (closure model targets)))))))
   (-listed [_ p]
-    (r/ok (vec (enabled (get-in @world [:projects (profile/project p)]) (:profile/compose-profiles p)))))
+    (or (fault world :listed)
+        (r/ok (vec (enabled (get-in @world [:projects (profile/project p)]) (:profile/compose-profiles p))))))
   (-profiles [_ p]
     (r/ok (into #{} (mapcat :profiles) (vals (get-in @world [:projects (profile/project p)])))))
   (-running [_ p]
     (or (fault world :running)
         (r/ok (into (sorted-set) (get-in @world [:running (profile/project p)])))))
   (-projects [_]
-    (r/ok (mapv (fn [[k v]] {:name k :status (str "running(" (count v) ")") :config-files ""})
-                (:running @world))))
+    (r/ok (or (:ls @world)
+              (mapv (fn [[k v]] {:name k :status (str "running(" (count v) ")") :config-files ""})
+                    (:running @world)))))
   (-up! [_ p services]
     (record! world [:up (profile/project p) (vec services)])
+    (swap! world assoc :last-up-no-deps? (boolean (:profile/no-deps? p)))
     (or (fault world :up)
         (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
             (r/ok {:out ""}))))
   (-stop! [_ p services]
     (record! world [:stop (profile/project p) (vec services)])
     (or (fault world :stop)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
             (r/ok {:out ""}))))
   (-down! [_ p services]
     (record! world [:down (profile/project p) (vec services)])
     (or (fault world :down)
+        (undefined world services)
         (do (swap! world update-in [:running (profile/project p)] #(reduce disj (or % #{}) services))
+            (r/ok {:out ""}))))
+  (-restart! [_ p services recreate?]
+    (record! world [(if recreate? :recreate :restart) (profile/project p) (vec services)])
+    (or (fault world :restart)
+        (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
             (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
-    (r/ok {:out "log"})))
+    (r/ok {:out "log"}))
+
+  port/IDependencyGraph
+  ;; As `compose config --format json [targets]`: the targets' closure when
+  ;; the profile names services, else what its native profiles enable. A
+  ;; graph injected under :graphs answers as is (an engine that disagrees).
+  (-dependencies [_ p]
+    (or (fault world :dependencies)
+        (if-let [g (get-in @world [:graphs (profile/project p)])]
+          (r/ok g)
+          (let [model (get-in @world [:projects (profile/project p)])
+                shown (set (closure model (or (seq (:profile/services p))
+                                              (enabled model (:profile/compose-profiles p)))))]
+            (r/ok (into {}
+                        (for [[svc {:keys [deps optional]}] model
+                              :when (shown svc)]
+                          [svc (merge (zipmap deps (repeat {:required? true}))
+                                      (zipmap optional (repeat {:required? false})))])))))))
+
+  port/IPublishedPorts
+  ;; {service #{port}} set with `published!`, of the services running now.
+  (-published [_ p]
+    (or (fault world :published)
+        (let [project (profile/project p)
+              running (get-in @world [:running project] #{})]
+          (r/ok (select-keys (get-in @world [:published project] {}) running)))))
+
+  port/IContainerAddresses
+  ;; #{ip} set with `addresses!`.
+  (-addresses [_ p]
+    (or (fault world :addresses)
+        (r/ok (get-in @world [:addresses (profile/project p)] #{})))))
 
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
@@ -85,3 +140,18 @@
 (defn calls [e] (:calls @(:world e)))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
+
+(defn published!
+  "Make the running services of `project` publish host ports `m` ({service #{port}})."
+  [e project m]
+  (swap! (:world e) assoc-in [:published project] m))
+
+(defn addresses!
+  "Make the containers of `project` hold network addresses `ips`."
+  [e project ips]
+  (swap! (:world e) assoc-in [:addresses project] (set ips)))
+
+(defn graph!
+  "Make `-dependencies` answer `g` for `project`, whatever the model says."
+  [e project g]
+  (swap! (:world e) assoc-in [:graphs project] g))

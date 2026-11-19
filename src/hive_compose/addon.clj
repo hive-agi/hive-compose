@@ -11,7 +11,8 @@
 
    Config: see `hive-compose.promote.config`. `:compose/engine` injects an
    IComposeEngine in place of the docker CLI, `:compose/runner` an
-   IProgramRunner in place of the host one."
+   IProgramRunner in place of the host one, `:compose/resolver` the
+   {scheme ISecretBackend} env references are read through in place of `pass`."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [hive-addon.protocol :as addon]
@@ -20,9 +21,16 @@
             [hive-compose.boundary.files :as files]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
+            [hive-compose.promote.env :as env]
             [hive-compose.port :as port]
+            [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
-            [hive-compose.promote.profile :as profile])
+            [hive-compose.promote.profile :as profile]
+            [hive-compose.pipeline.restart :as restart]
+            [hive-compose.pipeline.swarm :as swarm]
+            [hive-compose.adapter.swarm :as swarm-adapter]
+            [hive-compose.adapter.procnet :as procnet]
+            [hive-addon.host :as addon-host])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -49,13 +57,62 @@
     (r/let-ok [file-profiles (files/read-profiles (config/profiles-file cfg home))]
       (config/settings cfg file-profiles home))))
 
-(defn- build-ctx [cfg settings persisted]
-  {:engine (or (:compose/engine cfg) (cli/make-engine settings))
-   :runner (or (:compose/runner cfg) (host/make-runner cfg))
-   :settings settings
-   :state (atom (merge {:active {} :current nil} (select-keys persisted [:active :current])))
-   :now (or (:compose/now cfg) now-ms)
-   :save! (or (:compose/save! cfg) #(files/save-state! (:compose/state-file settings) %))})
+(def ^:private host-declared-config
+  "The host's reader of an addon's declared config block (`:addons <id>` in
+   config.edn), the same one its init path merges into the config `initialize!`
+   receives. Soft-resolved: the published addon never requires hive-mcp, and
+   with no host it answers {}."
+  (addon-host/soft 'hive-mcp.addons.core/addon-declared-config (constantly {})))
+
+(defn- declared-config
+  "{:block m :source s}: the addon config block as declared NOW and where it
+   came from. `:compose/config-source` (a 0-arity fn, for tests and non-MCP
+   hosts) when `base` carries one, else the host's declared-config reader.
+   Anything but a map counts as {}."
+  [base]
+  (let [own (:compose/config-source base)
+        m (if own (own) (host-declared-config addon-id-value))]
+    {:block (if (map? m) m {})
+     :source (cond own :config-source
+                   (map? m) :host-config
+                   :else :none)}))
+
+(defn- merged-config
+  "The config the addon runs on: `seed`, then the declared block, then the
+   caller's own options. `runtime-config` is what `initialize!` received; the
+   host built it by merging the block declared at that time (`declared-then`)
+   under its options, so the entries it still holds unchanged from that block
+   are dropped and the block declared now takes their place. One function for
+   init and reload, so a reload sees exactly what a fresh init would."
+  [seed runtime-config declared-then]
+  (let [base (merge (:addon/config seed) seed (:addon/config runtime-config))
+        own (into {} (remove (fn [[k v]] (and (contains? declared-then k)
+                                              (= v (get declared-then k)))))
+                  runtime-config)
+        {:keys [block source]} (declared-config (merge base own))]
+    {:cfg (merge base block own)
+     :declared block
+     :source source}))
+
+(defn- build-ctx
+  "The context. Unless `:compose/save!` is injected, every save merges with the
+   state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
+   so an instance sharing the file through a hot remount loses nothing."
+  [cfg settings persisted]
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current]))
+        state (atom st)
+        base (atom st)
+        sync! #(files/sync-state! (:compose/state-file settings) base state)]
+    {:engine (or (:compose/engine cfg)
+                 (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
+     :runner (or (:compose/runner cfg) (host/make-runner cfg))
+     :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
+     :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
+     :settings settings
+     :state state
+     :now (or (:compose/now cfg) now-ms)
+     :save! (or (:compose/save! cfg) (fn [_] (sync!)))
+     :sync! (when-not (:compose/save! cfg) sync!)}))
 
 ;; ---------------------------------------------------------------------------
 ;; reaper
@@ -70,9 +127,13 @@
       (not (.compareAndSet busy false true)) {:skipped :busy}
       :else
       (try
-        (let [adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
+        (let [_ (when-let [sync! (:sync! ctx)] (sync!))
+              adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
                         (ops/adopt! ctx))
-              pass (cond-> (ops/reap! ctx) (seq adopted) (assoc :adopted adopted))]
+              observed (swarm/observe! ctx)
+              reaped (ops/reap! ctx)
+              _ (swarm/announce-reaped! ctx (:reaped reaped))
+              pass (cond-> (assoc reaped :observed observed) (seq adopted) (assoc :adopted adopted))]
           (swap! state assoc :adopted? true :last-pass (assoc pass :at ((:now ctx))))
           pass)
         (catch Throwable t
@@ -101,14 +162,19 @@
    "status" "active sections: services, idle time, reaper countdown, host programs"
    "targets" "what each configured project offers as a target: services and native profiles"
    "programs" "host programs each project declares, how each starts, whether its nREPL answers"
-   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value}"
+   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value | VAR {\"pass\": path}}"
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
-   "down" "remove a section's containers (never volumes), keeping what other sections need. target|profile"
-   "stop" "stop a section's containers, keeping what other sections need. target|profile"
+   "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
+   "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
+   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on). target|profile; env"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
-   "reap" "run the idle reaper now"
+   "claim" "an agent declares it works on a section, bringing it up when not active; the answer names the shared nREPL per module to drive. target|profile; agent (default agent_id); note. Renew before claim TTL"
+   "release" "an agent gives up its claim; with no claim left the section is reaped after the orphan TTL, or now with stop=true. target|profile; agent; stop"
+   "who" "per active section: claims, what the last pass saw using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent the sections it works in"
+   "nrepl" "which shared nREPL drives a module: path (a file or dir) for the closest one, project to filter, none for all; each with advice"
+   "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
    "reload" "re-read the config"))
@@ -127,19 +193,50 @@
           :else (boolean v))))
 
 (defn- call-options
-  "The per-call options of `up`/`switch`, from the tool params."
+  "The per-call options of `up`/`switch`/`restart`, from the tool params. An
+   env value {\"pass\" path} stays a reference, read only when containers are
+   created."
   [params]
   {:no-deps? (flag params "no_deps")
    :wait? (flag params "wait")
    :env (some->> (param params "env")
-                 (into {} (map (fn [[k v]] [(name k) (str v)]))))})
+                 (into {} (map (fn [[k v]] [(name k) (env/from-param v)]))))})
+
+(defn- checked-options
+  "Result<opts>: `opts` when its env is an Env, else why not. The problems
+   name the variable and the rule broken, never a value."
+  [opts]
+  (if-let [problems (some->> (:env opts) (schema/explain schema/Env))]
+    (r/err :compose/invalid-param {:param "env" :problems problems
+                                   :hint "a value is a string or {\"pass\": \"<store path>\"}"})
+    (r/ok opts)))
+
+(defn- agent-param
+  "The claiming agent: `agent`, else the `agent_id` the host stamps on a call."
+  [params]
+  (some-> (or (param params "agent") (param params "agent_id")) str))
+
+(defn- announced
+  "`res` of an up or switch, with the swarm told about the section's shared
+   nREPLs (:announced, when a notice went out)."
+  [ctx res]
+  (if (r/ok? res)
+    (let [n (swarm/announce-up! ctx (get-in res [:ok :profile]))]
+      (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
+    res))
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
-        on-subject (fn [f] (r/bind (ops/subject ctx {:target tgt :id id}) f))
-        opts (call-options params)]
+        opts (call-options params)
+        on-subject* (fn [f adjust]
+                      (r/bind (checked-options opts)
+                              (fn [o]
+                                (r/bind (ops/subject ctx {:target tgt :id id :env (:env o)})
+                                        #(f (adjust % o))))))
+        on-subject (fn [f] (on-subject* f (fn [p o] (profile/with-call-options p (select-keys o [:env])))))
+        with-opts (fn [f] (on-subject* f profile/with-call-options))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
@@ -149,10 +246,18 @@
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (on-subject #(ops/up-profile! ctx (profile/with-call-options % opts)))
-        "switch" (on-subject #(ops/switch-profile! ctx (profile/with-call-options % opts)))
+        "up" (announced ctx (with-opts #(ops/up-profile! ctx %)))
+        "switch" (announced ctx (with-opts #(ops/switch-profile! ctx %)))
+        "claim" (on-subject #(swarm/claim! ctx % (agent-param params)
+                                            {:note (some-> (param params "note") str)}))
+        "release" (on-subject #(swarm/release-claim! ctx % (agent-param params)
+                                                     {:stop? (flag params "stop")}))
+        "who" (swarm/who ctx)
+        "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
+                                  :project (some-> (param params "project") str)})
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
+        "restart" (with-opts #(restart/restart-profile! ctx % (flag params "recreate")))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -174,18 +279,30 @@
                      "A section also starts the host PROGRAMS its project pairs with its services (a shadow-cljs "
                      "watch, a JVM): a Clojure directory starts with its nREPL, and up/status answer the port. "
                      "A section keeps alive everything its services depend on, so releasing or reaping another "
-                     "section never stops a dependency this one needs. "
+                     "section never stops a dependency this one needs; down/stop name what they kept and why. "
+                     "restart recycles the named services in place (recreate=true recreates them) even when "
+                     "another section needs them. "
                      "up/switch take no_deps (start only the named services, e.g. past a failing migration), "
                      "wait (until healthy) and env. touch with no target resets every active section. "
+                     "SWARM: an agent working on an app claims its section (claim target=.. note=..; renew within "
+                     "the claim TTL, release when done) and gets the shared nREPL per module to drive instead of "
+                     "starting its own JVM; nrepl path=<file> answers which port drives that file. The reaper keeps "
+                     "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
+                     "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
-                              "target" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
-                              "profile" {:type "string" :description "[up|switch|down|stop|touch|ps|logs] preset or active section id"}
+                              "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
+                              "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
                               "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
-                              "env" {:type "object" :description "[up|switch] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}"}
-                              "project" {:type "string" :description "[touch] with no target: only the sections of this project"}
+                              "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
+                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
+                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes"}
+                              "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
+                              "note" {:type "string" :description "[claim] what the agent works on"}
+                              "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
+                              "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
    :handler (fn [params]
@@ -216,22 +333,45 @@
                 :tick-seconds tick}}))
 
 (defn reload!
-  "Re-read config and profiles file into the running context, keeping the
-   active map. Result<{:profiles n}>."
-  [{:keys [state]}]
+  "Re-read the addon config block declared now and the profiles file into the
+   running context, keeping the active map; the engine and program runner are
+   rebuilt from the new config. Answers Result<report>: :source (where the
+   block came from), :profiles and :projects (ids now), :changed (projects,
+   profiles and settings that differ, by id or key, never by value),
+   :sections (active sections re-based on their changed project: :rebased
+   ids, :kept with why) and :not-reloaded (what applies only at the next
+   initialize!, and that running containers keep the env they were created
+   with until recreated)."
+  [{:keys [state seed]}]
   (locking state
-    (let [{:keys [cfg ctx]} @state]
+    (let [{:keys [runtime-config declared ctx]} @state
+          {:keys [cfg source]} (merged-config seed runtime-config declared)
+          old (:settings ctx)]
       (r/let-ok [settings (build-settings cfg)]
-        (swap! state assoc :ctx (assoc ctx :settings settings))
-        (r/ok {:profiles (vec (sort (keys (:compose/profiles settings))))})))))
+        (let [fresh (build-ctx cfg settings {})
+              ctx' (assoc ctx :settings settings :engine (:engine fresh) :runner (:runner fresh))
+              diff (config/settings-diff old settings)
+              _ (swap! state assoc :cfg cfg :ctx ctx')
+              sections (ops/rebase-sections! ctx' (:compose/projects old))]
+          (r/ok (cond-> {:source source
+                         :profiles (vec (sort (keys (:compose/profiles settings))))
+                         :projects (vec (sort (keys (:compose/projects settings))))
+                         :changed diff
+                         :sections sections
+                         :not-reloaded (cond-> ["env and files of running containers: they apply when the containers are recreated (up after the change, restart recreate=true)"]
+                                         (seq (:restart-required diff))
+                                         (conj (str "settings applied at the next initialize!: "
+                                                    (str/join ", " (map name (:restart-required diff))))))}
+                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed"))))))))
 
 (defn- initialize-addon! [a seed runtime-config]
   (let [{:keys [state]} a]
     (locking state
       (if (= :active (:lifecycle @state))
         {:success? true :already-initialized? true}
-        (let [cfg (merge (:addon/config seed) seed (:addon/config runtime-config) runtime-config)
+        (let [{:keys [cfg declared]} (merged-config seed runtime-config {})
               settings (build-settings cfg)]
+          (swap! state assoc :runtime-config runtime-config :declared declared)
           (if (r/err? settings)
             (do (swap! state assoc :lifecycle :error :errors [(pr-str settings)])
                 {:success? false :errors [(str "invalid hive.compose config: " (pr-str settings))]})
@@ -271,7 +411,20 @@
   (hooks [this]
     {:compose/touch! (fn [id] (if-let [ctx (:ctx @state)] (ops/touch! ctx id) (r/err :compose/not-initialized)))
      :compose/status (fn [] (some-> (:ctx @state) ops/status))
-     :compose/tick! (fn [] (tick! this))}))
+     :compose/tick! (fn [] (tick! this))
+     :compose/claim! (fn [target agent opts]
+                       (if-let [ctx (:ctx @state)]
+                         (r/bind (ops/subject ctx {:target target}) #(swarm/claim! ctx % agent (or opts {})))
+                         (r/err :compose/not-initialized)))
+     :compose/release! (fn [target agent opts]
+                         (if-let [ctx (:ctx @state)]
+                           (r/bind (ops/subject ctx {:target target}) #(swarm/release-claim! ctx % agent (or opts {})))
+                           (r/err :compose/not-initialized)))
+     :compose/nrepl-for (fn [path]
+                          (if-let [ctx (:ctx @state)]
+                            (swarm/nrepl ctx {:path path})
+                            (r/err :compose/not-initialized)))
+     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))}))
 
 (defn make-addon
   "Uninitialized IAddon. No thread, file or container is touched."

@@ -152,11 +152,36 @@
 (defn detached-script
   "The `sh -c` script that replaces the shell with `command` as the leader of a
    new session, its output appended to `log`. The spawned pid is therefore the
-   program's and its process group's."
-  [command log]
-  (str "exec setsid "
-       (str/join " " (map quoted (command-line command)))
-       " >> " (quoted log) " 2>&1 < /dev/null"))
+   program's and its process group's.
+
+   With `{:unit u}` the program is started through
+   `systemd-run --user --scope --collect --unit=u`: systemd-run execs in place,
+   so the pid is still the program's, but the program now lives in a transient
+   scope of the user manager instead of the cgroup of the process that spawned
+   it. An OOM kill of the hive scope then leaves the program running."
+  ([command log] (detached-script command log nil))
+  ([command log {:keys [unit]}]
+   (str "exec "
+        (when unit
+          (str "systemd-run --user --scope --quiet --collect --unit="
+               (quoted unit) " -- "))
+        "setsid "
+        (str/join " " (map quoted (command-line command)))
+        " >> " (quoted log) " 2>&1 < /dev/null")))
+
+(defn exit-advice
+  "What to do about program `run` (a Running row: :program/id :dir :log) that
+   exited right after its start, given the last lines of its log. Pure."
+  [run exit-code tail]
+  (let [said (str/lower-case (str/join "\n" tail))
+        dir (:dir run)]
+    (str (:program/id run) " exited right after start"
+         (when exit-code (str " (exit " exit-code ")"))
+         "; "
+         (cond
+           (str/includes? said "node_modules") (str "install node_modules in " dir " (npm install)")
+           (str/includes? said "not found") (str "a command it runs is missing in " dir "; see :log-tail")
+           :else (str "see :log-tail and " (:log run))))))
 
 (defn log-file
   "Where the output of `program` of compose project `project` goes under `log-dir`."

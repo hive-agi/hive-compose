@@ -22,8 +22,50 @@
     "Result<{:out}>: stop `services`, keeping containers and volumes. Empty is a no-op.")
   (-down! [e profile services]
     "Result<{:out}>: remove the containers of `services`, never volumes. Empty is a no-op.")
+  (-restart! [e profile services recreate?]
+    "Result<{:out}>: restart the containers of `services` in place, or, when
+     `recreate?`, recreate them (never their depends_on, never volumes). Empty is a no-op.")
   (-logs [e profile services tail]
     "Result<{:out}>: the last `tail` log lines of `services` (all when empty)."))
+
+(defprotocol IDependencyGraph
+  "Optional engine capability: the depends_on edges of a project, so `up` can
+   leave out what the compose file marks `required: false`. An engine without
+   it closes over every depends_on entry, as before."
+  (-dependencies [e profile]
+    "Result<{service {dep {:required? bool}}}>: the depends_on edges of the services the profile's project defines."))
+
+(defprotocol IPublishedPorts
+  "Optional engine capability: the host ports the running containers of a
+   project publish, so connections to them can count as use."
+  (-published [e profile]
+    "Result<{service #{port}}>: the host ports published by the running containers of the profile's project."))
+
+(defprotocol IContainerAddresses
+  "Optional engine capability: the addresses the running containers of a
+   project hold on their networks, so the connections they open to the
+   project's own published ports are not taken for use of it."
+  (-addresses [e profile]
+    "Result<#{ip}>: the network addresses of the running containers of the profile's project."))
+
+(defprotocol ISwarm
+  "The agents working beside the addon and the channel that reaches them."
+  (-agents [s]
+    "Result<[{:agent/id :agent/status :agent/cwd}]>: the live agents of the
+     swarm, or an error when no swarm answers (no host).")
+  (-notify! [s event data]
+    "Result<{:channel :direct|:broadcast ..}>: tell the swarm about `event` (a
+     keyword) with `data` ({:message string ..}). With `:to` (an agent id) in
+     `data` the notice is meant for that agent alone: :direct when it went to
+     it, :broadcast (with :fallback? true) when no directed channel resolved.
+     A notice that cannot be delivered is an error, never a throw."))
+
+(defprotocol IActivity
+  "Who talks to a local port right now."
+  (-peers [a ports]
+    "{port #{peer}}: the remote endpoints (\"addr:port\") of the TCP
+     connections accepted on each of local `ports`, listening sockets left
+     out. A port nobody is connected to is absent."))
 
 (defprotocol IProgramRunner
   "Host programs: the processes a section runs outside compose."
@@ -39,3 +81,13 @@
     "The port in `dir`'s .nrepl-port file, nil when absent.")
   (-halt! [r pid]
     "Result<{:pid :stopped?}>: terminate the process group `pid` leads. Halting a dead pid succeeds."))
+
+(defprotocol IProgramOutcome
+  "Optional runner capability: what a started program left behind once its
+   process is gone, so a program that dies right after start can say why. A
+   runner without it reports the death alone."
+  (-exit-code [r pid]
+    "The exit code of `pid`, started by this runner and since exited; nil while
+     it lives or when this runner did not start it (a pid kept across a restart).")
+  (-log-tail [r log n]
+    "[line]: the last `n` non-blank lines of the program log `log`, [] when it is absent."))

@@ -32,7 +32,8 @@
     (:project/env project) (assoc :profile/env (:project/env project))
     (some? (:project/wait? project)) (assoc :profile/wait? (:project/wait? project))
     (:project/ttl-minutes project) (assoc :profile/ttl-minutes (:project/ttl-minutes project))
-    (:project/idle-action project) (assoc :profile/idle-action (:project/idle-action project))))
+    (:project/idle-action project) (assoc :profile/idle-action (:project/idle-action project))
+    (:project/activity project) (assoc :profile/activity (:project/activity project))))
 
 (defn section
   "The Profile of the section of `project` that `names` resolved to `services`."
@@ -40,6 +41,25 @@
   (assoc (project-profile project)
          :profile/id (section-id (:project/id project) names)
          :profile/services (vec (distinct services))))
+
+(def ^:private project-derived
+  "Profile keys a section takes from its project rather than from the call."
+  [:profile/dir :profile/files :profile/project :profile/programs :profile/env
+   :profile/ttl-minutes :profile/idle-action :profile/activity])
+
+(defn rebase-section
+  "Snapshot `snap` of an active section re-based on its project as configured
+   now (`new-proj`; `old-proj` as it was when the snapshot was taken): dir,
+   files, compose name, programs, env, TTL and idle action follow `new-proj`.
+   The id, services and per-call flags stay; env entries the call added over
+   `old-proj`'s env stay over `new-proj`'s."
+  [old-proj new-proj snap]
+  (let [old-env (:project/env old-proj)
+        extra (into {} (remove (fn [[k v]] (= v (get old-env k)))) (:profile/env snap))
+        base (dissoc (project-profile new-proj) :profile/id :profile/wait?)
+        env (merge (:profile/env base) extra)]
+    (cond-> (merge (apply dissoc snap project-derived) (dissoc base :profile/env))
+      (seq env) (assoc :profile/env env))))
 
 (defn profile-members
   "Services a native compose profile adds over the always-on ones."

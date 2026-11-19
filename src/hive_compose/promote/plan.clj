@@ -41,34 +41,73 @@
         :action :stop
         :services (vec (remove keep (release-services active current)))}])))
 
+(defn kept-by
+  "{service [profile-id]}: for each of `services` that `released` leaves up,
+   the other active profiles of `project` that need it. Services nobody else
+   needs are absent. Pure."
+  [active id project services released]
+  (into (sorted-map)
+        (for [s (sort (distinct (remove (set released) services)))
+              :let [holders (vec (sort (for [[k a] active
+                                             :when (and (not= k id)
+                                                        (= project (:project a))
+                                                        (contains? (footprint a) s))]
+                                         k)))]
+              :when (seq holders)]
+          [s holders])))
+
 (defn down-release
   "The Release step for taking profile `id` down with `action` (:stop or :down).
    An active profile releases what it alone needs; an inactive one releases
-   `services` minus what active profiles need."
+   `services` minus what active profiles need. What is left up because another
+   section needs it is named under :kept ({service [section-id]}), and a step
+   that releases nothing says why under :note, so a down that does nothing is
+   never a silent ok."
   [active id project services action]
-  {:profile/id id
-   :project project
-   :action action
-   :services (if (contains? active id)
-               (release-services active id)
-               (vec (sort (remove (needed-by-others active project id) services))))})
+  (let [candidates (if (contains? active id) (footprint (get active id)) services)
+        released (if (contains? active id)
+                   (release-services active id)
+                   (vec (sort (remove (needed-by-others active project id) services))))
+        kept (kept-by active id project candidates released)]
+    (cond-> {:profile/id id
+             :project project
+             :action action
+             :services released}
+      (seq kept) (assoc :kept kept)
+      (and (empty? released) (seq kept))
+      (assoc :note (str "nothing was " (if (= :stop action) "stopped" "removed")
+                        ": every service of " id " is needed by another active section (see kept). "
+                        "Use command=restart to recycle a service in place, or take those sections down first."))
+      (and (empty? released) (empty? kept))
+      (assoc :note (str "nothing was " (if (= :stop action) "stopped" "removed")
+                        ": " id " names no service to release.")))))
 
 (defn idle?
   "True when `ttl-ms` has elapsed since `last-touch`."
   [now-ms last-touch ttl-ms]
   (>= (- now-ms last-touch) ttl-ms))
 
+(defn effective-ttl-ms
+  "Idle time after which the reaper acts on active entry `a` running `p`: its
+   TTL, or the orphan TTL when shorter and the entry's last claim ended
+   (`:orphaned-at`)."
+  [settings p a]
+  (let [ttl (profile/ttl-ms settings p)
+        orphan (some-> (:compose/orphan-ttl-minutes settings) (* 60000))]
+    (if (and (:orphaned-at a) orphan) (min ttl orphan) ttl)))
+
 (defn reap-releases
   "Release steps for every idle profile, applied in id order against a shrinking
    active map, so a service two idle profiles share is released by the last one.
-   Profiles whose idle action is :none are never reaped."
+   Profiles whose idle action is :none are never reaped. An orphaned entry
+   (its last claim ended) is idle after the orphan TTL when that is shorter."
   [settings now-ms active]
   (let [profiles (:compose/profiles settings)
         idle-ids (->> active
                       (filter (fn [[id a]]
                                 (let [p (or (get profiles id) (:profile a))]
                                   (and (not= :none (profile/idle-action settings p))
-                                       (idle? now-ms (:last-touch a) (profile/ttl-ms settings p))))))
+                                       (idle? now-ms (:last-touch a) (effective-ttl-ms settings p a))))))
                       (map key)
                       sort)]
     (first
