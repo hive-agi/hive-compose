@@ -244,6 +244,18 @@ value the preset's services need.
   `allow_orphans=true` goes ahead anyway and reports what it overrode. The
   check reads `/proc` and `/etc/subuid`; when it cannot read them it says so
   and lets the call through. `:compose/orphan-guard? false` turns it off.
+- A section never takes a service from under another live section of the same
+  compose project. compose keeps one container per service, so `restart
+  recreate=true` of a service another section holds (it runs it or needs it),
+  or an `up`/`switch` whose compose inputs (project dir, files, env, references
+  compared by rendering) differ from those the holder ran with, which makes
+  compose recreate the container on a changed config hash, is refused. The
+  refusal names the holder section, the agents owning it (its claims, else the
+  agents the last usage pass saw working in it), the services and which inputs
+  differ (variable names, never values). A holder is live unless it is
+  orphaned and unused. Sections with equal inputs share dependencies freely.
+  `allow_shared=true` goes ahead and reports what it overrode. The decision is
+  the pure `hive-compose.promote.ownership/conflicts`.
 
 ## Config
 
