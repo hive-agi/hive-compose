@@ -72,3 +72,13 @@
     "The port in `dir`'s .nrepl-port file, nil when absent.")
   (-halt! [r pid]
     "Result<{:pid :stopped?}>: terminate the process group `pid` leads. Halting a dead pid succeeds."))
+
+(defprotocol IProgramOutcome
+  "Optional runner capability: what a started program left behind once its
+   process is gone, so a program that dies right after start can say why. A
+   runner without it reports the death alone."
+  (-exit-code [r pid]
+    "The exit code of `pid`, started by this runner and since exited; nil while
+     it lives or when this runner did not start it (a pid kept across a restart).")
+  (-log-tail [r log n]
+    "[line]: the last `n` non-blank lines of the program log `log`, [] when it is absent."))

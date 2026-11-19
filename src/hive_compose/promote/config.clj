@@ -25,7 +25,10 @@
      :compose/claim-ttl-minutes    a claim not renewed for this long ends (default 30)
      :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
                                    whose last claim ended, when shorter than its TTL
-                                   (default 10)"
+                                   (default 10)
+     :compose/program-grace-ms     how long a host program is watched after its
+                                   start; one that exits within it is reported
+                                   :exited with its code and log tail (default 3000)"
   (:require [clojure.string :as str]
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]))
@@ -44,7 +47,8 @@
    :compose/notify? true
    :compose/activity #{:nrepl}
    :compose/claim-ttl-minutes 30
-   :compose/orphan-ttl-minutes 10})
+   :compose/orphan-ttl-minutes 10
+   :compose/program-grace-ms 3000})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")

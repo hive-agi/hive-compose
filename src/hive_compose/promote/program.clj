@@ -169,6 +169,20 @@
         (str/join " " (map quoted (command-line command)))
         " >> " (quoted log) " 2>&1 < /dev/null")))
 
+(defn exit-advice
+  "What to do about program `run` (a Running row: :program/id :dir :log) that
+   exited right after its start, given the last lines of its log. Pure."
+  [run exit-code tail]
+  (let [said (str/lower-case (str/join "\n" tail))
+        dir (:dir run)]
+    (str (:program/id run) " exited right after start"
+         (when exit-code (str " (exit " exit-code ")"))
+         "; "
+         (cond
+           (str/includes? said "node_modules") (str "install node_modules in " dir " (npm install)")
+           (str/includes? said "not found") (str "a command it runs is missing in " dir "; see :log-tail")
+           :else (str "see :log-tail and " (:log run))))))
+
 (defn log-file
   "Where the output of `program` of compose project `project` goes under `log-dir`."
   [log-dir project program]

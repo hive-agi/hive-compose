@@ -244,6 +244,10 @@ value the preset's services need.
 `:compose/timeout-ms` (60000), `:compose/up-timeout-ms` (600000),
 `:compose/adopt?` (true), `:compose/programs?` (true), `:compose/log-dir`,
 `:compose/stop-grace-ms` (5000, before a program's group is killed),
+`:compose/program-grace-ms` (3000, how long a started program is watched; one
+that exits within it is reported `:status :exited` with `:exit-code`,
+`:log-tail` and `:advice`, and is not held; `status` reports a held program
+that died since the same way),
 `:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
 (`#{:nrepl}`), `:compose/claim-ttl-minutes` (30), `:compose/orphan-ttl-minutes` (10).
 
