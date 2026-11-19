@@ -23,7 +23,8 @@
             [hive-system.process.core :as process]
             [hive-system.process.liveness :as liveness]
             [hive-system.shell.core :as shell])
-  (:import (java.net InetSocketAddress Socket)))
+  (:import (java.io RandomAccessFile)
+           (java.net InetSocketAddress Socket)))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -69,9 +70,28 @@
       (<= left 0) false
       :else (do (Thread/sleep 100) (recur (- left 100))))))
 
+(defn- tail-lines
+  "The last `n` non-blank lines of file `log`, read from its last 16 KiB; []
+   when it is absent or unreadable."
+  [log n]
+  (let [f (io/file log)]
+    (if-not (.isFile f)
+      []
+      (try (with-open [raf (RandomAccessFile. f "r")]
+             (let [len (.length raf)
+                   start (max 0 (- len 16384))
+                   buf (byte-array (- len start))]
+               (.seek raf start)
+               (.readFully raf buf)
+               (->> (str/split-lines (String. buf "UTF-8"))
+                    (remove str/blank?)
+                    (take-last n)
+                    vec)))
+           (catch java.io.IOException _unreadable-log-has-no-tail [])))))
+
 (declare scope-unit)
 
-(defrecord HostRunner [spawn exec alive? grace-ms resolver systemd-scope?]
+(defrecord HostRunner [spawn exec alive? grace-ms resolver systemd-scope? procs]
   port/IProgramRunner
   (-facts [_ dir]
     (r/try-effect* :compose/program-unreadable (facts dir)))
@@ -88,6 +108,10 @@
                          (seq env) (assoc :env env)))
                 (fn [handle]
                   (close-pipes! handle)
+                  ;; The JVM handle is kept so the exit code of a program
+                  ;; that dies can be read; a pid from before a restart has none.
+                  (when (instance? Process (:process handle))
+                    (swap! procs assoc (:pid handle) (:process handle)))
                   {:pid (:pid handle)}))))
   (-alive? [_ pid] (boolean (alive? pid)))
   (-listening? [_ port]
@@ -108,7 +132,13 @@
         (when-not (await-death alive? pid grace-ms)
           (signal-group! exec pid "KILL")
           (await-death alive? pid 2000))
-        {:pid pid :stopped? (not (alive? pid))}))))
+        {:pid pid :stopped? (not (alive? pid))})))
+  port/IProgramOutcome
+  (-exit-code [_ pid]
+    (let [p (get @procs pid)]
+      (when (and (instance? Process p) (not (.isAlive ^Process p)))
+        (.exitValue ^Process p))))
+  (-log-tail [_ log n] (tail-lines log n)))
 
 (defn- systemd-user-scope?
   "True when a systemd user manager answers here: `systemd-run` is on PATH and
@@ -146,4 +176,5 @@
                   (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
                   (if (contains? opts :compose/systemd-scope?)
                     (boolean (:compose/systemd-scope? opts))
-                    (systemd-user-scope?)))))
+                    (systemd-user-scope?))
+                  (atom {}))))

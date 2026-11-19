@@ -144,7 +144,8 @@
    [:compose/notify? :boolean]
    [:compose/activity [:set [:enum :nrepl :published]]]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
-   [:compose/orphan-ttl-minutes [:int {:min 1}]]])
+   [:compose/orphan-ttl-minutes [:int {:min 1}]]
+   [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."
