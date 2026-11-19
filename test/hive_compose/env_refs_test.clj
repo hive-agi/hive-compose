@@ -294,7 +294,12 @@
         (is (str/includes? (slurp (io/file dir "state.edn")) token-path) "it holds the reference"))
       (testing "an unreadable reference fails the up and names itself"
         (reset! calls [])
-        (let [res (call a {"command" "up" "target" "db" "env" {"EXTRA" {"pass" "Funeraria/absent"}}})]
+        ;; section shop/api is live and needs db, and this env differs from the
+        ;; one it ran with: the ownership guard would refuse first
+        ;; (held-by-another-section); allow_shared lets the call reach the
+        ;; secret resolution this test is about.
+        (let [res (call a {"command" "up" "target" "db" "env" {"EXTRA" {"pass" "Funeraria/absent"}}
+                           "allow_shared" true})]
           (is (:error? res))
           (is (= "secret-unresolved" (get-in res [:body :error])))
           (is (= "pass:Funeraria/absent" (get-in res [:body :ref])))
