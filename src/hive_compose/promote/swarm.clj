@@ -142,27 +142,44 @@
     (merge (apply dissoc mine published)
            (without-hosts (select-keys mine published) own))))
 
+(defn busy-services
+  "{service percent} of `load` ({service percent}) above `threshold`, among
+   the services of `footprint` (all of `load` when nil). A reading that is
+   no number is left out."
+  [load threshold footprint]
+  (into (sorted-map)
+        (filter (fn [[s pct]]
+                  (and (number? pct) (> pct threshold)
+                       (or (nil? footprint) (contains? (set footprint) s)))))
+        load))
+
 (defn usage
   "{:in-use? bool :by [reason] :sources [source]} of an active section from
    what one pass saw: `claims` still holding, `agents` working in its
-   project's directories and `fresh` ({port #{peer}}) connections opened to
+   project's directories, `fresh` ({port #{peer}}) connections opened to
    its ports since the last pass, each port's source (:nrepl, :published)
-   given by `sources` ({port source}). A reason is {:claim agent}, {:agent id}
-   or {:port p :peers n :source s}; :sources names, in that order and once
-   each, what the reasons came from: :claim, :agent, or a port's source
-   (:port when `sources` does not name it)."
-  [{:keys [claims agents fresh sources]}]
+   given by `sources` ({port source}), and `busy` ({service percent}) services
+   found working on their own (see `busy-services`). A reason is {:claim
+   agent}, {:agent id}, {:port p :peers n :source s} or {:service s :cpu
+   percent :source :cpu}; :sources names, in that order and once each, what
+   the reasons came from: :claim, :agent, a port's source (:port when
+   `sources` does not name it), :cpu."
+  [{:keys [claims agents fresh sources busy]}]
   (let [ports (for [[p peers] (sort-by key fresh) :when (seq peers)]
                 (cond-> {:port p :peers (count peers)}
                   (get sources p) (assoc :source (get sources p))))
+        cpu (for [[s pct] (sort-by key busy)]
+              {:service s :cpu pct :source :cpu})
         by (vec (concat (map (fn [a] {:claim a}) (sort (keys claims)))
                         (map (fn [a] {:agent (:agent/id a)}) agents)
-                        ports))]
+                        ports
+                        cpu))]
     {:in-use? (boolean (seq by))
      :by by
      :sources (vec (distinct (concat (when (seq claims) [:claim])
                                      (when (seq agents) [:agent])
-                                     (map #(or (:source %) :port) ports))))}))
+                                     (map #(or (:source %) :port) ports)
+                                     (when (seq cpu) [:cpu]))))}))
 
 ;; ---------------------------------------------------------------------------
 ;; nREPL routes

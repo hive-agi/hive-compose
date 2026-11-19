@@ -25,7 +25,11 @@
                                    #{:nrepl}). A project overrides it for its sections
                                    with :project/activity, a preset with
                                    :profile/activity. Connections from the project's
-                                   own containers never count.
+                                   own containers never count. :cpu (opt-in too)
+                                   counts a running service busier than
+                                   :compose/cpu-busy-percent, client or not
+     :compose/cpu-busy-percent     CPU use, in percent of one core, above which a
+                                   service of a :cpu section is busy (default 5)
      :compose/claim-ttl-minutes    a claim not renewed for this long ends (default 30)
      :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
                                    whose last claim ended, when shorter than its TTL
@@ -50,6 +54,7 @@
    :compose/swarm? true
    :compose/notify? true
    :compose/activity #{:nrepl}
+   :compose/cpu-busy-percent 5
    :compose/claim-ttl-minutes 30
    :compose/orphan-ttl-minutes 10
    :compose/program-grace-ms 3000})

@@ -31,9 +31,9 @@
   (or (:profile/idle-action p) (:compose/default-idle-action settings)))
 
 (defn activity
-  "Which new connections count as use of `p`: its own :profile/activity (from
-   its project's :project/activity for a section), else the global
-   :compose/activity. A set of :nrepl and :published."
+  "What counts as use of `p`: its own :profile/activity (from its project's
+   :project/activity for a section), else the global :compose/activity. A set
+   of :nrepl, :published and :cpu."
   [settings p]
   (set (or (:profile/activity p) (:compose/activity settings))))
 

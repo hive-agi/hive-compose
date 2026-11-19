@@ -58,10 +58,11 @@
    [:nrepl-port {:optional true} :int]])
 
 (def Activity
-  "Which new connections to a section's ports count as use of it: :nrepl (the
-   shared nREPLs of its programs) and :published (the host ports its
-   containers publish, a browser or any host-side client)."
-  [:set [:enum :nrepl :published]])
+  "What counts as use of a section: new connections to :nrepl (the shared
+   nREPLs of its programs) and :published (the host ports its containers
+   publish, a browser or any host-side client), and :cpu (a running service
+   above :compose/cpu-busy-percent, busy with no client connected)."
+  [:set [:enum :nrepl :published :cpu]])
 
 (def Profile
   [:map
@@ -92,8 +93,9 @@
 
 (def Usage
   "What the last reaper pass saw using a section. A reason is {:claim agent},
-   {:agent id} or {:port p :peers n :source :nrepl|:published}; :sources names
-   once each what the reasons came from (:claim :agent :nrepl :published)."
+   {:agent id}, {:port p :peers n :source :nrepl|:published} or {:service s
+   :cpu percent :source :cpu}; :sources names once each what the reasons came
+   from (:claim :agent :nrepl :published :cpu)."
   [:map
    [:at :int]
    [:in-use? :boolean]
@@ -153,6 +155,7 @@
    [:compose/swarm? :boolean]
    [:compose/notify? :boolean]
    [:compose/activity Activity]
+   [:compose/cpu-busy-percent {:optional true} [:and number? [:>= 0]]]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
    [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])
