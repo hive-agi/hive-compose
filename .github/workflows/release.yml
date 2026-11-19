@@ -58,16 +58,26 @@ jobs:
       # The release number comes from the tags, not from a commit back to main.
       # VERSION in the tree is a FLOOR (raise it in a staging PR to open a new
       # minor line); this run releases patch+1 of max(VERSION, newest v* tag).
+      # A VERSION above every tag and not yet tagged (a new minor or major set
+      # in a staging PR) is released as written, so 0.2.0 ships as v0.2.0.
       - name: Resolve release base from tags
+        id: resolve
         run: |
           set -euo pipefail
           FLOOR=$(tr -d '[:space:]' < VERSION)
           LAST=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1 | sed 's/^v//')
           BASE=$(printf '%s\n%s\n' "$FLOOR" "${LAST:-$FLOOR}" | sort -V | tail -n1)
-          echo "VERSION floor $FLOOR, newest tag ${LAST:-none}: base $BASE"
+          PINNED=false
+          if [ "$BASE" = "$FLOOR" ] && [ "$FLOOR" != "${LAST:-}" ] \
+             && ! git rev-parse -q --verify "refs/tags/v$FLOOR" >/dev/null; then
+            PINNED=true
+          fi
+          echo "VERSION floor $FLOOR, newest tag ${LAST:-none}: base $BASE, pinned $PINNED"
           printf '%s\n' "$BASE" > VERSION
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
 
       - name: Bump patch version
+        if: steps.resolve.outputs.pinned != 'true'
         run: clojure -T:build bump :level :patch
 
       - name: Tag
