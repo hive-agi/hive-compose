@@ -15,7 +15,17 @@
      :compose/state-file           default ~/.local/state/hive-compose/state.edn
      :compose/timeout-ms           per compose call (default 60000)
      :compose/up-timeout-ms        per `up`, pulls included (default 600000)
-     :compose/adopt?               adopt running stacks of configured profiles (default true)"
+     :compose/adopt?               adopt running stacks of configured profiles (default true)
+     :compose/swarm?               count agents working in a project's directories as
+                                   use of its sections (default true)
+     :compose/notify?              shout nREPL routes and reaps to the swarm (default true)
+     :compose/activity             #{:nrepl :published}: which new connections count as
+                                   use; :published (container ports) is opt-in because
+                                   a section's own pool would keep it alive (default #{:nrepl})
+     :compose/claim-ttl-minutes    a claim not renewed for this long ends (default 30)
+     :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
+                                   whose last claim ended, when shorter than its TTL
+                                   (default 10)"
   (:require [clojure.string :as str]
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]))
@@ -29,7 +39,12 @@
    :compose/timeout-ms 60000
    :compose/up-timeout-ms 600000
    :compose/adopt? true
-   :compose/programs? true})
+   :compose/programs? true
+   :compose/swarm? true
+   :compose/notify? true
+   :compose/activity #{:nrepl}
+   :compose/claim-ttl-minutes 30
+   :compose/orphan-ttl-minutes 10})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")
@@ -104,7 +119,9 @@
                               (as-seq :profile/id (:compose/profiles cfg))))
         projects (map #(normalize-project home %) (as-seq :project/id (:compose/projects cfg)))
         s (merge defaults
-                 (select-keys cfg (keys defaults))
+                 (cond-> (select-keys cfg (keys defaults))
+                   (coll? (:compose/activity cfg))
+                   (update :compose/activity #(into #{} (map keyword) %)))
                  {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
                   :compose/log-dir (expand-home home (or (:compose/log-dir cfg) default-log-dir))
                   :compose/projects (into {} (map (juxt :project/id identity)) projects)

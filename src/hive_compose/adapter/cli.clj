@@ -102,6 +102,22 @@
               (keep #(get % "Service")))
         rows))
 
+(defn published-ports
+  "{service #{host-port}} of the running containers in `ps` rows: the
+   PublishedPort of each of their Publishers that publishes one."
+  [rows]
+  (reduce (fn [acc row]
+            (let [svc (get row "Service")
+                  ports (into #{} (keep (fn [pub]
+                                          (let [p (get pub "PublishedPort")]
+                                            (when (and (int? p) (pos? p)) (long p)))))
+                              (get row "Publishers"))]
+              (if (and svc (= "running" (get row "State")) (seq ports))
+                (update acc svc (fnil into #{}) ports)
+                acc)))
+          {}
+          rows))
+
 (defn closure-services
   "Sorted services of a `config --format json` document."
   [s]
@@ -208,7 +224,12 @@
   ;; query would drop that service and its edges.
   (-dependencies [_ p]
     (parsed (run exec p (closure-argv p) timeout-ms)
-            :compose/unparseable dependency-graph)))
+            :compose/unparseable dependency-graph))
+
+  port/IPublishedPorts
+  (-published [_ p]
+    (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
+            (comp published-ports parse-json-rows))))
 
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),

@@ -27,6 +27,9 @@
             [hive-dsl.result :as r]
             [hive-compose.promote.profile :as profile]
             [hive-compose.pipeline.restart :as restart]
+            [hive-compose.pipeline.swarm :as swarm]
+            [hive-compose.adapter.swarm :as swarm-adapter]
+            [hive-compose.adapter.procnet :as procnet]
             [hive-addon.host :as addon-host])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
@@ -95,6 +98,8 @@
   {:engine (or (:compose/engine cfg)
                (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
    :runner (or (:compose/runner cfg) (host/make-runner cfg))
+   :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
+   :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
    :settings settings
    :state (atom (merge {:active {} :current nil} (select-keys persisted [:active :current])))
    :now (or (:compose/now cfg) now-ms)
@@ -115,7 +120,10 @@
       (try
         (let [adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
                         (ops/adopt! ctx))
-              pass (cond-> (ops/reap! ctx) (seq adopted) (assoc :adopted adopted))]
+              observed (swarm/observe! ctx)
+              reaped (ops/reap! ctx)
+              _ (swarm/announce-reaped! ctx (:reaped reaped))
+              pass (cond-> (assoc reaped :observed observed) (seq adopted) (assoc :adopted adopted))]
           (swap! state assoc :adopted? true :last-pass (assoc pass :at ((:now ctx))))
           pass)
         (catch Throwable t
@@ -152,7 +160,11 @@
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
-   "reap" "run the idle reaper now"
+   "claim" "an agent declares it works on a section, bringing it up when not active; the answer names the shared nREPL per module to drive. target|profile; agent (default agent_id); note. Renew before claim TTL"
+   "release" "an agent gives up its claim; with no claim left the section is reaped after the orphan TTL, or now with stop=true. target|profile; agent; stop"
+   "who" "per active section: claims, what the last pass saw using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent the sections it works in"
+   "nrepl" "which shared nREPL drives a module: path (a file or dir) for the closest one, project to filter, none for all; each with advice"
+   "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
    "reload" "re-read the config"))
@@ -189,6 +201,20 @@
                                    :hint "a value is a string or {\"pass\": \"<store path>\"}"})
     (r/ok opts)))
 
+(defn- agent-param
+  "The claiming agent: `agent`, else the `agent_id` the host stamps on a call."
+  [params]
+  (some-> (or (param params "agent") (param params "agent_id")) str))
+
+(defn- announced
+  "`res` of an up or switch, with the swarm told about the section's shared
+   nREPLs (:announced, when a notice went out)."
+  [ctx res]
+  (if (r/ok? res)
+    (let [n (swarm/announce-up! ctx (get-in res [:ok :profile]))]
+      (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
+    res))
+
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
@@ -210,8 +236,15 @@
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (with-opts #(ops/up-profile! ctx %))
-        "switch" (with-opts #(ops/switch-profile! ctx %))
+        "up" (announced ctx (with-opts #(ops/up-profile! ctx %)))
+        "switch" (announced ctx (with-opts #(ops/switch-profile! ctx %)))
+        "claim" (on-subject #(swarm/claim! ctx % (agent-param params)
+                                            {:note (some-> (param params "note") str)}))
+        "release" (on-subject #(swarm/release-claim! ctx % (agent-param params)
+                                                     {:stop? (flag params "stop")}))
+        "who" (swarm/who ctx)
+        "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
+                                  :project (some-> (param params "project") str)})
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
         "restart" (with-opts #(restart/restart-profile! ctx % (flag params "recreate")))
@@ -241,6 +274,11 @@
                      "another section needs them. "
                      "up/switch take no_deps (start only the named services, e.g. past a failing migration), "
                      "wait (until healthy) and env. touch with no target resets every active section. "
+                     "SWARM: an agent working on an app claims its section (claim target=.. note=..; renew within "
+                     "the claim TTL, release when done) and gets the shared nREPL per module to drive instead of "
+                     "starting its own JVM; nrepl path=<file> answers which port drives that file. The reaper keeps "
+                     "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
+                     "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -250,7 +288,11 @@
                               "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
-                              "project" {:type "string" :description "[touch] with no target: only the sections of this project"}
+                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes"}
+                              "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
+                              "note" {:type "string" :description "[claim] what the agent works on"}
+                              "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
+                              "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
                  :required ["command"]}
    :handler (fn [params]
@@ -359,7 +401,20 @@
   (hooks [this]
     {:compose/touch! (fn [id] (if-let [ctx (:ctx @state)] (ops/touch! ctx id) (r/err :compose/not-initialized)))
      :compose/status (fn [] (some-> (:ctx @state) ops/status))
-     :compose/tick! (fn [] (tick! this))}))
+     :compose/tick! (fn [] (tick! this))
+     :compose/claim! (fn [target agent opts]
+                       (if-let [ctx (:ctx @state)]
+                         (r/bind (ops/subject ctx {:target target}) #(swarm/claim! ctx % agent (or opts {})))
+                         (r/err :compose/not-initialized)))
+     :compose/release! (fn [target agent opts]
+                         (if-let [ctx (:ctx @state)]
+                           (r/bind (ops/subject ctx {:target target}) #(swarm/release-claim! ctx % agent (or opts {})))
+                           (r/err :compose/not-initialized)))
+     :compose/nrepl-for (fn [path]
+                          (if-let [ctx (:ctx @state)]
+                            (swarm/nrepl ctx {:path path})
+                            (r/err :compose/not-initialized)))
+     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))}))
 
 (defn make-addon
   "Uninitialized IAddon. No thread, file or container is touched."

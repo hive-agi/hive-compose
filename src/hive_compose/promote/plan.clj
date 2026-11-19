@@ -87,17 +87,27 @@
   [now-ms last-touch ttl-ms]
   (>= (- now-ms last-touch) ttl-ms))
 
+(defn effective-ttl-ms
+  "Idle time after which the reaper acts on active entry `a` running `p`: its
+   TTL, or the orphan TTL when shorter and the entry's last claim ended
+   (`:orphaned-at`)."
+  [settings p a]
+  (let [ttl (profile/ttl-ms settings p)
+        orphan (some-> (:compose/orphan-ttl-minutes settings) (* 60000))]
+    (if (and (:orphaned-at a) orphan) (min ttl orphan) ttl)))
+
 (defn reap-releases
   "Release steps for every idle profile, applied in id order against a shrinking
    active map, so a service two idle profiles share is released by the last one.
-   Profiles whose idle action is :none are never reaped."
+   Profiles whose idle action is :none are never reaped. An orphaned entry
+   (its last claim ended) is idle after the orphan TTL when that is shorter."
   [settings now-ms active]
   (let [profiles (:compose/profiles settings)
         idle-ids (->> active
                       (filter (fn [[id a]]
                                 (let [p (or (get profiles id) (:profile a))]
                                   (and (not= :none (profile/idle-action settings p))
-                                       (idle? now-ms (:last-touch a) (profile/ttl-ms settings p))))))
+                                       (idle? now-ms (:last-touch a) (effective-ttl-ms settings p a))))))
                       (map key)
                       sort)]
     (first

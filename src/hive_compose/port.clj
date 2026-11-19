@@ -35,6 +35,29 @@
   (-dependencies [e profile]
     "Result<{service {dep {:required? bool}}}>: the depends_on edges of the services the profile's project defines."))
 
+(defprotocol IPublishedPorts
+  "Optional engine capability: the host ports the running containers of a
+   project publish, so connections to them can count as use."
+  (-published [e profile]
+    "Result<{service #{port}}>: the host ports published by the running containers of the profile's project."))
+
+(defprotocol ISwarm
+  "The agents working beside the addon and the channel that reaches them."
+  (-agents [s]
+    "Result<[{:agent/id :agent/status :agent/cwd}]>: the live agents of the
+     swarm, or an error when no swarm answers (no host).")
+  (-notify! [s event data]
+    "Result<bool>: tell the swarm about `event` (a keyword) with `data`
+     ({:message string ..}). A notice that cannot be delivered is an error,
+     never a throw."))
+
+(defprotocol IActivity
+  "Who talks to a local port right now."
+  (-peers [a ports]
+    "{port #{peer}}: the remote endpoints (\"addr:port\") of the TCP
+     connections accepted on each of local `ports`, listening sockets left
+     out. A port nobody is connected to is absent."))
+
 (defprotocol IProgramRunner
   "Host programs: the processes a section runs outside compose."
   (-facts [r dir]
