@@ -47,9 +47,11 @@
     "Result<[{:agent/id :agent/status :agent/cwd}]>: the live agents of the
      swarm, or an error when no swarm answers (no host).")
   (-notify! [s event data]
-    "Result<bool>: tell the swarm about `event` (a keyword) with `data`
-     ({:message string ..}). A notice that cannot be delivered is an error,
-     never a throw."))
+    "Result<{:channel :direct|:broadcast ..}>: tell the swarm about `event` (a
+     keyword) with `data` ({:message string ..}). With `:to` (an agent id) in
+     `data` the notice is meant for that agent alone: :direct when it went to
+     it, :broadcast (with :fallback? true) when no directed channel resolved.
+     A notice that cannot be delivered is an error, never a throw."))
 
 (defprotocol IActivity
   "Who talks to a local port right now."

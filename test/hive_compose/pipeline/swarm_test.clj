@@ -126,7 +126,8 @@
     (advance! c (* 61 minute))
     (let [pass (pass! c)]
       (is (empty? (:reaped pass)) "past its TTL, but an agent works in it")
-      (is (= [{:agent "ling-2" :section "shop/api"}] (get-in pass [:observed :notified])))
+      (is (= [{:agent "ling-2" :section "shop/api" :channel :direct}] (get-in pass [:observed :notified])))
+      (is (= [[:nrepl/route "ling-2"]] (stub-swarm/targets (:swarm c))) "addressed to the agent, not broadcast")
       (is (= [{:agent "ling-2"}] (get-in @(:state c) [:active "shop/api" :usage :by]))))
     (let [[event data] (last (stub-swarm/notices (:swarm c)))]
       (is (= :nrepl/route event))
@@ -136,6 +137,32 @@
       (stub-swarm/agents! (:swarm c) [])
       (advance! c (* 61 minute))
       (is (= ["shop/api"] (mapv :profile/id (:reaped (pass! c))))))))
+
+(deftest a-claiming-agent-is-told-directly-wherever-it-works
+  (let [c (ctx [{:agent/id "ling-1" :agent/cwd "/elsewhere"}
+                {:agent/id "ling-3" :agent/cwd "/w/blog"}])
+        _ (stub-runner/listen! (:runner c) repl-port)]
+    (swarm/claim! c (section c "shop/api") "ling-1" {})
+    (let [pass (pass! c)]
+      (is (= [{:agent "ling-1" :section "shop/api" :channel :direct}] (get-in pass [:observed :notified]))
+          "the claimant is told though its cwd lies outside the project; the blog agent is not")
+      (is (= [[:nrepl/route "ling-1"]] (stub-swarm/targets (:swarm c)))))
+    (is (empty? (get-in (pass! c) [:observed :notified])) "told once")
+    (testing "a claimant the swarm does not list is still told while its claim holds"
+      (let [c (ctx [])
+            _ (stub-runner/listen! (:runner c) repl-port)]
+        (swarm/claim! c (section c "shop/api") "ling-9" {})
+        (is (= [{:agent "ling-9" :section "shop/api" :channel :direct}]
+               (get-in (pass! c) [:observed :notified])))
+        (is (empty? (get-in (pass! c) [:observed :notified])) "and only once")))))
+
+(deftest section-notices-stay-broadcasts
+  (let [c (ctx [{:agent/id "ling-2" :agent/cwd "/w/shop/api"}])]
+    (stub-runner/listen! (:runner c) repl-port)
+    (ops/up-profile! c (section c "shop/api"))
+    (is (= {:channel :broadcast} (:ok (swarm/announce-up! c "shop/api"))))
+    (is (nil? (:to (second (last (stub-swarm/notices (:swarm c)))))))
+    (is (empty? (stub-swarm/targets (:swarm c))) "section/up names no single agent")))
 
 (deftest new-nrepl-connections-count-as-use-a-lingering-one-does-not
   (let [c (ctx)

@@ -47,6 +47,18 @@
   (vec (sort-by :agent/id
                 (filter (fn [a] (some #(under? % (:agent/cwd a)) dirs)) agents))))
 
+(defn concerned
+  "The agents a section's notices concern: `agents` (those working in its
+   project's directories) and the `claimants` (agent ids holding a claim on
+   it), distinct and sorted by id. A claimant the swarm does not list stands
+   as {:agent/id id}."
+  [agents claimants]
+  (let [by-id (into {} (map (juxt :agent/id identity)) agents)]
+    (vec (sort-by :agent/id
+                  (vals (reduce (fn [m id] (if (contains? m id) m (assoc m id {:agent/id id})))
+                                by-id
+                                (remove nil? claimants)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; claims
 

@@ -140,7 +140,8 @@
         (stub-swarm/agents! (:swarm w) [{:agent/id "ling-2" :agent/cwd (str (:repl-dir w) "/src")}])
         (compose/tick! a)
         (compose/tick! a)
-        (let [routes (filter #(= :nrepl/route (first %)) (stub-swarm/notices (:swarm w)))]
+        (let [routes (filter #(and (= :nrepl/route (first %)) (= "ling-2" (:to (second %))))
+                             (stub-swarm/notices (:swarm w)))]
           (is (= 1 (count routes)))
           (is (= "ling-2" (:agent (second (first routes)))))
           (is (= (:port w) (-> routes first second :nrepl first :nrepl-port)))))

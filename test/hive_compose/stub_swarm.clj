@@ -13,17 +13,23 @@
       (r/err :host/absent {})
       (r/ok (vec (:agents @world)))))
   (-notify! [_ event data]
-    (swap! world update :notices conj [event data])
-    (r/ok true)))
+    (let [to (:to data)]
+      (swap! world update :notices conj [event data])
+      (when to (swap! world update :targets conj [event to]))
+      (r/ok (if to {:channel :direct :to to} {:channel :broadcast})))))
 
 (defn swarm
   "StubSwarm with `agents` ([{:agent/id :agent/cwd}])."
   ([] (swarm []))
-  ([agents] (->StubSwarm (atom {:agents agents :notices [] :absent? false}))))
+  ([agents] (->StubSwarm (atom {:agents agents :notices [] :targets [] :absent? false}))))
 
 (defn agents! [s agents] (swap! (:world s) assoc :agents agents))
 (defn absent! [s] (swap! (:world s) assoc :absent? true))
 (defn notices [s] (:notices @(:world s)))
+(defn targets
+  "[[event agent-id]] of the notices sent directed, in order."
+  [s]
+  (:targets @(:world s)))
 
 (defrecord StubActivity [world]
   port/IActivity
