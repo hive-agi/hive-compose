@@ -235,6 +235,15 @@ value the preset's services need.
   whole project).
 - The active map lives in `~/.local/state/hive-compose/state.edn`, so a restart
   still reaps what it started.
+- `up`, `switch` and `restart` refuse while orphans of a dead rootless docker
+  daemon still hold the section's docker volumes or host ports. An orphan is a
+  container process (subuid range, or a `docker-<id>.scope` cgroup) whose
+  parent is `systemd --user` and that no running container owns. The refusal
+  names each orphan with its pids, because recreating the service would run a
+  second copy on the same volume, e.g. two postmasters on one data dir.
+  `allow_orphans=true` goes ahead anyway and reports what it overrode. The
+  check reads `/proc` and `/etc/subuid`; when it cannot read them it says so
+  and lets the call through. `:compose/orphan-guard? false` turns it off.
 
 ## Config
 

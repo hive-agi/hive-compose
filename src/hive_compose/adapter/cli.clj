@@ -166,6 +166,33 @@
                  :config-files (get m "ConfigFiles")})
         rows))
 
+(def live-ids-argv
+  "Full ids of every running container the daemon knows, any project."
+  ["docker" "ps" "-q" "--no-trunc"])
+
+(defn service-resources
+  "{:volumes #{name} :ports #{port}} of `services` in a `config --format json`
+   document: the real names of the named volumes they mount (the top-level
+   `volumes` entry's name, else the key) and the host ports they publish.
+   Pure."
+  [s services]
+  (let [doc (json/read-str s)
+        vols (get doc "volumes")
+        wanted (set services)
+        svcs (filter (comp wanted key) (get doc "services"))
+        port-of (fn [p] (let [v (get p "published")]
+                          (cond (int? v) (long v)
+                                (and (string? v) (re-matches #"\d+" v)) (Long/parseLong v)
+                                :else nil)))]
+    {:volumes (into (sorted-set)
+                    (for [[_ m] svcs
+                          v (get m "volumes")
+                          :when (= "volume" (get v "type"))
+                          :let [src (get v "source")]
+                          :when (seq src)]
+                      (or (get-in vols [src "name"]) src)))
+     :ports (into (sorted-set) (for [[_ m] svcs p (get m "ports") :let [n (port-of p)] :when n] n))}))
+
 ;; ---------------------------------------------------------------------------
 ;; boundary
 
@@ -249,6 +276,17 @@
   (-published [_ p]
     (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
             (comp published-ports parse-json-rows)))
+
+  port/IContainerOwnership
+  (-live-containers [_]
+    (r/map-ok (run exec nil live-ids-argv timeout-ms) (comp set lines)))
+  ;; Every service named, not a targeted query: a service behind a native
+  ;; profile is shown only when named, so name exactly the ones asked for.
+  (-resources [_ p services]
+    (if (empty? services)
+      (r/ok {:volumes #{} :ports #{}})
+      (parsed (run exec p (closure-argv (assoc p :profile/services (vec services))) timeout-ms)
+              :compose/unparseable #(service-resources % services))))
 
   port/IContainerAddresses
   (-addresses [_ p]

@@ -30,6 +30,8 @@
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
             [hive-compose.adapter.procnet :as procnet]
+            [hive-compose.adapter.procfs :as procfs]
+            [hive-compose.pipeline.orphans :as orphans]
             [hive-addon.host :as addon-host])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
@@ -108,6 +110,9 @@
      :runner (or (:compose/runner cfg) (host/make-runner cfg))
      :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
      :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
+     :processes (if (contains? cfg :compose/process-table)
+                  (:compose/process-table cfg)
+                  (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
      :settings settings
      :state state
      :now (or (:compose/now cfg) now-ms)
@@ -162,11 +167,11 @@
    "status" "active sections: services, idle time, reaper countdown, host programs"
    "targets" "what each configured project offers as a target: services and native profiles"
    "programs" "host programs each project declares, how each starts, whether its nREPL answers"
-   "up" "start a section alongside the others. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value | VAR {\"pass\": path}}"
+   "up" "start a section alongside the others; refused while processes of a dead docker daemon hold its volumes or ports. target|profile; no_deps (only the named services), wait (until healthy), env {VAR value | VAR {\"pass\": path}}, allow_orphans (go ahead anyway)"
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
    "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
    "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
-   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on). target|profile; env"
+   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on). target|profile; env; allow_orphans"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
@@ -230,6 +235,7 @@
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
         opts (call-options params)
+        allow-orphans? (flag params orphans/override-param)
         on-subject* (fn [f adjust]
                       (r/bind (checked-options opts)
                               (fn [o]
@@ -246,8 +252,8 @@
         "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (announced ctx (with-opts #(ops/up-profile! ctx %)))
-        "switch" (announced ctx (with-opts #(ops/switch-profile! ctx %)))
+        "up" (announced ctx (with-opts (fn [p] (orphans/guarded ctx p allow-orphans? #(ops/up-profile! ctx p)))))
+        "switch" (announced ctx (with-opts (fn [p] (orphans/guarded ctx p allow-orphans? #(ops/switch-profile! ctx p)))))
         "claim" (on-subject #(swarm/claim! ctx % (agent-param params)
                                             {:note (some-> (param params "note") str)}))
         "release" (on-subject #(swarm/release-claim! ctx % (agent-param params)
@@ -257,7 +263,8 @@
                                   :project (some-> (param params "project") str)})
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
-        "restart" (with-opts #(restart/restart-profile! ctx % (flag params "recreate")))
+        "restart" (with-opts (fn [p] (orphans/guarded ctx p allow-orphans?
+                                                       #(restart/restart-profile! ctx p (flag params "recreate")))))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -297,6 +304,7 @@
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
                               "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
+                              "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes"}
                               "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
