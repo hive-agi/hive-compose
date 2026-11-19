@@ -111,6 +111,80 @@
     (ops/reap! c)
     (is (= #{} (stub/running (:engine c) "shop")))))
 
+(deftest an-adopted-section-is-released-by-container-name
+  (let [c (ctx {"shop" #{"ledger" "postgres"}})]
+    (is (= ["shop/adopted"] (ops/adopt! c)))
+    (testing "a stray from a compose file the project does not name"
+      (stub/undefine! (:engine c) "ledger")
+      (stub/unset! (:engine c) "shop" "OVERLAY_SRC"))
+    (swap! (:clock c) + (* 61 minute))
+    (let [[row & more] (:reaped (ops/reap! c))]
+      (is (empty? more))
+      (is (= {:profile/id "shop/adopted" :ok? true :by :container-name}
+             (select-keys row [:profile/id :ok? :by]))))
+    (is (= [[:stop-by-name "shop" ["ledger" "postgres"]]]
+           (filterv #(#{:stop :down :stop-by-name :rm-by-name} (first %)) (stub/calls (:engine c))))
+        "compose is never asked: neither the unknown service nor the unset variable stops it")
+    (is (= #{} (stub/running (:engine c) "shop")))
+    (is (not (contains? (:active @(:state c)) "shop/adopted")))))
+
+(deftest an-unset-project-variable-is-reported-per-section-and-the-pass-goes-on
+  (let [c (ctx)]
+    (up-target! c "web")
+    (up-target! c "ghost")
+    (stub/unset! (:engine c) "shop" "OVERLAY_SRC")
+    (swap! (:clock c) + (* 61 minute))
+    (let [{:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (= #{"blog/ghost" "shop/web"} (set (keys by-id))) "both sections answer a row")
+      (is (:ok? (by-id "blog/ghost")) "a project with every variable set is reaped as before")
+      (testing "the section whose files need the unset variable says which, and still stops by name"
+        (is (= "OVERLAY_SRC" (:missing-env (by-id "shop/web"))))
+        (is (:ok? (by-id "shop/web")))
+        (is (= :container-name (:by (by-id "shop/web"))))
+        (is (= #{} (stub/running (:engine c) "shop")))))))
+
+(deftest without-name-control-an-unset-variable-fails-only-its-section
+  (let [c (ctx)
+        plain (reify hive-compose.port/IComposeEngine
+                (-stop! [_ p _]
+                  (if (= "shop" (profile/project p))
+                    (r/err :compose/command-failed
+                           {:exit 1 :stderr "required variable OVERLAY_SRC is missing a value: x"})
+                    (r/ok {:out ""})))
+                (-running [_ _] (r/ok #{"web" "ghost"})))
+        c (assoc c :engine plain)]
+    (swap! (:state c) assoc :active
+           {"shop/web" {:project "shop" :services ["web"] :last-touch 0
+                        :profile {:profile/id "shop/web" :profile/dir "/w/shop" :profile/services ["web"]}}
+            "blog/ghost" {:project "blog" :services ["ghost"] :last-touch 0
+                          :profile {:profile/id "blog/ghost" :profile/dir "/w/blog" :profile/services ["ghost"]
+                                    :profile/ttl-minutes 5}}})
+    (swap! (:clock c) + (* 61 minute))
+    (let [{:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (:ok? (by-id "blog/ghost")))
+      (is (false? (:ok? (by-id "shop/web"))))
+      (is (= "OVERLAY_SRC" (:missing-env (by-id "shop/web"))))
+      (is (= ["shop/web"] (keys (:active @(:state c)))) "it stays active, to be retried once the variable is set"))))
+
+(deftest a-release-that-throws-fails-only-its-section
+  (let [c (ctx)]
+    (up-target! c "web")
+    (up-target! c "ghost")
+    (swap! (:clock c) + (* 61 minute))
+    (let [real (:engine c)
+          c (assoc c :engine (reify hive-compose.port/IComposeEngine
+                               (-stop! [_ p s]
+                                 (if (= "shop" (profile/project p))
+                                   (throw (ex-info "boom" {}))
+                                   (hive-compose.port/-stop! real p s)))
+                               (-running [_ p] (hive-compose.port/-running real p))))
+          {:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (:ok? (by-id "blog/ghost")))
+      (is (= :compose/release-threw (get-in (by-id "shop/web") [:error :error]))))))
+
 (deftest reaping-a-section-spares-what-an-adopted-one-depends-on
   (let [c (ctx {"shop" #{"auth" "redis"}})]
     (up-target! c "postgres")

@@ -278,7 +278,30 @@
       (when i
         (first (str/split-lines (str/trim (subs s (+ i (count no-such-service))))))))))
 
-(defn- execute!
+(def ^:private missing-variable-re #"required variable (\S+) is missing a value")
+
+(defn missing-variable
+  "The variable compose named in a `required variable <name> is missing a
+   value` refusal, nil for any other result."
+  [res]
+  (when (r/err? res)
+    (second (re-find missing-variable-re (str (:stderr res))))))
+
+(defn adopted-section?
+  "True when `id` names the section adopt! keeps strays of a project in."
+  [id]
+  (str/ends-with? (str id) "/adopted"))
+
+(defn- by-name? [{:keys [engine]}]
+  (satisfies? port/IContainerControl engine))
+
+(defn- execute-by-name!
+  "Run Release `step` on `p` by container name: no compose file is loaded."
+  [{:keys [engine]} p {:keys [action services]}]
+  (r/map-ok (port/-stop-containers! engine p services action)
+            #(assoc % :by :container-name)))
+
+(defn- execute-by-service!
   "Run Release `step` on `p`. A service compose no longer defines (a stale
    snapshot: an adopted section, a file edited since) is dropped and the
    step retried, so one unknown name never keeps the rest running. Answers
@@ -293,6 +316,25 @@
             (r/ok {:out "" :skipped :no-services :unknown (conj dropped svc)})
             (recur (assoc step :services left) (conj dropped svc))))
         (cond-> res (and (seq dropped) (r/ok? res)) (update :ok assoc :unknown dropped))))))
+
+(defn- execute!
+  "Run Release `step` on `p`. An adopted section is released by container
+   name when the engine can: its strays may come from a compose file its
+   project does not name, so compose would refuse them as unknown services.
+   Any other section goes through compose; when compose cannot load the
+   project's files because a variable is unset, the step falls back to
+   container names and the answer names the variable under :missing-env, so
+   one unset variable never keeps a section running pass after pass."
+  [ctx p {id :profile/id :as step}]
+  (if (and (adopted-section? id) (by-name? ctx))
+    (execute-by-name! ctx p step)
+    (let [res (execute-by-service! ctx p step)
+          var (missing-variable res)]
+      (cond
+        (nil? var) res
+        (by-name? ctx) (r/map-ok (execute-by-name! ctx p step) #(assoc % :missing-env var))
+        :else (assoc res :missing-env var
+                     :hint (str var " is unset: set it in the project's :project/env"))))))
 
 (defn- forget [st id]
   (-> st
@@ -316,7 +358,10 @@
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
     (r/err? result) (assoc :error result)
-    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))))
+    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))
+    (get-in result [:ok :by]) (assoc :by (get-in result [:ok :by]))
+    (or (:missing-env result) (get-in result [:ok :missing-env]))
+    (assoc :missing-env (or (:missing-env result) (get-in result [:ok :missing-env])))))
 
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
@@ -532,12 +577,23 @@
       (persist! ctx))
     dropped))
 
+(defn- reap-step!
+  "Release one reaper `step`, answering its report row. A throw is that
+   section's error, never the pass's: the other sections are still reaped."
+  [ctx step]
+  (try
+    (step-report (release! ctx step))
+    (catch Throwable t
+      (assoc step :ok? false :error (r/err :compose/release-threw {:message (str t)})))))
+
 (defn reap!
-  "One reaper pass: reconcile, then release every idle profile."
+  "One reaper pass: reconcile, then release every idle profile. Each section
+   answers its own row: one that cannot be released (an unset variable, a
+   throw) is reported with why and the rest are still reaped."
   [ctx]
   (let [reconciled (reconcile! ctx)
         steps (plan/reap-releases (:settings ctx) ((:now ctx)) (:active @(:state ctx)))
-        reaped (mapv #(step-report (release! ctx %)) steps)]
+        reaped (mapv #(reap-step! ctx %) steps)]
     (when (seq reaped) (persist! ctx))
     {:reconciled reconciled :reaped reaped}))
 

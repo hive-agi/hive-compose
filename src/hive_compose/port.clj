@@ -35,6 +35,18 @@
   (-dependencies [e profile]
     "Result<{service {dep {:required? bool}}}>: the depends_on edges of the services the profile's project defines."))
 
+(defprotocol IContainerControl
+  "Optional engine capability: release a project's containers by name, found
+   by their compose labels, without loading its compose files. What an
+   adopted section runs may come from a file its project does not name, and
+   a file that needs a variable nobody set cannot be loaded at all; neither
+   keeps a release by name from running."
+  (-stop-containers! [e profile services action]
+    "Result<{:out :containers [name]}>: stop (`action` :stop) or remove
+     (:down, never volumes) the containers of `services` in the profile's
+     compose project, addressed by container name. A service with no
+     container is skipped. Empty `services` is a no-op."))
+
 (defprotocol IPublishedPorts
   "Optional engine capability: the host ports the running containers of a
    project publish, so connections to them can count as use."
