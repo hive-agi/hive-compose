@@ -101,6 +101,36 @@ afterwards. A program that fails to start is reported and never fails the
 section. A program whose nREPL port already answers is somebody else's: it is
 reported as `external?`, not started a second time and never stopped.
 
+## Environment and secrets
+
+`:project/env`, `:profile/env` (presets), `:program/env` and the `env` param of
+`up`/`switch`/`restart` take `{VAR value}`. A value is a string, or a secret
+reference read from [pass](https://www.passwordstore.org/):
+
+```clojure
+{:project/id "dc"
+ :project/dir "~/PP/funeraria/dc"
+ :project/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}
+               "SISF_CRM_SRC" "../../funeraria-wt/dc-staging-view-sisf-crm"}}
+```
+
+```
+compose up target=sisf-crm env={"EXTRA_TOKEN": {"pass": "Funeraria/other"}}
+```
+
+A reference is read (`pass <path>`, first line, trimmed) only when containers
+are created (`up`, `switch`, `restart recreate=true`) or a host program starts,
+and the value goes to that process alone. Every other compose call (`config`,
+`ps`, `stop`, `down`, `logs`, an in-place `restart`) is given the rendering
+`pass:<path>`, so interpolation still works and no store is read. The value is
+never kept in the state file, never shown by `status`, `ps`, `targets`,
+`programs` or `logs`, and what docker prints has it replaced by the rendering.
+An entry that cannot be read (missing, gpg locked, `pass` absent) fails that
+`up` before docker runs, naming the variable, the reference and the reason; a
+program whose env cannot be read is reported and not started.
+`:compose/resolver` injects the stores (`{:pass ISecretBackend}`) in place of
+`pass`.
+
 ## Tool `compose`
 
 | command | effect |
@@ -117,8 +147,46 @@ reported as `external?`, not started a second time and never stopped.
 | `adopt` | take charge of running containers nobody owns |
 | `projects` | every compose project on the host, managed ones marked |
 | `reload` | re-read config |
+| `claim target=… note=…` | an agent declares it works on a section (bringing it up if needed); answers the shared nREPL per module |
+| `release target=… [stop=true]` | give the claim up; with none left the section is orphaned, or stopped now with `stop` |
+| `who` | per section: claims, what is using it, when it is reaped; per agent: the sections it works in |
+| `nrepl path=…` | which shared nREPL drives that file or directory (no path: every route) |
 
-Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`.
+Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`,
+`:compose/claim!`, `:compose/release!`, `:compose/nrepl-for`, `:compose/who`.
+
+## Swarm work
+
+Several agents working on one app should share its running JVMs, not each boot
+their own, and an app nobody works on should not keep holding memory.
+
+- **Claims.** `compose claim target=shop/api note="fix login"` brings the section up
+  if needed and records the claim (the agent is the call's `agent`, else its
+  `agent_id`). The answer lists the section's nREPL **routes**: for each program
+  directory, the port to drive it through (`clojure_eval port=…`) and one line
+  of advice. A claim must be renewed (claim again) within
+  `:compose/claim-ttl-minutes` (30); a claim made by a swarm agent also ends
+  when that agent leaves the swarm.
+- **Routes.** `compose nrepl path=/w/shop/api/src/core.clj` answers the program
+  whose directory holds the file most closely, whether its nREPL answers, and
+  whether somebody outside the addon runs it (`:external?`, shared all the same).
+- **Usage.** Every reaper pass counts as use of a section: claims that hold, swarm
+  agents whose cwd lies in the project's directories, and connections newly opened
+  to its nREPL ports (`/proc/net/tcp`; a connection left open counts once).
+  `:compose/activity #{:nrepl :published}` also counts new connections to the
+  ports its containers publish (opt-in: an app's own connection pool would
+  otherwise look like use). What is in use has its idle clock reset; `who`
+  shows why.
+- **Notices.** When an agent starts working in a project whose section serves a
+  ready nREPL, the swarm is told once which port drives which module. `up` and
+  `switch` announce the routes, and the reaper announces what it freed.
+- **Enforcement.** Nothing in use for the TTL is stopped, as before. A section whose
+  last claim ended (released, stale or its agent gone) is **orphaned** and reaped
+  after `:compose/orphan-ttl-minutes` (10) of disuse instead. `release stop=true`
+  frees it at once, sparing what other sections need.
+
+With no hive host (published standalone), the swarm adapter answers absent and the
+addon runs on claims and connections alone.
 
 ## Presets (optional)
 
@@ -132,6 +200,30 @@ Named presets in `~/.config/hive-mcp/compose-profiles.edn`, used with `profile=I
   :profile/idle-action :stop}]      ; :stop (default) | :down | :none
 ```
 
+A preset carries its own `:profile/files` and `:profile/env` (`{:pass ..}`
+values included), so an overlay compose file and the secrets it needs apply
+only when that preset runs, never to the project's targets. To run the
+overlay against the same containers, give it the project's compose name:
+
+```clojure
+{:profile/id "crm-whatsapp"
+ :profile/dir "~/PP/funeraria/dc"
+ :profile/project "dc"
+ :profile/files ["docker-compose.yml" "docker-compose.override.yml"
+                 "docker-compose.crm-whatsapp.yml"]
+ :profile/services ["sisf-crm"]
+ :profile/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}}}
+```
+
+`compose up profile=crm-whatsapp` then runs
+`docker compose -p dc -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.crm-whatsapp.yml up -d sisf-crm`
+with the token read from pass at that moment. `compose down profile=crm-whatsapp`
+releases it.
+
+`:profile/project` only names the compose project. A preset does not inherit that
+project's `:project/env` from the addon config, so repeat in `:profile/env` every
+value the preset's services need.
+
 ## Safety
 
 - Only sections the addon started or adopted are ever reaped. Adoption covers
@@ -143,6 +235,27 @@ Named presets in `~/.config/hive-mcp/compose-profiles.edn`, used with `profile=I
   whole project).
 - The active map lives in `~/.local/state/hive-compose/state.edn`, so a restart
   still reaps what it started.
+- `up`, `switch` and `restart` refuse while orphans of a dead rootless docker
+  daemon still hold the section's docker volumes or host ports. An orphan is a
+  container process (subuid range, or a `docker-<id>.scope` cgroup) whose
+  parent is `systemd --user` and that no running container owns. The refusal
+  names each orphan with its pids, because recreating the service would run a
+  second copy on the same volume, e.g. two postmasters on one data dir.
+  `allow_orphans=true` goes ahead anyway and reports what it overrode. The
+  check reads `/proc` and `/etc/subuid`; when it cannot read them it says so
+  and lets the call through. `:compose/orphan-guard? false` turns it off.
+- A section never takes a service from under another live section of the same
+  compose project. compose keeps one container per service, so `restart
+  recreate=true` of a service another section holds (it runs it or needs it),
+  or an `up`/`switch` whose compose inputs (project dir, files, env, references
+  compared by rendering) differ from those the holder ran with, which makes
+  compose recreate the container on a changed config hash, is refused. The
+  refusal names the holder section, the agents owning it (its claims, else the
+  agents the last usage pass saw working in it), the services and which inputs
+  differ (variable names, never values). A holder is live unless it is
+  orphaned and unused. Sections with equal inputs share dependencies freely.
+  `allow_shared=true` goes ahead and reports what it overrode. The decision is
+  the pure `hive-compose.promote.ownership/conflicts`.
 
 ## Config
 
@@ -151,7 +264,33 @@ Named presets in `~/.config/hive-mcp/compose-profiles.edn`, used with `profile=I
 `:compose/profiles`, `:compose/profiles-file`, `:compose/state-file`,
 `:compose/timeout-ms` (60000), `:compose/up-timeout-ms` (600000),
 `:compose/adopt?` (true), `:compose/programs?` (true), `:compose/log-dir`,
-`:compose/stop-grace-ms` (5000, before a program's group is killed).
+`:compose/stop-grace-ms` (5000, before a program's group is killed),
+`:compose/program-grace-ms` (3000, how long a started program is watched; one
+that exits within it is reported `:status :exited` with `:exit-code`,
+`:log-tail` and `:advice`, and is not held; `status` reports a held program
+that died since the same way),
+`:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
+(`#{:nrepl}`), `:compose/cpu-busy-percent` (5), `:compose/claim-ttl-minutes` (30),
+`:compose/orphan-ttl-minutes` (10).
+
+`:compose/activity` says which new connections count as use; a project
+overrides it for its sections with `:project/activity` (a preset with
+`:profile/activity`). `#{:nrepl :published}` also counts new peers on the host
+ports the section's containers publish, so a browser or any host-side client
+keeps it alive. Peers whose address belongs to one of the project's own
+running containers (`docker inspect`) are left out, so pools do not count, and
+a keep-alive connection counts once, when first seen. `who` and `status` name
+the source that counted (`:in-use-via`, e.g. `[:published]`) and each
+section's `:activity`.
+
+`:cpu` in the activity counts a section's running services busier than
+`:compose/cpu-busy-percent` (5, percent of one core) as use, whether or not a
+client is connected: a batch job or a queue worker that nobody touches is not
+reaped while it works. Each reaper pass takes one `docker stats --no-stream`
+sample of the project's running containers (found by compose label) and keeps
+the busiest container per service; `who` shows the reason as
+`{:service "worker" :cpu 80.0 :source :cpu}`. An engine that cannot read the
+load counts nothing, as before.
 
 ## Development
 

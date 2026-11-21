@@ -120,6 +120,37 @@
       (is (r/err? (:error row)))
       (is (empty? (held c "web"))))))
 
+(deftest a-program-that-dies-at-start-is-reported-exited-and-not-held
+  (let [c (ctx)
+        tail ["sh: 1: ./node_modules/.bin/shadow-cljs: not found"]]
+    (runner/die-on-start! (:runner c) "web" 127 "/logs/shop-web.log" tail)
+    (let [res (ops/up! c "web")
+          [row] (:programs (:ok res))]
+      (is (r/ok? res) "the section itself is up")
+      (is (= {:program/id "web" :status :exited :exited? true :exit-code 127 :log-tail tail}
+             (select-keys row [:program/id :status :exited? :exit-code :log-tail])))
+      (is (not (:started? row)))
+      (is (re-find #"install node_modules in /w/web" (:advice row))) ;; pattern-exempt: literal advice text
+      (is (empty? (held c "web")) "a dead program is not held")
+      (testing "a later up starts it again"
+        (swap! (:world (:runner c)) update :dies dissoc "web")
+        (is (:started? (first (:programs (:ok (ops/up! c "web")))))))))
+  (testing "the grace waits for a death that comes a little later"
+    (let [c (ctx (assoc settings :compose/program-grace-ms 500))
+          rn (:runner c)]
+      (future (Thread/sleep 100) (runner/kill! rn 101))
+      (let [[row] (:programs (:ok (ops/up! c "web")))]
+        (is (= :exited (:status row)))
+        (is (empty? (held c "web")))))))
+
+(deftest status-reports-a-held-program-that-exited-since
+  (let [c (ctx)]
+    (ops/up! c "web")
+    (runner/kill! (:runner c) (get-in (held c "web") ["web" :pid]))
+    (let [row (->> (:profiles (ops/status c)) (filter #(= "web" (:id %))) first :programs first)]
+      (is (= {:program/id "web" :alive? false :status :exited :exited? true :log-tail []}
+             (select-keys row [:program/id :alive? :status :exited? :log-tail]))))))
+
 (deftest a-program-with-no-command-is-reported
   (let [c (ctx (assoc-in settings [:compose/profiles "web" :profile/programs]
                          [{:program/id "bare" :program/dir "/w/nothing"}]))

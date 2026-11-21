@@ -24,6 +24,21 @@
     (is (= "/inline" (get-in s [:compose/profiles "api" :profile/dir])))
     (is (= #{"api" "web"} (set (keys (:compose/profiles s)))))))
 
+(deftest activity-is-global-with-a-per-project-override
+  (let [s (:ok (config/settings {:compose/activity ["nrepl"]
+                                 :compose/projects {:shop {:project/dir "/w/shop" :project/activity ["nrepl" "published"]}
+                                                    :blog {:project/dir "/w/blog"}}
+                                 :compose/profiles [{:profile/id "p" :profile/dir "/w/p" :profile/activity ["published"]}]}
+                                nil home))]
+    (is (= #{:nrepl} (:compose/activity s)))
+    (is (= #{:nrepl :published} (get-in s [:compose/projects "shop" :project/activity])) "names from JSON become keywords")
+    (is (nil? (get-in s [:compose/projects "blog" :project/activity])))
+    (is (= #{:published} (get-in s [:compose/profiles "p" :profile/activity]))))
+  (is (= #{:nrepl} (:compose/activity (:ok (config/settings {} nil home)))) "the default")
+  (is (= :compose/invalid-config
+         (:error (config/settings {:compose/projects {:shop {:project/dir "/w" :project/activity [:browser]}}} nil home)))
+      "an unknown kind is refused"))
+
 (deftest invalid-config-is-an-err
   (testing "missing dir"
     (is (= :compose/invalid-config (:error (config/settings {:compose/profiles [{:profile/id "api"}]} nil home)))))
@@ -31,3 +46,22 @@
     (is (= :compose/invalid-config
            (:error (config/settings {:compose/profiles [{:profile/id "a" :profile/dir "/w" :profile/idle-action :nuke}]}
                                     nil home))))))
+
+(deftest a-preset-carries-an-overlay-file-and-pass-env-of-its-own
+  (testing "an overlay -f file and {:pass} env on a preset apply to that preset only, not to the project"
+    (let [files ["docker-compose.yml" "docker-compose.override.yml" "docker-compose.crm-whatsapp.yml"]
+          s (:ok (config/settings
+                  {:compose/projects [{:project/id "dc" :project/dir "~/dc"
+                                       :project/files ["docker-compose.yml" "docker-compose.override.yml"]}]}
+                  [{:profile/id "crm-whatsapp" :profile/dir "~/dc" :profile/project "dc"
+                    :profile/files files
+                    :profile/services ["sisf-crm"]
+                    :profile/env {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}}}]
+                  home))
+          p (get-in s [:compose/profiles "crm-whatsapp"])]
+      (is (= files (:profile/files p)))
+      (is (= {"CRM_WA_ACCESS_TOKEN" {:pass "Funeraria/Whatsapp/token"}} (:profile/env p)))
+      (is (= "dc" (:profile/project p)) "same compose project, so it shares and replaces dc's containers")
+      (is (= ["docker-compose.yml" "docker-compose.override.yml"]
+             (get-in s [:compose/projects "dc" :project/files])))
+      (is (nil? (get-in s [:compose/projects "dc" :project/env]))))))

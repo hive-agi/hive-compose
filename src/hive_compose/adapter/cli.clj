@@ -1,10 +1,17 @@
 (ns hive-compose.adapter.cli
   "IComposeEngine over the docker compose CLI. Argv construction and output
    parsing are pure; the process runs through an injected `exec` with
-   hive-system's `shell.core/exec!` contract (argv, opts) -> Result."
+   hive-system's `shell.core/exec!` contract (argv, opts) -> Result.
+
+   Secret references in a profile's env are read only by the calls that create
+   containers (`up`, a recreating `restart`), through the injected resolver
+   (see `hive-compose.adapter.secrets`). Every other call is given their
+   renderings, so it interpolates and reads no store."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
+            [hive-compose.adapter.secrets :as secrets]
             [hive-compose.port :as port]
+            [hive-compose.promote.env :as env]
             [hive-compose.promote.profile :as profile]
             [hive-dsl.result :as r]
             [hive-system.shell.core :as shell]))
@@ -34,6 +41,14 @@
 (defn ps-argv [p]
   (into (base-argv p) ["ps" "--format" "json"]))
 
+(defn ids-argv
+  "The ids of the running containers of `p`'s project."
+  [p]
+  (into (base-argv p) ["ps" "-q"]))
+
+(defn inspect-argv [ids]
+  (into ["docker" "inspect" "--type" "container"] ids))
+
 (defn listed-argv [p]
   (into (base-argv p) ["config" "--services"]))
 
@@ -58,8 +73,87 @@
 (defn down-argv [p services]
   (-> (base-argv p) (conj "down") (into services)))
 
+(defn restart-argv
+  "`compose restart` of `services`, or when `recreate?` an `up -d
+   --force-recreate --no-deps` of exactly them: their dependencies are left
+   as they are."
+  [p services recreate?]
+  (-> (base-argv p)
+      (into (if recreate? ["up" "-d" "--force-recreate" "--no-deps"] ["restart"]))
+      (into services)))
+
 (defn logs-argv [p services tail]
   (-> (base-argv p) (into ["logs" "--no-color" "--tail" (str tail)]) (into services)))
+
+(defn containers-argv
+  "Every container of `p`'s compose project, running or not, found by its
+   compose labels, one `<name>\t<service>` line each. Loads no compose file."
+  [p]
+  ["docker" "ps" "-a" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   "--format" "{{.Names}}\t{{.Label \"com.docker.compose.service\"}}"])
+
+(defn container-names
+  "Sorted names of the containers of `services` in `containers-argv` output."
+  [s services]
+  (let [wanted (set services)]
+    (vec (sort (for [line (lines s)
+                     :let [[nm svc] (str/split line #"\t" 2)]
+                     :when (and (seq nm) (wanted svc))]
+                 nm)))))
+
+(defn running-containers-argv
+  "The running containers of `p`'s compose project, as `containers-argv`."
+  [p]
+  ["docker" "ps" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   "--filter" "status=running"
+   "--format" "{{.Names}}\t{{.Label \"com.docker.compose.service\"}}"])
+
+(defn container-services
+  "{name service} of `containers-argv` output."
+  [s]
+  (into (sorted-map)
+        (for [line (lines s)
+              :let [[nm svc] (str/split line #"\t" 2)]
+              :when (and (seq nm) (seq svc))]
+          [nm svc])))
+
+(defn stats-argv
+  "One `docker stats` sample of container `names`, one `<name>\t<cpu%>` line each."
+  [names]
+  (into ["docker" "stats" "--no-stream" "--format" "{{.Name}}\t{{.CPUPerc}}"] names))
+
+(defn cpu-percent
+  "The number in a `docker stats` CPU column (\"12.5%\"), nil when there is
+   none (\"--\" for a container that just stopped)."
+  [s]
+  (let [t (str/replace (str/trim (str s)) #"%$" "")]
+    (when (re-matches #"\d+(\.\d+)?" t)
+      (Double/parseDouble t))))
+
+(defn service-cpu
+  "{service percent} of `stats-argv` output `s` for containers `names`
+   ({name service}): the busiest container of each service. A container
+   whose reading is no number is left out."
+  [names s]
+  (reduce (fn [acc line]
+            (let [[nm col] (str/split line #"\t" 2)
+                  svc (get names nm)
+                  pct (cpu-percent col)]
+              (if (and svc pct)
+                (update acc svc (fnil max 0.0) pct)
+                acc)))
+          (sorted-map)
+          (lines s)))
+
+(defn stop-containers-argv
+  "`docker stop` of container `names`."
+  [names]
+  (into ["docker" "stop"] names))
+
+(defn rm-containers-argv
+  "`docker rm` of stopped container `names`: their anonymous volumes stay."
+  [names]
+  (into ["docker" "rm"] names))
 
 (def ls-argv ["docker" "compose" "ls" "--all" "--format" "json"])
 
@@ -86,10 +180,53 @@
               (keep #(get % "Service")))
         rows))
 
+(defn published-ports
+  "{service #{host-port}} of the running containers in `ps` rows: the
+   PublishedPort of each of their Publishers that publishes one."
+  [rows]
+  (reduce (fn [acc row]
+            (let [svc (get row "Service")
+                  ports (into #{} (keep (fn [pub]
+                                          (let [p (get pub "PublishedPort")]
+                                            (when (and (int? p) (pos? p)) (long p)))))
+                              (get row "Publishers"))]
+              (if (and svc (= "running" (get row "State")) (seq ports))
+                (update acc svc (fnil into #{}) ports)
+                acc)))
+          {}
+          rows))
+
+(defn container-addresses
+  "#{ip} of `docker inspect` rows: the IPv4 and global IPv6 address each
+   running container holds on each of its networks."
+  [rows]
+  (into (sorted-set)
+        (comp (filter #(true? (get-in % ["State" "Running"])))
+              (mapcat #(vals (get-in % ["NetworkSettings" "Networks"])))
+              (mapcat (juxt #(get % "IPAddress") #(get % "GlobalIPv6Address")))
+              (remove str/blank?))
+        rows))
+
 (defn closure-services
   "Sorted services of a `config --format json` document."
   [s]
   (vec (sort (keys (get (json/read-str s) "services")))))
+
+(defn dependency-graph
+  "{service {dep {:required? bool}}} of a `config --format json` document.
+   Map-form depends_on reads each entry's \"required\" (absent = true);
+   list-form depends_on makes every entry required."
+  [s]
+  (letfn [(edge [e]
+            (if (map? e)
+              (not (false? (get e "required" true)))
+              true))
+          (edges [deps]
+            (if (map? deps)
+              (into {} (for [[d e] deps] [d {:required? (edge e)}]))
+              (into {} (for [d deps] [d {:required? true}]))))]
+    (into {} (for [[svc m] (get (json/read-str s) "services")]
+               [svc (edges (get m "depends_on"))]))))
 
 (defn projects
   "Project summaries of `ls` rows."
@@ -99,27 +236,76 @@
                  :config-files (get m "ConfigFiles")})
         rows))
 
+(def live-ids-argv
+  "Full ids of every running container the daemon knows, any project."
+  ["docker" "ps" "-q" "--no-trunc"])
+
+(defn service-resources
+  "{:volumes #{name} :ports #{port}} of `services` in a `config --format json`
+   document: the real names of the named volumes they mount (the top-level
+   `volumes` entry's name, else the key) and the host ports they publish.
+   Pure."
+  [s services]
+  (let [doc (json/read-str s)
+        vols (get doc "volumes")
+        wanted (set services)
+        svcs (filter (comp wanted key) (get doc "services"))
+        port-of (fn [p] (let [v (get p "published")]
+                          (cond (int? v) (long v)
+                                (and (string? v) (re-matches #"\d+" v)) (Long/parseLong v)
+                                :else nil)))]
+    {:volumes (into (sorted-set)
+                    (for [[_ m] svcs
+                          v (get m "volumes")
+                          :when (= "volume" (get v "type"))
+                          :let [src (get v "source")]
+                          :when (seq src)]
+                      (or (get-in vols [src "name"]) src)))
+     :ports (into (sorted-set) (for [[_ m] svcs p (get m "ports") :let [n (port-of p)] :when n] n))}))
+
 ;; ---------------------------------------------------------------------------
 ;; boundary
 
-(defn- run [exec p argv timeout-ms]
-  (r/bind (exec argv (cond-> {:timeout-ms timeout-ms}
-                       (:profile/dir p) (assoc :dir (:profile/dir p))
-                       (seq (:profile/env p)) (assoc :env (:profile/env p))))
-          (fn [{:keys [exit stdout stderr]}]
-            (if (zero? exit)
-              (r/ok (or stdout ""))
-              (r/err :compose/command-failed {:argv argv :exit exit :stderr (clip stderr)})))))
+(defn- run
+  "Result<stdout> of `argv` in `p`'s directory. With no `env`, `p`'s own with
+   its references rendered, never read; `scrub` cleans what docker printed
+   before it reaches a result."
+  ([exec p argv timeout-ms]
+   (run exec p argv timeout-ms (env/rendered (:profile/env p)) identity))
+  ([exec p argv timeout-ms env scrub]
+   (r/bind (exec argv (cond-> {:timeout-ms timeout-ms}
+                        (:profile/dir p) (assoc :dir (:profile/dir p))
+                        (seq env) (assoc :env env)))
+           (fn [{:keys [exit stdout stderr]}]
+             (if (zero? exit)
+               (r/ok (scrub (or stdout "")))
+               (r/err :compose/command-failed {:argv argv :exit exit :stderr (clip (scrub stderr))}))))))
 
 (defn- parsed [res category f]
   (r/bind res (fn [out] (r/try-effect* category (f out)))))
 
-(defn- act [exec p argv timeout-ms services]
+(defn- act
+  "Run `argv`, which creates no container, over `services`: references in the
+   env stay their renderings, nothing is read from a store."
+  [exec p argv timeout-ms services]
   (if (empty? services)
     (r/ok {:out "" :skipped :no-services})
     (r/map-ok (run exec p argv timeout-ms) (fn [out] {:out (clip out)}))))
 
-(defrecord CliEngine [exec timeout-ms up-timeout-ms]
+(defn- spawn
+  "Run `argv`, which creates containers, over `services`: the env's references
+   are read from their stores now, and only now. One that cannot be read fails
+   the call before docker runs. What docker prints has every resolved value
+   replaced by its reference's rendering."
+  [exec resolver p argv timeout-ms services]
+  (if (empty? services)
+    (r/ok {:out "" :skipped :no-services})
+    (let [declared (:profile/env p)]
+      (r/let-ok [resolved (secrets/resolve-env resolver declared)]
+        (r/map-ok (run exec p argv timeout-ms resolved #(env/scrub declared resolved %))
+                  (fn [out] {:out (clip out)}))))))
+
+(defrecord CliEngine [exec resolver timeout-ms up-timeout-ms]
   port/IComposeEngine
   (-version [_]
     (r/map-ok (run exec nil version-argv timeout-ms) str/trim))
@@ -136,18 +322,83 @@
     (parsed (run exec nil ls-argv timeout-ms) :compose/unparseable
             (comp projects parse-json-rows)))
   (-up! [_ p services]
-    (act exec p (up-argv p services) up-timeout-ms services))
+    (spawn exec resolver p (up-argv p services) up-timeout-ms services))
   (-stop! [_ p services]
     (act exec p (stop-argv p services) timeout-ms services))
   (-down! [_ p services]
     (act exec p (down-argv p services) timeout-ms services))
+  (-restart! [_ p services recreate?]
+    (if recreate?
+      (spawn exec resolver p (restart-argv p services true) up-timeout-ms services)
+      (act exec p (restart-argv p services false) timeout-ms services)))
   (-logs [_ p services tail]
-    (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)}))))
+    (r/map-ok (run exec p (logs-argv p services tail) timeout-ms) (fn [out] {:out (clip out)})))
+
+  port/IDependencyGraph
+  ;; The same targeted query as -closure: compose keeps an explicitly targeted
+  ;; service behind a native profile only when it is named, so an untargeted
+  ;; query would drop that service and its edges.
+  (-dependencies [_ p]
+    (parsed (run exec p (closure-argv p) timeout-ms)
+            :compose/unparseable dependency-graph))
+
+  port/IContainerControl
+  ;; By label and name only: no compose file is loaded, so neither a service
+  ;; the project's files no longer define nor a variable nobody set stops it.
+  (-stop-containers! [_ p services action]
+    (if (empty? services)
+      (r/ok {:out "" :skipped :no-services :containers []})
+      (r/let-ok [names (r/map-ok (run exec nil (containers-argv p) timeout-ms)
+                                 #(container-names % services))]
+        (if (empty? names)
+          (r/ok {:out "" :skipped :no-containers :containers []})
+          (r/let-ok [stopped (run exec nil (stop-containers-argv names) timeout-ms)
+                     removed (if (= :down action)
+                               (run exec nil (rm-containers-argv names) timeout-ms)
+                               (r/ok ""))]
+            (r/ok {:out (clip (str stopped removed)) :containers names}))))))
+
+  port/IPublishedPorts
+  (-published [_ p]
+    (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
+            (comp published-ports parse-json-rows)))
+
+  port/IContainerOwnership
+  (-live-containers [_]
+    (r/map-ok (run exec nil live-ids-argv timeout-ms) (comp set lines)))
+  ;; Every service named, not a targeted query: a service behind a native
+  ;; profile is shown only when named, so name exactly the ones asked for.
+  (-resources [_ p services]
+    (if (empty? services)
+      (r/ok {:volumes #{} :ports #{}})
+      (parsed (run exec p (closure-argv (assoc p :profile/services (vec services))) timeout-ms)
+              :compose/unparseable #(service-resources % services))))
+
+  port/IContainerAddresses
+  (-addresses [_ p]
+    (r/let-ok [ids (r/map-ok (run exec p (ids-argv p) timeout-ms) lines)]
+      (if (empty? ids)
+        (r/ok #{})
+        (parsed (run exec p (inspect-argv ids) timeout-ms) :compose/unparseable
+                (comp container-addresses parse-json-rows)))))
+
+  port/IContainerLoad
+  ;; By label, like -stop-containers!: no compose file is loaded.
+  (-cpu [_ p]
+    (r/let-ok [names (r/map-ok (run exec nil (running-containers-argv p) timeout-ms)
+                               container-services)]
+      (if (empty? names)
+        (r/ok {})
+        (r/map-ok (run exec nil (stats-argv (keys names)) timeout-ms)
+                  #(service-cpu names %))))))
 
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),
-   :compose/timeout-ms, :compose/up-timeout-ms."
+   :compose/resolver ({scheme ISecretBackend}, default the `pass` one over
+   that exec), :compose/timeout-ms, :compose/up-timeout-ms."
   [opts]
-  (->CliEngine (or (:exec opts) shell/exec!)
-               (or (:compose/timeout-ms opts) 60000)
-               (or (:compose/up-timeout-ms opts) 600000)))
+  (let [exec (or (:exec opts) shell/exec!)]
+    (->CliEngine exec
+                 (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
+                 (or (:compose/timeout-ms opts) 60000)
+                 (or (:compose/up-timeout-ms opts) 600000))))

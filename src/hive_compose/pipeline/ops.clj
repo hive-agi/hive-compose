@@ -17,11 +17,13 @@
    once its containers are up and stop when the last section holding them is
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
             [hive-compose.promote.target :as target]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [clojure.string :as str]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -39,9 +41,18 @@
 
 (defn lookup
   "Result<Profile> for `id`: the configured preset, else the snapshot an active
-   entry (a preset or a section) ran with."
+   entry (a preset or a section) ran with. The snapshot of a section whose
+   project is still configured is re-based on the project as configured now, so
+   a release that follows a restart interpolates the files it names with the
+   variables they need. What the snapshot's env says wins over the project's."
   [ctx id]
-  (if-let [p (or (configured ctx id) (:profile (active-entry ctx id)))]
+  (if-let [p (or (configured ctx id)
+                 (when-let [snap (:profile (active-entry ctx id))]
+                   (let [[pid section?] (str/split id #"/" 2)
+                         proj (get-in ctx [:settings :compose/projects pid])]
+                     (if (and section? proj)
+                       (target/rebase-section nil proj snap)
+                       snap))))]
     (r/ok p)
     (r/err :compose/unknown-profile
            {:profile id :known (vec (sort (keys (get-in ctx [:settings :compose/profiles]))))})))
@@ -49,9 +60,11 @@
 (defn- expand-name
   "Result<[service] | nil>: what `nm` stands for in project `proj`: itself when
    it is a service, the members of the native profile when it is one, nil when
-   the project defines neither."
-  [engine proj nm]
-  (let [whole (target/project-profile proj)]
+   the project defines neither. `env` is the call's own, added to the
+   project's for these compose queries too."
+  [engine proj nm env]
+  (let [whole (cond-> (target/project-profile proj)
+                (seq env) (update :profile/env merge env))]
     (r/let-ok [profiles (port/-profiles engine whole)]
       (if (contains? profiles nm)
         (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
@@ -65,9 +78,9 @@
 
 (defn- expand-names
   "Result<[service] | nil> for all `names` in `proj`; nil when one is unknown there."
-  [engine proj names]
+  [engine proj names env]
   (reduce (fn [acc nm]
-            (let [x (expand-name engine proj nm)]
+            (let [x (expand-name engine proj nm env)]
               (cond
                 (r/err? x) (reduced x)
                 (nil? (:ok x)) (reduced (r/ok nil))
@@ -79,50 +92,78 @@
   "Result<Profile>: the section running exactly what `target-str` names
    (services or native compose profiles, see `promote.target/parse`), in the
    first configured project that defines all of them. Its services close over
-   the compose file's depends_on when brought up."
-  [ctx target-str]
-  (let [{:keys [project names]} (target/parse target-str)
-        projects (get-in ctx [:settings :compose/projects])
-        candidates (if project
-                     (some-> (get projects project) vector)
-                     (map val (sort-by key projects)))]
-    (cond
-      (empty? names) (r/err :compose/missing-param {:param "target"})
-      (and project (empty? candidates)) (r/err :compose/unknown-project
-                                                {:project project :known (vec (sort (keys projects)))})
-      (empty? candidates) (r/err :compose/no-projects
-                                 {:hint "declare compose projects under :compose/projects"})
-      :else
-      (loop [[proj & more] candidates]
-        (if-not proj
-          (r/err :compose/unknown-target {:target target-str :projects (vec (sort (keys projects)))})
-          (let [x (expand-names (:engine ctx) proj names)]
-            (cond
-              (r/err? x) x
-              (nil? (:ok x)) (recur more)
-              :else (r/ok (target/section proj names (:ok x))))))))))
+   the compose file's depends_on when brought up. `env`, the call's own, is
+   given to the compose queries that resolve the target, so a variable the
+   YAML requires can come from the call."
+  ([ctx target-str] (resolve-target ctx target-str nil))
+  ([ctx target-str env]
+   (let [{:keys [project names]} (target/parse target-str)
+         projects (get-in ctx [:settings :compose/projects])
+         candidates (if project
+                      (some-> (get projects project) vector)
+                      (map val (sort-by key projects)))]
+     (cond
+       (empty? names) (r/err :compose/missing-param {:param "target"})
+       (and project (empty? candidates)) (r/err :compose/unknown-project
+                                                 {:project project :known (vec (sort (keys projects)))})
+       (empty? candidates) (r/err :compose/no-projects
+                                  {:hint "declare compose projects under :compose/projects"})
+       :else
+       (loop [[proj & more] candidates]
+         (if-not proj
+           (r/err :compose/unknown-target {:target target-str :projects (vec (sort (keys projects)))})
+           (let [x (expand-names (:engine ctx) proj names env)]
+             (cond
+               (r/err? x) x
+               (nil? (:ok x)) (recur more)
+               :else (r/ok (target/section proj names (:ok x)))))))))))
 
 (defn subject
   "Result<Profile> for a tool call: `target` resolves a section, else `id`
    looks up a preset or an active section. A target is resolved against the
    config as it is now, so an active section picks up what its project gained
    since (a program, a TTL); the snapshot it ran with answers only when the
-   target no longer resolves."
-  [ctx {:keys [target id]}]
+   target no longer resolves. `env` is the call's env, used by the compose
+   queries that resolve the target."
+  [ctx {:keys [target id env]}]
   (cond
     (seq target) (let [{:keys [project names]} (target/parse target)
                        sid (when project (target/section-id project names))
-                       fresh (resolve-target ctx target)]
+                       fresh (resolve-target ctx target env)]
                    (if (and (r/err? fresh) sid (active-entry ctx sid))
                      (lookup ctx sid)
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
 
+(defn rebase-sections!
+  "After the configured projects changed from `old-projects` to the ones in
+   `ctx`'s settings, re-base the snapshot of every active section of a changed
+   project on its project as configured now, so a release, ps or logs by id
+   runs with the new files and env. Answers {:rebased [id] :kept [{:id :reason}]};
+   a section whose project left the config keeps the snapshot it ran with."
+  [ctx old-projects]
+  (let [new-projects (get-in ctx [:settings :compose/projects])
+        rows (for [[id a] (sort-by key (:active @(:state ctx)))
+                   :let [pid (first (str/split id #"/" 2))]
+                   :when (and (:profile a) (str/includes? id "/") (not (configured ctx id))
+                              (contains? old-projects pid)
+                              (not= (get old-projects pid) (get new-projects pid)))]
+               (if-let [proj (get new-projects pid)]
+                 {:id id :profile (target/rebase-section (get old-projects pid) proj (:profile a))}
+                 {:id id :reason :project-removed}))
+        rebased (filter :profile rows)]
+    (when (seq rebased)
+      (swap! (:state ctx) update :active
+             (fn [m] (reduce (fn [m {:keys [id profile]}] (assoc-in m [id :profile] profile)) m rebased)))
+      (persist! ctx))
+    (cond-> {:rebased (mapv :id rebased)}
+      (seq (remove :profile rows)) (assoc :kept (vec (remove :profile rows))))))
+
 ;; ---------------------------------------------------------------------------
 ;; release
 
-(defn- runner
+(defn runner
   "The program runner, nil when the context has none or programs are off."
   [ctx]
   (when (get-in ctx [:settings :compose/programs?] true) (:runner ctx)))
@@ -136,6 +177,35 @@
           (filter (fn [[_ run]] (port/-alive? rn (:pid run))))
           (program/running-in (:active @(:state ctx)) project nil))
     {}))
+
+(def ^:private tail-lines
+  "How many log lines an exited program reports."
+  20)
+
+(defn- exit-facts
+  "{:status :exited :exited? true :exit-code :log-tail :advice} of started
+   program `run` whose process is gone. The code and the tail come from a
+   runner that keeps them (IProgramOutcome); without one only the death shows."
+  [rn run]
+  (let [outcome? (satisfies? port/IProgramOutcome rn)
+        code (when outcome? (port/-exit-code rn (:pid run)))
+        tail (if (and outcome? (:log run)) (port/-log-tail rn (:log run) tail-lines) [])]
+    (cond-> {:status :exited :exited? true :log-tail tail
+             :advice (program/exit-advice run code tail)}
+      (some? code) (assoc :exit-code code))))
+
+(defn- await-exit
+  "True when `pid` is gone within the program grace (`:compose/program-grace-ms`,
+   0 when the settings carry none): a program that dies right after its start."
+  [ctx rn pid]
+  (let [grace (get-in ctx [:settings :compose/program-grace-ms] 0)]
+    (loop [left grace]
+      (cond
+        (not (port/-alive? rn pid)) true
+        (<= left 0) false
+        :else (let [step (min 100 left)]
+                (Thread/sleep (long step))
+                (recur (- left step)))))))
 
 (defn- start-program!
   "Result<Running>: Program `p` of compose project `project`, completed from the
@@ -152,13 +222,16 @@
           (r/ok {:program/id (:program/id p) :external? true :nrepl-port nrepl
                  :dir (:program/dir p) :kind (:program/kind ready)})
           (r/let-ok [started (port/-start! rn ready log)]
-            (r/ok (cond-> {:program/id (:program/id p)
-                           :pid (:pid started)
-                           :log log
-                           :dir (:program/dir p)
-                           :kind (:program/kind ready)
-                           :started-at ((:now ctx))}
-                    nrepl (assoc :nrepl-port nrepl)))))))))
+            (let [run (cond-> {:program/id (:program/id p)
+                               :pid (:pid started)
+                               :log log
+                               :dir (:program/dir p)
+                               :kind (:program/kind ready)
+                               :started-at ((:now ctx))}
+                        nrepl (assoc :nrepl-port nrepl))]
+              (r/ok (if (await-exit ctx rn (:pid run))
+                      (merge run (exit-facts rn run))
+                      run)))))))))
 
 (defn- start-programs!
   "Start the programs `p` pairs with `services`, reusing the live ones in
@@ -177,6 +250,8 @@
                     (cond
                       (r/err? res) (update acc :report conj {:program/id id :error res})
                       (:external? (:ok res)) (update acc :report conj (:ok res))
+                      ;; died within the grace: reported, never held
+                      (:exited? (:ok res)) (update acc :report conj (:ok res))
                       :else (-> acc
                                 (assoc-in [:held id] (:ok res))
                                 (update :report conj (assoc (:ok res) :started? true))))))))
@@ -195,10 +270,80 @@
           (sort-by key (program/release-programs (:active @(:state ctx)) id keep)))
     []))
 
-(defn- execute! [{:keys [engine]} p {:keys [action services]}]
+(defn- execute-once! [{:keys [engine]} p {:keys [action services]}]
   (case action
     :stop (port/-stop! engine p services)
     :down (port/-down! engine p services)))
+
+(def ^:private no-such-service "no such service: ")
+
+(defn unknown-service-name
+  "The service compose named in a `no such service: <name>` refusal, nil for
+   any other result."
+  [res]
+  (when (target/unknown-service? res)
+    (let [s (str (:stderr res))
+          i (str/index-of s no-such-service)]
+      (when i
+        (first (str/split-lines (str/trim (subs s (+ i (count no-such-service))))))))))
+
+(def ^:private missing-variable-re #"required variable (\S+) is missing a value")
+
+(defn missing-variable
+  "The variable compose named in a `required variable <name> is missing a
+   value` refusal, nil for any other result."
+  [res]
+  (when (r/err? res)
+    (second (re-find missing-variable-re (str (:stderr res))))))
+
+(defn adopted-section?
+  "True when `id` names the section adopt! keeps strays of a project in."
+  [id]
+  (str/ends-with? (str id) "/adopted"))
+
+(defn- by-name? [{:keys [engine]}]
+  (satisfies? port/IContainerControl engine))
+
+(defn- execute-by-name!
+  "Run Release `step` on `p` by container name: no compose file is loaded."
+  [{:keys [engine]} p {:keys [action services]}]
+  (r/map-ok (port/-stop-containers! engine p services action)
+            #(assoc % :by :container-name)))
+
+(defn- execute-by-service!
+  "Run Release `step` on `p`. A service compose no longer defines (a stale
+   snapshot: an adopted section, a file edited since) is dropped and the
+   step retried, so one unknown name never keeps the rest running. Answers
+   the result, with :unknown [service] when any were dropped."
+  [ctx p step]
+  (loop [step step dropped []]
+    (let [res (execute-once! ctx p step)
+          svc (unknown-service-name res)]
+      (if (and svc (some #{svc} (:services step)) (< (count dropped) 64))
+        (let [left (vec (remove #{svc} (:services step)))]
+          (if (empty? left)
+            (r/ok {:out "" :skipped :no-services :unknown (conj dropped svc)})
+            (recur (assoc step :services left) (conj dropped svc))))
+        (cond-> res (and (seq dropped) (r/ok? res)) (update :ok assoc :unknown dropped))))))
+
+(defn- execute!
+  "Run Release `step` on `p`. An adopted section is released by container
+   name when the engine can: its strays may come from a compose file its
+   project does not name, so compose would refuse them as unknown services.
+   Any other section goes through compose; when compose cannot load the
+   project's files because a variable is unset, the step falls back to
+   container names and the answer names the variable under :missing-env, so
+   one unset variable never keeps a section running pass after pass."
+  [ctx p {id :profile/id :as step}]
+  (if (and (adopted-section? id) (by-name? ctx))
+    (execute-by-name! ctx p step)
+    (let [res (execute-by-service! ctx p step)
+          var (missing-variable res)]
+      (cond
+        (nil? var) res
+        (by-name? ctx) (r/map-ok (execute-by-name! ctx p step) #(assoc % :missing-env var))
+        :else (assoc res :missing-env var
+                     :hint (str var " is unset: set it in the project's :project/env"))))))
 
 (defn- forget [st id]
   (-> st
@@ -221,18 +366,85 @@
 
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
-    (r/err? result) (assoc :error result)))
+    (r/err? result) (assoc :error result)
+    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))
+    (get-in result [:ok :by]) (assoc :by (get-in result [:ok :by]))
+    (or (:missing-env result) (get-in result [:ok :missing-env]))
+    (assoc :missing-env (or (:missing-env result) (get-in result [:ok :missing-env])))))
 
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
 
+(defn required-closure
+  "What `roots` need under the depends_on edges of `graph`
+   ({service {dep {:required? bool}}}): {:start [service]} follows only the
+   required edges (an edge without :required? is required); {:needs [service]}
+   adds the `required: false` dependencies met on the way that are already in
+   `running`, together with everything those require in turn (and the running
+   optional ones they meet), so release never strands a kept service. What
+   :needs adds is waited on and kept, never started. Pure."
+  [graph roots running]
+  (let [running (set running)
+        optional? (fn [[_ e]] (false? (:required? e)))
+        walk (fn [seen roots]
+               (loop [seen seen optional #{} todo (vec roots)]
+                 (if-let [[s & more] (seq todo)]
+                   (if (seen s)
+                     (recur seen optional (vec more))
+                     (let [edges (get graph s)]
+                       (recur (conj seen s)
+                              (into optional (map key) (filter optional? edges))
+                              (into (vec more) (map key) (remove optional? edges)))))
+                   [seen optional])))
+        [start optional] (walk #{} roots)]
+    (loop [kept start optional optional]
+      (let [fresh (vec (sort (remove kept (filter running optional))))]
+        (if (empty? fresh)
+          {:start (vec (sort start)) :needs (vec (sort kept))}
+          (let [[kept more] (walk kept fresh)]
+            (recur kept more)))))))
+
+(defn- up-plan
+  "Result<{:start :needs :pin?}> for bringing `p` up. The engine's closure
+   follows every depends_on entry; when the engine also answers the dependency
+   graph, the entries marked `required: false` are left out of :start (never
+   built or started) and kept in :needs only when already running, with what
+   they require. :pin? is true when something was left out, so compose must
+   start exactly :start. Without a graph, with no optional edge in the
+   closure, or with a graph that disagrees with the closure (a closure service
+   it has no entry for, a required dependency outside the closure), :start and
+   :needs are the closure and nothing is pinned, as before."
+  [ctx p]
+  (let [engine (:engine ctx)
+        whole (fn [closure] (r/ok {:start closure :needs closure :pin? false}))]
+    (r/let-ok [closure (port/-closure engine p)]
+      (if-not (satisfies? port/IDependencyGraph engine)
+        (whole closure)
+        (r/let-ok [graph (port/-dependencies engine p)]
+          (let [in-closure (set closure)
+                complete? (every? #(contains? graph %) closure)
+                optional? (some (fn [s] (some #(false? (:required? %)) (vals (get graph s))))
+                                closure)]
+            (if-not (and complete? optional?)
+              (whole closure)
+              (r/let-ok [roots (if (seq (:profile/services p))
+                                 (r/ok (:profile/services p))
+                                 (port/-listed engine p))
+                         running (port/-running engine p)]
+                (let [{:keys [start needs]} (required-closure graph (filter in-closure roots) running)]
+                  (if-not (and (every? in-closure start) (every? in-closure needs))
+                    (whole closure)
+                    (r/ok {:start start :needs needs :pin? (not= start closure)})))))))))))
+
 (defn- bring-up!
   "Start `services` of `p`, then the programs paired with them (`carried` are
    live ones to reuse), and track the profile as active. `needs` is the
-   depends_on closure of `services`, kept when wider so release spares it."
-  [ctx p services needs carried]
+   depends_on closure of `services`, kept when wider so release spares it.
+   `pin?` starts exactly `services` (compose --no-deps), so compose does not
+   pull in the optional dependencies the closure left out."
+  [ctx p services needs carried pin?]
   (let [id (:profile/id p)]
-    (r/let-ok [out (port/-up! (:engine ctx) p services)]
+    (r/let-ok [out (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services)]
       (let [now ((:now ctx))
             {:keys [held report]} (start-programs! ctx p services carried)
             wider (seq (remove (set services) needs))]
@@ -244,37 +456,41 @@
                                 :started-at (or (:started-at a) now)
                                 :last-touch now}
                          wider (assoc :needs (vec needs))
-                         (seq held) (assoc :programs held))))
+                         (seq held) (assoc :programs held)
+                         (seq (:claims a)) (assoc :claims (:claims a)))))
         (r/ok (cond-> {:profile id :project (profile/project p) :services services :out (:out out)}
                 wider (assoc :needs (vec needs))
                 (seq report) (assoc :programs report)))))))
 
 (defn up-profile!
-  "Bring `p` up alongside whatever is active. Becomes current when nothing is."
+  "Bring `p` up alongside whatever is active. Becomes current when nothing is.
+   A depends_on entry marked `required: false` is neither built nor started;
+   it is only needed when already running."
   [ctx p]
-  (r/let-ok [closure (port/-closure (:engine ctx) p)
-             up (bring-up! ctx p (profile/up-services p closure) closure
-                           (live-programs ctx (profile/project p)))]
+  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)
+             up (bring-up! ctx p (profile/up-services p start) needs
+                           (live-programs ctx (profile/project p)) pin?)]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
     (persist! ctx)
     (r/ok up)))
 
 (defn switch-profile!
   "Make `p` current: release what only the previous current profile needs, then
-   bring `p` up. Shared services and the programs `p` wants stay up throughout."
+   bring `p` up. Shared services and the programs `p` wants stay up throughout.
+   Optional (`required: false`) dependencies are treated as in `up-profile!`."
   [ctx p]
-  (r/let-ok [closure (port/-closure (:engine ctx) p)]
+  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)]
     (let [id (:profile/id p)
           project (profile/project p)
-          services (profile/up-services p closure)
+          services (profile/up-services p start)
           {:keys [active current]} @(:state ctx)
           carried (live-programs ctx project)
           keep (if (= project (get-in active [current :project]))
                  (into #{} (map :program/id) (program/wanted (:profile/programs p) services))
                  #{})
           released (mapv #(step-report (release! ctx % keep))
-                         (plan/switch-releases active current id project closure))
-          up (bring-up! ctx p services closure carried)]
+                         (plan/switch-releases active current id project needs))
+          up (bring-up! ctx p services needs carried pin?)]
       (when (r/ok? up) (swap! (:state ctx) assoc :current id))
       (persist! ctx)
       (r/map-ok up #(assoc % :released released)))))
@@ -370,12 +586,23 @@
       (persist! ctx))
     dropped))
 
+(defn- reap-step!
+  "Release one reaper `step`, answering its report row. A throw is that
+   section's error, never the pass's: the other sections are still reaped."
+  [ctx step]
+  (try
+    (step-report (release! ctx step))
+    (catch Throwable t
+      (assoc step :ok? false :error (r/err :compose/release-threw {:message (str t)})))))
+
 (defn reap!
-  "One reaper pass: reconcile, then release every idle profile."
+  "One reaper pass: reconcile, then release every idle profile. Each section
+   answers its own row: one that cannot be released (an unset variable, a
+   throw) is reported with why and the rest are still reaped."
   [ctx]
   (let [reconciled (reconcile! ctx)
         steps (plan/reap-releases (:settings ctx) ((:now ctx)) (:active @(:state ctx)))
-        reaped (mapv #(step-report (release! ctx %)) steps)]
+        reaped (mapv #(reap-step! ctx %) steps)]
     (when (seq reaped) (persist! ctx))
     {:reconciled reconciled :reaped reaped}))
 
@@ -450,44 +677,81 @@
 ;; ---------------------------------------------------------------------------
 ;; reads
 
-(defn- program-row
+(defn program-row
   "What is known of started program `run` right now: alive, and whether its
-   nREPL answers. A port the program chose itself is read from its .nrepl-port."
+   nREPL answers. A port the program chose itself is read from its .nrepl-port.
+   One whose process is gone is :status :exited, with its exit code when the
+   runner kept it and the last lines of its log."
   [ctx run]
   (let [rn (runner ctx)
+        alive? (when rn (port/-alive? rn (:pid run)))
         port (or (:nrepl-port run) (when rn (port/-nrepl-port rn (:dir run))))]
     (cond-> (select-keys run [:program/id :pid :kind :log :dir])
-      rn (assoc :alive? (port/-alive? rn (:pid run)))
+      rn (assoc :alive? alive? :status (if alive? :running :exited))
+      (and rn (not alive?)) (merge (exit-facts rn run))
       port (assoc :nrepl-port port)
       (and rn port) (assoc :nrepl-ready? (port/-listening? rn port)))))
 
+(defn config-health
+  "{project-id {:compose-project name :ok? bool :error ..}}: whether `docker
+   compose config` accepts each configured project as configured now (its
+   files and env; references rendered, never read). A missing required
+   variable, a bad file or an absent overlay shows here."
+  [ctx]
+  (into (sorted-map)
+        (for [[id proj] (get-in ctx [:settings :compose/projects])
+              :let [whole (target/project-profile proj)
+                    res (port/-listed (:engine ctx) whole)]]
+          [id (cond-> {:compose-project (profile/project whole) :ok? (r/ok? res)}
+                (r/err? res) (assoc :error (select-keys res [:error :exit :stderr])))])))
+
 (defn status
   "Every configured preset and every active section, with activity, reaper
-   countdown and the host programs it holds."
+   countdown and the host programs it holds. Up front, :ok? and :config say
+   whether compose accepts each configured project now; a row of a project it
+   rejects carries :config-ok? false, and an active one :reap-blocked? true,
+   since no compose call on that project, the reaper's included, can run."
   [ctx]
   (let [{:keys [settings]} ctx
         {:keys [active current]} @(:state ctx)
         now ((:now ctx))
+        health (config-health ctx)
+        broken (into {} (for [[id h] health :when (not (:ok? h))] [(:compose-project h) id]))
         row (fn [id p]
               (let [a (get active id)
-                    ttl (profile/ttl-ms settings p)]
+                    ttl (if a (plan/effective-ttl-ms settings p a) (profile/ttl-ms settings p))
+                    bad (get broken (profile/project p))]
                 (cond-> {:id id
                          :project (profile/project p)
                          :active? (some? a)
                          :ttl-minutes (quot ttl 60000)
-                         :idle-action (profile/idle-action settings p)}
+                         :idle-action (profile/idle-action settings p)
+                         :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
+                  (and a bad) (assoc :reap-blocked? true)
+                  (seq (:claims a)) (assoc :claims (into (sorted-map)
+                                                         (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
+                                                         (:claims a)))
+                  (:orphaned-at a) (assoc :orphaned? true)
+                  (:usage a) (assoc :usage (:usage a)
+                                    :in-use-via (get-in a [:usage :sources] []))
                   (seq (:programs a)) (assoc :programs (mapv #(program-row ctx (val %))
                                                              (sort-by key (:programs a)))))))]
-    {:current current
-     :projects (vec (sort (keys (:compose/projects settings))))
-     :profiles (into (mapv (fn [[id p]] (row id p)) (sort-by key (:compose/profiles settings)))
-                     (for [[id a] (sort-by key active)
-                           :when (not (configured ctx id))]
-                       (assoc (row id (:profile a)) :section? true)))}))
+    (cond-> {:ok? (empty? broken)
+             :config health
+             :current current
+             :projects (vec (sort (keys (:compose/projects settings))))
+             :profiles (into (mapv (fn [[id p]] (row id p)) (sort-by key (:compose/profiles settings)))
+                             (for [[id a] (sort-by key active)
+                                   :when (not (configured ctx id))]
+                               (assoc (row id (:profile a)) :section? true)))}
+      (seq broken) (assoc :problem (str "compose rejects the config of "
+                                        (str/join ", " (sort (vals broken)))
+                                        "; every compose call on it fails, the reaper's included (see :config)")))))
 
 (defn programs
   "Result<[row]>: every program the configured projects declare, as it would
@@ -527,9 +791,47 @@
             (r/ok [])
             (sort-by key (get-in ctx [:settings :compose/projects])))))
 
+(defn- label-files
+  "The compose files docker recorded on a project's containers (`ls`
+   ConfigFiles, comma-separated absolute paths)."
+  [s]
+  (vec (remove str/blank? (map str/trim (str/split (or s "") #",")))))
+
+(defn- configured-files
+  "Absolute compose files configured project `proj` runs with: its
+   :project/files resolved against its dir, else compose's own defaults (nil)."
+  [proj]
+  (when-let [fs (seq (:project/files proj))]
+    (mapv #(if (str/starts-with? % "/") % (str (str/replace (:project/dir proj) #"/+$" "") "/" %)) fs)))
+
 (defn projects
-  "Result<[project]>: every compose project on the host, managed ones marked."
+  "Result<[project]>: every compose project on the host, managed ones marked.
+   :label-files are the files docker recorded when its containers were
+   created. For a project a configured one runs as, :configured lists those
+   with their :files as configured now, and :stale-files the label files
+   no configured project of that name uses (a different checkout, an overlay
+   since dropped); :files-match? false says the running containers were not
+   created from the files configured now."
   [ctx]
-  (let [managed (into #{} (map :project) (vals (:active @(:state ctx))))]
+  (let [managed (into #{} (map :project) (vals (:active @(:state ctx))))
+        by-name (group-by (comp profile/project target/project-profile)
+                          (vals (get-in ctx [:settings :compose/projects])))]
     (r/map-ok (port/-projects (:engine ctx))
-              (fn [ps] (mapv #(assoc % :managed? (contains? managed (:name %))) ps)))))
+              (fn [ps]
+                (mapv (fn [{nm :name :as row}]
+                        (let [labels (label-files (:config-files row))
+                              confs (get by-name nm)
+                              conf-rows (vec (for [p (sort-by :project/id confs)]
+                                               (cond-> {:id (:project/id p)}
+                                                 (configured-files p) (assoc :files (configured-files p)))))
+                              known (set (mapcat :files conf-rows))
+                              explicit? (every? :files conf-rows)
+                              stale (when (and (seq confs) explicit?) (vec (remove known labels)))]
+                          (cond-> (-> row
+                                      (dissoc :config-files)
+                                      (assoc :managed? (contains? managed nm) :label-files labels))
+                            (seq confs) (assoc :configured conf-rows)
+                            (and (seq confs) explicit?)
+                            (assoc :stale-files stale
+                                   :files-match? (boolean (some #(= (set labels) (set (:files %))) conf-rows))))))
+                      ps)))))

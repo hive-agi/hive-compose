@@ -14,6 +14,21 @@
    them (never volumes), :none exempts the profile."
   [:enum :stop :down :none])
 
+(def SecretRef
+  "An env value read from a secret store when a process is spawned, never
+   before, and shown everywhere else as `<scheme>:<path>`. One entry, its
+   scheme: `{:pass \"<store path>\"}` is the first line of `pass <path>`. A new
+   scheme is one more map here and a backend of that id in
+   `hive-compose.adapter.secrets`."
+  [:map {:closed true} [:pass [:string {:min 1}]]])
+
+(def EnvValue
+  "A literal string, or a SecretRef."
+  [:or :string SecretRef])
+
+(def Env
+  [:map-of :string EnvValue])
+
 (def Program
   "A host process a section needs beside its containers. `:program/with` pairs
    it with compose services: it starts with a section running one of them, or
@@ -27,7 +42,7 @@
    [:program/kind {:optional true} [:enum :shadow :deps :lein :bb :plain]]
    [:program/nrepl-port {:optional true} [:int {:min 1 :max 65535}]]
    [:program/with {:optional true} [:vector [:string {:min 1}]]]
-   [:program/env {:optional true} [:map-of :string :string]]
+   [:program/env {:optional true} Env]
    [:program/description {:optional true} :string]])
 
 (def Running
@@ -42,6 +57,13 @@
    [:kind {:optional true} :keyword]
    [:nrepl-port {:optional true} :int]])
 
+(def Activity
+  "What counts as use of a section: new connections to :nrepl (the shared
+   nREPLs of its programs) and :published (the host ports its containers
+   publish, a browser or any host-side client), and :cpu (a running service
+   above :compose/cpu-busy-percent, busy with no client connected)."
+  [:set [:enum :nrepl :published :cpu]])
+
 (def Profile
   [:map
    [:profile/id ProfileId]
@@ -51,12 +73,34 @@
    [:profile/compose-profiles {:optional true} [:vector ProfileId]]
    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
    [:profile/programs {:optional true} [:vector Program]]
-   [:profile/env {:optional true} [:map-of :string :string]]
+   [:profile/env {:optional true} Env]
    [:profile/wait? {:optional true} :boolean]
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
+   [:profile/activity {:optional true} Activity]
    [:profile/description {:optional true} :string]])
+
+(def Claim
+  "An agent's declaration that it works on a section: since when, when it was
+   last renewed, what for, and whether the agent was in the swarm when it
+   claimed (then the claim ends with the agent)."
+  [:map
+   [:since :int]
+   [:seen :int]
+   [:note {:optional true} :string]
+   [:swarm? {:optional true} :boolean]])
+
+(def Usage
+  "What the last reaper pass saw using a section. A reason is {:claim agent},
+   {:agent id}, {:port p :peers n :source :nrepl|:published} or {:service s
+   :cpu percent :source :cpu}; :sources names once each what the reasons came
+   from (:claim :agent :nrepl :published :cpu)."
+  [:map
+   [:at :int]
+   [:in-use? :boolean]
+   [:by [:vector :map]]
+   [:sources {:optional true} [:vector :keyword]]])
 
 (def Active
   "A profile this addon brought up (or adopted) and still answers for. `:profile`
@@ -72,7 +116,10 @@
    [:started-at :int]
    [:last-touch :int]
    [:programs {:optional true} [:map-of :string Running]]
-   [:profile {:optional true} Profile]])
+   [:profile {:optional true} Profile]
+   [:claims {:optional true} [:map-of :string Claim]]
+   [:orphaned-at {:optional true} :int]
+   [:usage {:optional true} Usage]])
 
 (def ActiveMap [:map-of :string Active])
 
@@ -86,10 +133,11 @@
    [:project/files {:optional true} [:vector [:string {:min 1}]]]
    [:project/name {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
    [:project/programs {:optional true} [:vector Program]]
-   [:project/env {:optional true} [:map-of :string :string]]
+   [:project/env {:optional true} Env]
    [:project/wait? {:optional true} :boolean]
    [:project/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:project/idle-action {:optional true} IdleAction]])
+   [:project/idle-action {:optional true} IdleAction]
+   [:project/activity {:optional true} Activity]])
 
 (def Settings
   [:map
@@ -103,7 +151,14 @@
    [:compose/timeout-ms [:int {:min 1000}]]
    [:compose/up-timeout-ms [:int {:min 1000}]]
    [:compose/adopt? :boolean]
-   [:compose/programs? :boolean]])
+   [:compose/programs? :boolean]
+   [:compose/swarm? :boolean]
+   [:compose/notify? :boolean]
+   [:compose/activity Activity]
+   [:compose/cpu-busy-percent {:optional true} [:and number? [:>= 0]]]
+   [:compose/claim-ttl-minutes [:int {:min 1}]]
+   [:compose/orphan-ttl-minutes [:int {:min 1}]]
+   [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."
