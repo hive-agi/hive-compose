@@ -3,6 +3,7 @@
    qualified categories, HTTP status, routing, the browser guard and the
    param type check. A dispatch fn stands in for the addon."
   (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [hive-compose.api :as api]
             [hive-dsl.result :as r]))
@@ -45,7 +46,26 @@
                       :compose/not-initialized 503 :compose/invalid-config 503}]
     (is (= code (api/http-status (r/err cat {}))) (str cat)))
   (is (= 200 (api/http-status (r/ok nil))))
-  (is (= 500 (api/http-status (r/err :compose/release-threw {})))))
+  (is (= 500 (api/http-status (r/err :compose/release-threw {}))))
+  (is (= 500 (api/http-status (r/err :stub/never-mapped {}))) "an unmapped category is 500")
+  (doseq [[cat code] {:compose/invalid-run 400 :compose/faults-invalid-toxic 400 :trace/bad-id 400
+                      :compose/unknown-run 404 :compose/faults-no-toxiproxy 404 :trace/not-found 404
+                      :compose/run-exists 409 :compose/toxiproxy-proxy-conflict 409
+                      :compose/toxiproxy-unreachable 502 :trace/unreachable 502 :trace/http-error 502
+                      :trace/not-ready 503 :compose/no-trace-query 503 :compose/stacks-unsupported 503
+                      :compose/invalid-result 500}]
+    (is (= code (api/http-status (r/err cat {}))) (str cat))))
+
+(deftest every-category-the-source-answers-has-a-status
+  ;; derived from src/, so a new (r/err :ns/name ..) cannot ship unmapped
+  (let [in-src (into (sorted-set)
+                     (comp (filter #(re-find #"\.clj$" (str %)))
+                           (mapcat #(re-seq #"\(r/err :([a-z-]+/[a-z-]+)" (slurp %)))
+                           (map (comp keyword second)))
+                     (file-seq (io/file "src")))]
+    (is (seq in-src))
+    (is (= #{} (apply disj in-src (keys api/status-by-category))) "categories with no HTTP status")
+    (is (every? #{400 403 404 405 409 413 415 500 501 502 503} (vals api/status-by-category)))))
 
 (deftest post-runs-the-dispatch-with-the-body-as-params
   (let [seen (atom nil)
@@ -73,8 +93,8 @@
   (let [d (deps (fn [_ _] (throw (ex-info "must not run" {}))))]
     (is (= 404 (:status (api/route d (req "POST" "/v1/bogus" "{}")))))
     (is (= "compose/unknown-command" (get (body (api/route d (req "POST" "/v1/bogus" "{}"))) "error")))
-    (is (= 501 (:status (api/route d (req "POST" "/v1/stack/up" "{}")))))
-    (is (= "stack.up" (get (body (api/route d (req "POST" "/v1/stack/up" "{}"))) "op")))
+    (is (= 501 (:status (api/route d (req "POST" "/v1/flaky" "{}")))))
+    (is (= "flaky" (get (body (api/route d (req "POST" "/v1/flaky" "{}"))) "op")))
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "[1,2]")))))
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "{not json")))))
     (is (= 405 (:status (api/route d (req "GET" "/v1/up" "")))))

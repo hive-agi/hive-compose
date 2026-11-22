@@ -25,8 +25,10 @@ tags:
   description: existing section commands
 - name: swarm
   description: existing claim / nREPL routing commands
+- name: stacks
+  description: stack runs, fault injection and failure explanation (hc-4/6/10/12)
 - name: stacks (planned)
-  description: hc-4/6/8/10/12/13 placeholders
+  description: hc-8/13 placeholders
 - name: meta
   description: health and this document
 security: []
@@ -904,6 +906,57 @@ paths:
           $ref: '#/components/responses/Unavailable'
         '502':
           $ref: '#/components/responses/EngineFailed'
+  /v1/faults:
+    post:
+      operationId: faults
+      summary: 'fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default
+        list); run (r'
+      description: 'fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default
+        list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer,
+        attributes {name number}, stream upstream|downstream, toxicity 0..1, name}'
+      tags:
+      - stacks
+      x-hive-call-op: faults
+      x-mcp:
+        tool: compose
+        command: faults
+      x-mutates: true
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Req_faults'
+      responses:
+        '200':
+          description: Result ok
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Ok'
+                - type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/FaultsResult'
+                  required:
+                  - value
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
   /v1/reload:
     post:
       operationId: reload
@@ -948,23 +1001,27 @@ paths:
           $ref: '#/components/responses/Unavailable'
         '502':
           $ref: '#/components/responses/EngineFailed'
-  /v1/stack/plan:
+  /v1/stack-up:
     post:
-      operationId: stack_plan
-      summary: Resolved graph to instances, compose -p names, start order; what is shared, private and already running
-        (terra
-      description: Resolved graph to instances, compose -p names, start order; what is shared, private and already
-        running (terraform-plan style). Lockfile of image digests. Pure, mutates nothing.
+      operationId: stack-up
+      summary: 'run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order,
+        each waited '
+      description: 'run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order,
+        each waited and health-gated, join them to each consumer''s view network hive-<run>-<consumer>, then start
+        the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)'
       tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-4-stack-plan
-      x-hive-call-op: stack.plan
+      - stacks
+      x-hive-call-op: stack-up
+      x-mcp:
+        tool: compose
+        command: stack-up
+      x-mutates: true
       requestBody:
+        required: false
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Req_stack_plan'
+              $ref: '#/components/schemas/Req_stack-up'
       responses:
         '200':
           description: Result ok
@@ -976,33 +1033,45 @@ paths:
                 - type: object
                   properties:
                     value:
-                      $ref: '#/components/schemas/Res_stack_plan'
+                      $ref: '#/components/schemas/StackUpResult'
                   required:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/stack/up:
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
+  /v1/stack-down:
     post:
-      operationId: stack_up
-      summary: 'Bring a stack up over its plan: run id, per-run network, docker labels hive'
-      description: 'Bring a stack up over its plan: run id, per-run network, docker labels hive.run/hive.stack,
-        up --wait plus health gating of dependents.'
+      operationId: stack-down
+      summary: 'take a stack run down: consumers, view networks, then the instances no other live run or section
+        keeps (never '
+      description: 'take a stack run down: consumers, view networks, then the instances no other live run or section
+        keeps (never volumes, never what ran before the run). run, or stack for every run of it'
       tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-6-stack-ops
-      x-hive-call-op: stack.up
+      - stacks
+      x-hive-call-op: stack-down
+      x-mcp:
+        tool: compose
+        command: stack-down
+      x-mutates: true
       requestBody:
+        required: false
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Req_stack_up'
+              $ref: '#/components/schemas/Req_stack-down'
       responses:
         '200':
           description: Result ok
@@ -1014,32 +1083,43 @@ paths:
                 - type: object
                   properties:
                     value:
-                      $ref: '#/components/schemas/Res_stack_up'
+                      $ref: '#/components/schemas/StackDownResult'
                   required:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/stack/down:
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
+  /v1/stack-status:
     post:
-      operationId: stack_down
-      summary: Release a stack run; instances other stacks still need are spared (refcount)
-      description: Release a stack run; instances other stacks still need are spared (refcount). Volumes never removed.
+      operationId: stack-status
+      summary: stack runs with their instances' and consumers' containers now
+      description: stack runs with their instances' and consumers' containers now. stack; run
       tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-6-stack-ops
-      x-hive-call-op: stack.down
+      - stacks
+      x-hive-call-op: stack-status
+      x-mcp:
+        tool: compose
+        command: stack-status
+      x-mutates: false
       requestBody:
+        required: false
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Req_stack_down'
+              $ref: '#/components/schemas/Req_stack-status'
       responses:
         '200':
           description: Result ok
@@ -1051,32 +1131,43 @@ paths:
                 - type: object
                   properties:
                     value:
-                      $ref: '#/components/schemas/Res_stack_down'
+                      $ref: '#/components/schemas/StackStatusResult'
                   required:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/stack/status:
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
+  /v1/plan:
     post:
-      operationId: stack_status
-      summary: Runs, instances with refcounts, claims and reaper countdown per stack
-      description: Runs, instances with refcounts, claims and reaper countdown per stack.
+      operationId: plan
+      summary: what stack-up would start, share or find running (terraform-plan style)
+      description: what stack-up would start, share or find running (terraform-plan style). stack; run
       tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-6-stack-ops
-      x-hive-call-op: stack.status
+      - stacks
+      x-hive-call-op: plan
+      x-mcp:
+        tool: compose
+        command: plan
+      x-mutates: false
       requestBody:
+        required: false
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Req_stack_status'
+              $ref: '#/components/schemas/Req_plan'
       responses:
         '200':
           description: Result ok
@@ -1088,17 +1179,76 @@ paths:
                 - type: object
                   properties:
                     value:
-                      $ref: '#/components/schemas/Res_stack_status'
+                      $ref: '#/components/schemas/PlanResult'
                   required:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
+  /v1/why:
+    post:
+      operationId: why
+      summary: 'explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), '
+      description: 'explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url),
+        the span path from the root, container logs of its run in its time window and the stack plan; written to
+        <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run
+        holding it)'
+      tags:
+      - stacks
+      x-hive-call-op: why
+      x-mcp:
+        tool: compose
+        command: why
+      x-mutates: true
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Req_why'
+      responses:
+        '200':
+          description: Result ok
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
+                allOf:
+                - $ref: '#/components/schemas/Ok'
+                - type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/WhyResult'
+                  required:
+                  - value
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
   /v1/test:
     post:
       operationId: test
@@ -1138,44 +1288,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/why:
-    post:
-      operationId: why
-      summary: 'Failure bundle for test T: the case, traces carrying test'
-      description: 'Failure bundle for test T: the case, traces carrying test.id (Tempo/ClickHouse behind a port),
-        container logs in its window, the resolved plan; written to the state dir plus a memory note.'
-      tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-10-why
-      x-hive-call-op: why
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/Req_why'
-      responses:
-        '200':
-          description: Result ok
-          content:
-            application/json:
-              schema:
-                allOf:
-                - $ref: '#/components/schemas/Ok'
-                - type: object
-                  properties:
-                    value:
-                      $ref: '#/components/schemas/Res_why'
-                  required:
-                  - value
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
   /v1/flaky:
     post:
       operationId: flaky
@@ -1203,45 +1315,6 @@ paths:
                   properties:
                     value:
                       $ref: '#/components/schemas/Res_flaky'
-                  required:
-                  - value
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/faults:
-    post:
-      operationId: faults
-      summary: 'Toxiproxy interposed between a consumer and an instance (:needs {"pg" {:via :toxiproxy}}): list,
-        add or remove'
-      description: 'Toxiproxy interposed between a consumer and an instance (:needs {"pg" {:via :toxiproxy}}): list,
-        add or remove toxics.'
-      tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-12-faults
-      x-hive-call-op: faults
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/Req_faults'
-      responses:
-        '200':
-          description: Result ok
-          content:
-            application/json:
-              schema:
-                allOf:
-                - $ref: '#/components/schemas/Ok'
-                - type: object
-                  properties:
-                    value:
-                      $ref: '#/components/schemas/Res_faults'
                   required:
                   - value
         '400':
@@ -2067,6 +2140,67 @@ components:
             - published
             - cpu
           uniqueItems: true
+        provides:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              service:
+                type: string
+                minLength: 1
+              version:
+                type: string
+                pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+              env:
+                type: object
+                additionalProperties:
+                  anyOf:
+                  - type: string
+                  - type: object
+                    properties:
+                      pass:
+                        type: string
+                        minLength: 1
+                    required:
+                    - pass
+                    additionalProperties: false
+              tenancy:
+                type: object
+                properties:
+                  env:
+                    type: string
+                    minLength: 1
+                required:
+                - env
+              port:
+                type: integer
+                minimum: 1
+                maximum: 65535
+              description:
+                type: string
+            required:
+            - service
+        needs:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              version:
+                type: string
+                pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                  +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+              share?:
+                type: boolean
+              provider:
+                type: string
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+              services:
+                type: array
+                items:
+                  type: string
+                  minLength: 1
+              via:
+                type: string
       required:
       - id
       - dir
@@ -2242,6 +2376,67 @@ components:
                   - published
                   - cpu
                 uniqueItems: true
+              provides:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    service:
+                      type: string
+                      minLength: 1
+                    version:
+                      type: string
+                      pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+                    env:
+                      type: object
+                      additionalProperties:
+                        anyOf:
+                        - type: string
+                        - type: object
+                          properties:
+                            pass:
+                              type: string
+                              minLength: 1
+                          required:
+                          - pass
+                          additionalProperties: false
+                    tenancy:
+                      type: object
+                      properties:
+                        env:
+                          type: string
+                          minLength: 1
+                      required:
+                      - env
+                    port:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                    description:
+                      type: string
+                  required:
+                  - service
+              needs:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    version:
+                      type: string
+                      pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                        +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+                    share?:
+                      type: boolean
+                    provider:
+                      type: string
+                      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+                    services:
+                      type: array
+                      items:
+                        type: string
+                        minLength: 1
+                    via:
+                      type: string
             required:
             - id
             - dir
@@ -2424,6 +2619,127 @@ components:
         program-grace-ms:
           type: integer
           minimum: 0
+        stacks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              id:
+                type: string
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+              consumers:
+                type: array
+                items:
+                  type: string
+                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
+                minItems: 1
+              needs:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    version:
+                      type: string
+                      pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                        +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+                    share?:
+                      type: boolean
+                    provider:
+                      type: string
+                      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+                    services:
+                      type: array
+                      items:
+                        type: string
+                        minLength: 1
+                    via:
+                      type: string
+              description:
+                type: string
+            required:
+            - id
+            - consumers
+        suites:
+          type: object
+          additionalProperties:
+            allOf:
+            - type: object
+              properties:
+                id:
+                  type: string
+                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+                image:
+                  type: string
+                  minLength: 1
+                command:
+                  anyOf:
+                  - type: string
+                    minLength: 1
+                  - type: array
+                    items:
+                      type: string
+                      minLength: 1
+                    minItems: 1
+                dir:
+                  type: string
+                  minLength: 1
+                needs:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      version:
+                        type: string
+                        pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                          +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+                      share?:
+                        type: boolean
+                      provider:
+                        type: string
+                        pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+                      services:
+                        type: array
+                        items:
+                          type: string
+                          minLength: 1
+                      via:
+                        type: string
+                projects:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                  minItems: 1
+                env:
+                  type: object
+                  additionalProperties:
+                    anyOf:
+                    - type: string
+                    - type: object
+                      properties:
+                        pass:
+                          type: string
+                          minLength: 1
+                      required:
+                      - pass
+                      additionalProperties: false
+                reports-dir:
+                  type: string
+                  minLength: 1
+                report-format:
+                  type: string
+                  enum:
+                  - junit
+                  - tap
+                  - auto
+                timeout-ms:
+                  type: integer
+                  minimum: 1000
+                description:
+                  type: string
+              required:
+              - id
+            - {}
       required:
       - projects
       - profiles
@@ -2915,6 +3231,9 @@ components:
         tail:
           type: integer
           description: '[logs] lines per service (default 100)'
+        toxic:
+          type: object
+          description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
         agent:
           type: string
           description: '[claim|release] the agent claiming; defaults to the caller''s agent_id'
@@ -2932,6 +3251,10 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
         note:
           type: string
           description: '[claim] what the agent works on'
@@ -2951,14 +3274,31 @@ components:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
+        op:
+          type: string
+          enum:
+          - add
+          - remove
+          - reset
+          - list
+          description: '[faults] what to do (default list)'
         allow_shared:
           type: boolean
           description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
             the holder section and its agents)'
+        proxy:
+          type: string
+          description: '[faults] proxy name <consumer>.<capability>'
         allow_orphans:
           type: boolean
           description: '[up|switch|restart] go ahead although processes a dead docker daemon left running still
             hold the section''s volumes or ports (refused by default, naming them)'
+        test:
+          type: string
+          description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
+        stack:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
         agent_id:
           type: string
           description: stamped by the MCP host on every call; claim/release fall back to it when agent is absent
@@ -3015,42 +3355,95 @@ components:
       x-source: hand
     ErrorCategory:
       type: string
-      x-source: hand
-      x-from: carto structural-grep (r/err ?cat ?&rest) over src/ @ origin/staging
+      x-source: generated
+      x-from: 'every (r/err :ns/name ..) literal under src/ (doc/api/gen/assemble.py); HTTP status per category:
+        hive-compose.api/status-by-category'
       enum:
-      - compose/not-initialized
-      - compose/unknown-command
-      - compose/missing-param
+      - compose/alias-clash
+      - compose/alias-shadows-service
+      - compose/api-bind-failed
+      - compose/command-failed
+      - compose/consumer-name-collision
+      - compose/dependency-cycle
+      - compose/dispatch-threw
+      - compose/env-collision
+      - compose/faults-alias-clash
+      - compose/faults-invalid-toxic
+      - compose/faults-missing-port
+      - compose/faults-no-toxiproxy
+      - compose/faults-port-clash
+      - compose/faults-unknown-proxy
+      - compose/faults-unknown-toxic
+      - compose/forbidden-origin
+      - compose/held-by-another-section
+      - compose/inconsistent-resolution
+      - compose/instance-not-ready
+      - compose/instance-unhealthy
+      - compose/internal
+      - compose/invalid-config
+      - compose/invalid-consumer
+      - compose/invalid-extra-envs
       - compose/invalid-param
-      - compose/unknown-profile
-      - compose/unknown-project
-      - compose/unknown-target
+      - compose/invalid-range
+      - compose/invalid-resolution
+      - compose/invalid-result
+      - compose/invalid-run
+      - compose/invalid-stack
+      - compose/invalid-version
+      - compose/invalid-wiring
+      - compose/method-not-allowed
+      - compose/missing-param
+      - compose/name-collision
+      - compose/no-compose-file
+      - compose/no-container
       - compose/no-projects
+      - compose/no-results
+      - compose/no-runs
+      - compose/no-trace-query
       - compose/not-active
       - compose/not-claimed
-      - compose/command-failed
-      - compose/secret-unresolved
-      - compose/invalid-config
-      - compose/program-needs-command
-      - compose/orphans-hold-resources
-      - compose/held-by-another-section
-      - compose/orphan-check-failed
-      - compose/ownership-check-failed
-      - compose/release-threw
-      - compose/notice-failed
-      - compose/swarm-failed
-      - compose/notice-dropped
-      - compose/dispatch-threw
       - compose/not-implemented
-      - compose/unknown-route
-      - compose/method-not-allowed
+      - compose/not-initialized
+      - compose/note-failed
+      - compose/notice-dropped
+      - compose/notice-failed
+      - compose/orphan-check-failed
+      - compose/orphans-hold-resources
+      - compose/otlp-attributes-ref
+      - compose/otlp-pair-broken
+      - compose/ownership-check-failed
       - compose/payload-too-large
-      - compose/forbidden-origin
-      - compose/unsupported-media-type
-      - compose/internal
       - compose/proc-unreadable
-      - compose/api-bind-failed
+      - compose/program-needs-command
+      - compose/release-threw
+      - compose/run-exists
+      - compose/secret-unresolved
+      - compose/stack-down-incomplete
+      - compose/stacks-unsupported
+      - compose/swarm-failed
+      - compose/toxiproxy-failed
+      - compose/toxiproxy-proxy-conflict
+      - compose/toxiproxy-unreachable
+      - compose/unknown-command
+      - compose/unknown-consumer
+      - compose/unknown-instance
+      - compose/unknown-profile
+      - compose/unknown-project
+      - compose/unknown-provider
+      - compose/unknown-route
+      - compose/unknown-run
+      - compose/unknown-stack
+      - compose/unknown-target
+      - compose/unknown-test
+      - compose/unknown-via
+      - compose/unsupported-media-type
       - secrets/unknown-backend
+      - trace/bad-id
+      - trace/bad-json
+      - trace/http-error
+      - trace/not-found
+      - trace/not-ready
+      - trace/unreachable
     ProgramReport:
       type: object
       properties:
@@ -4055,6 +4448,37 @@ components:
       required:
       - adopted
       x-source: hand
+    FaultsResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.faults/faults!: list {proxy-name Proxy}, add the toxic, remove {removed?}, reset {reset
+        true}'
+      x-source: hand
+    StackUpResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.stacks/stack-up!: the run, its instances and consumers'
+      x-source: hand
+    StackDownResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.stacks/stack-down!: what was taken down and what was kept'
+      x-source: hand
+    StackStatusResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.stacks/stack-status: stack runs with their instances'' and consumers'' containers'
+      x-source: hand
+    PlanResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.stacks/plan: what stack-up would start, share or find running'
+      x-source: hand
+    WhyResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files'
+      x-source: hand
     Req_help:
       type: object
       additionalProperties: true
@@ -4368,11 +4792,103 @@ components:
       additionalProperties: true
       description: takes no params
       x-source: generated
+    Req_faults:
+      type: object
+      properties:
+        op:
+          type: string
+          enum:
+          - add
+          - remove
+          - reset
+          - list
+          description: '[faults] what to do (default list)'
+        proxy:
+          type: string
+          description: '[faults] proxy name <consumer>.<capability>'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        toxic:
+          type: object
+          description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
     Req_reload:
       type: object
       additionalProperties: true
       description: takes no params
       x-source: generated
+    Req_stack-up:
+      type: object
+      properties:
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        stack:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
+        wait:
+          type: boolean
+          description: '[up|switch] wait until the started services are healthy'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+    Req_stack-down:
+      type: object
+      properties:
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        stack:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+    Req_stack-status:
+      type: object
+      properties:
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        stack:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+    Req_plan:
+      type: object
+      properties:
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        stack:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+    Req_why:
+      type: object
+      properties:
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
+            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+        test:
+          type: string
+          description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
     Report:
       type: object
       properties:
@@ -4428,159 +4944,6 @@ components:
         hand-copied, regenerate once merged
       x-source: hand
       x-status: planned
-    Req_stack_plan:
-      type: object
-      properties:
-        stack:
-          type: string
-      required:
-      - stack
-      x-source: hand
-      x-status: planned
-      x-params-from: hc-lane-core provisional hc-6 params (hivemind 2026-11-22)
-    Res_stack_plan:
-      type: object
-      properties:
-        stack:
-          type: string
-        resolution:
-          $ref: '#/components/schemas/Resolution'
-        instances:
-          type: array
-          items:
-            type: object
-            properties:
-              instance:
-                $ref: '#/components/schemas/Instance'
-              state:
-                enum:
-                - shared-running
-                - shared-new
-                - private-new
-                - running
-            x-source: hand
-        order:
-          type: array
-          items:
-            type: string
-        wiring:
-          type: array
-          items:
-            $ref: '#/components/schemas/Wiring'
-        lockfile:
-          type: object
-          additionalProperties:
-            type: string
-      x-source: hand
-      x-status: planned
-    Req_stack_up:
-      type: object
-      properties:
-        stack:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-        wait:
-          type: boolean
-      required:
-      - stack
-      x-source: hand
-      x-status: planned
-      x-params-from: hc-lane-core provisional hc-6 params (hivemind 2026-11-22)
-    Res_stack_up:
-      type: object
-      properties:
-        stack:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-        instances:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: string
-              compose-project:
-                type: string
-              started?:
-                type: boolean
-              healthy?:
-                type: boolean
-            x-source: hand
-        wiring:
-          type: array
-          items:
-            $ref: '#/components/schemas/Wiring'
-      x-source: hand
-      x-status: planned
-    Req_stack_down:
-      type: object
-      properties:
-        stack:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-      required:
-      - stack
-      - run
-      x-source: hand
-      x-status: planned
-      x-params-from: hc-lane-core provisional hc-6 params (hivemind 2026-11-22)
-    Res_stack_down:
-      type: object
-      properties:
-        run:
-          $ref: '#/components/schemas/RunId'
-        released:
-          type: array
-          items:
-            type: string
-        kept:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: string
-      x-source: hand
-      x-status: planned
-    Req_stack_status:
-      type: object
-      properties:
-        stack:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-      x-source: hand
-      x-status: planned
-      x-params-from: hc-lane-core provisional hc-6 params (hivemind 2026-11-22)
-    Res_stack_status:
-      type: object
-      properties:
-        runs:
-          type: array
-          items:
-            type: object
-            properties:
-              run:
-                $ref: '#/components/schemas/RunId'
-              stack:
-                type: string
-              instances:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    id:
-                      type: string
-                    refs:
-                      type: integer
-                    healthy?:
-                      type: boolean
-                  x-source: hand
-            x-source: hand
-      x-source: hand
-      x-status: planned
     Req_test:
       type: object
       properties:
@@ -4618,43 +4981,6 @@ components:
             x-source: hand
       x-source: hand
       x-status: planned
-    Req_why:
-      type: object
-      properties:
-        test:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-      required:
-      - test
-      x-source: hand
-      x-status: planned
-      x-params-from: plan step description
-    Res_why:
-      type: object
-      properties:
-        test:
-          type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-        case:
-          type: object
-        spans:
-          type: array
-          items:
-            type: object
-        logs:
-          type: object
-          additionalProperties:
-            type: string
-        plan:
-          type: object
-        bundle:
-          type: string
-        memory-id:
-          type: string
-      x-source: hand
-      x-status: planned
     Req_flaky:
       type: object
       properties:
@@ -4690,62 +5016,6 @@ components:
                 - flaky
                 - regression
                 - stable
-            x-source: hand
-      x-source: hand
-      x-status: planned
-    Req_faults:
-      type: object
-      properties:
-        run:
-          $ref: '#/components/schemas/RunId'
-        consumer:
-          $ref: '#/components/schemas/ConsumerId'
-        capability:
-          $ref: '#/components/schemas/CapabilityId'
-        action:
-          enum:
-          - list
-          - add
-          - remove
-        toxic:
-          type: object
-          properties:
-            type:
-              enum:
-              - latency
-              - bandwidth
-              - timeout
-              - reset_peer
-              - slicer
-              - limit_data
-            attributes:
-              type: object
-            stream:
-              enum:
-              - upstream
-              - downstream
-          x-source: hand
-      x-source: hand
-      x-status: planned
-      x-params-from: plan step description
-    Res_faults:
-      type: object
-      properties:
-        proxies:
-          type: array
-          items:
-            type: object
-            properties:
-              name:
-                type: string
-              listen:
-                type: string
-              upstream:
-                type: string
-              toxics:
-                type: array
-                items:
-                  type: object
             x-source: hand
       x-source: hand
       x-status: planned

@@ -93,7 +93,7 @@
       (testing "a missing param is 400, an unknown target 404, a planned op 501"
         (is (= 400 (:status (post port "ps" {}))))
         (is (= 404 (:status (post port "ps" {"target" "nope/x"}))))
-        (is (= 501 (:status (post port "stack/up" {"stack" "s"})))))
+        (is (= 501 (:status (post port "flaky" {})))))
       (testing "a param of the wrong type is 400, not a throw"
         (is (= 400 (:status (post port "logs" {"target" "dc/envoy" "tail" "many"})))))
       (testing "browser traffic is refused over the wire too"

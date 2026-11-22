@@ -50,7 +50,7 @@ props = tool["inputSchema"]["properties"]
 applies = {}  # command -> [param]
 for p, spec in props.items():
     if p == "command": continue
-    for m in re.finditer(r"\[([a-z|_]+)\]", spec.get("description", "")):
+    for m in re.finditer(r"\[([a-z|_-]+)\]", spec.get("description", "")):
         for c in m.group(1).split("|"):
             applies.setdefault(c, []).append(p)
 req_props = {}
@@ -72,7 +72,8 @@ components["ComposeRequest"] = {
 SUBJECT = ["up", "switch", "down", "stop", "restart", "ps", "logs", "claim", "release"]
 def request_for(cmd):
     ps = sorted(set(applies.get(cmd, [])) | ({"target", "profile"} if cmd in SUBJECT + ["touch"] else set())
-                | ({"agent_id"} if cmd in ("claim", "release") else set()))
+                | ({"agent_id"} if cmd in ("claim", "release") else set())
+                | ({"wait"} if cmd == "stack-up" else set()))  # addon/stack-opts reads wait; its description says [up|switch]
     if not ps:
         return {"type": "object", "additionalProperties": True, "description": "takes no params", "x-source": "generated"}
     s = {"type": "object", "properties": {p: copy.deepcopy(req_props[p]) for p in ps},
@@ -97,16 +98,13 @@ components["ErrorEnvelope"] = obj({
                    "description": "host-side transport failure only (hive_call); absent for compose errors"},
     "hint": S, "message": S}, ["ok", "error"], extra=True,
     desc="hive-cabi/v1 failure envelope. Every other key of the r/err map rides alongside (param, profile, known, stderr ...).")
-components["ErrorCategory"] = {"type": "string", "x-source": "hand", "x-from": "carto structural-grep (r/err ?cat ?&rest) over src/ @ origin/staging",
-  "enum": ["compose/not-initialized", "compose/unknown-command", "compose/missing-param", "compose/invalid-param",
-           "compose/unknown-profile", "compose/unknown-project", "compose/unknown-target", "compose/no-projects",
-           "compose/not-active", "compose/not-claimed", "compose/command-failed", "compose/secret-unresolved",
-           "compose/invalid-config", "compose/program-needs-command", "compose/orphans-hold-resources",
-           "compose/held-by-another-section", "compose/orphan-check-failed", "compose/ownership-check-failed",
-           "compose/release-threw", "compose/notice-failed", "compose/swarm-failed", "compose/notice-dropped",
-           "compose/dispatch-threw", "compose/not-implemented", "compose/unknown-route", "compose/method-not-allowed",
-           "compose/payload-too-large", "compose/forbidden-origin", "compose/unsupported-media-type",
-           "compose/internal", "compose/proc-unreadable", "compose/api-bind-failed", "secrets/unknown-backend"]}
+# Derived, never listed: every literal (r/err :ns/name ..) under src/, the same scan
+# openapi_contract_test runs, so a category added in source shows up here on the next run.
+SRC = HERE.parent.parent.parent / "src"
+CATEGORIES = sorted({c for f in SRC.rglob("*.clj") for c in re.findall(r"\(r/err :([a-z-]+/[a-z-]+)", f.read_text())})
+components["ErrorCategory"] = {"type": "string", "x-source": "generated",
+  "x-from": "every (r/err :ns/name ..) literal under src/ (doc/api/gen/assemble.py); HTTP status per category: hive-compose.api/status-by-category",
+  "enum": CATEGORIES}
 
 # ---------------------------------------------------------------- hand-written response rows
 components["ProgramReport"] = obj({"id": S, "pid": I, "log": S, "dir": S, "kind": S, "started-at": I, "nrepl-port": I,
@@ -193,8 +191,22 @@ RESULT = {"help": "HelpResult", "status": "StatusResult", "targets": "TargetsRes
           "up": "UpResult", "switch": "UpResult", "down": "DownResult", "stop": "DownResult", "restart": "RestartResult",
           "touch": "TouchResult", "ps": "PsResult", "logs": "LogsResult", "claim": "ClaimResult", "release": "ReleaseResult",
           "who": "WhoResult", "nrepl": "NreplResult", "reap": "ReaperPass", "adopt": "AdoptResult",
-          "projects": "ProjectsResult", "reload": "ReloadResult"}
-MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload"}
+          "projects": "ProjectsResult", "reload": "ReloadResult",
+          "faults": "FaultsResult", "stack-up": "StackUpResult", "stack-down": "StackDownResult",
+          "stack-status": "StackStatusResult", "plan": "PlanResult", "why": "WhyResult"}
+# Commands staging added after phase 1 (hc-4/6/10/12). Their result maps are built in
+# pipeline/stacks.clj, pipeline/why.clj and pipeline/faults.clj with no malli schema yet, so
+# they are typed open here rather than hand-copied (NOTES: response shapes drift).
+def open_result(desc): return {"type": "object", "additionalProperties": True, "description": desc, "x-source": "hand"}
+components["FaultsResult"] = open_result("pipeline.faults/faults!: list {proxy-name Proxy}, add the toxic, remove {removed?}, reset {reset true}")
+components["StackUpResult"] = open_result("pipeline.stacks/stack-up!: the run, its instances and consumers")
+components["StackDownResult"] = open_result("pipeline.stacks/stack-down!: what was taken down and what was kept")
+components["StackStatusResult"] = open_result("pipeline.stacks/stack-status: stack runs with their instances' and consumers' containers")
+components["PlanResult"] = open_result("pipeline.stacks/plan: what stack-up would start, share or find running")
+components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
+STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why"}
+MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload",
+           "faults", "stack-up", "stack-down", "why"}
 assert set(RESULT) == set(tool["commands"]), set(tool["commands"]) ^ set(RESULT)
 
 def ok_of(schema_ref):
@@ -217,7 +229,8 @@ for cmd in tool["commands"]:
     rname = "Req_" + cmd
     components[rname] = rq
     op = {"operationId": cmd, "summary": tool["command-help"][cmd].split(".")[0][:110],
-          "description": tool["command-help"][cmd], "tags": ["swarm" if cmd in ("claim", "release", "who", "nrepl") else "sections"],
+          "description": tool["command-help"][cmd],
+          "tags": ["swarm" if cmd in ("claim", "release", "who", "nrepl") else "stacks" if cmd in STACKS else "sections"],
           "x-hive-call-op": cmd, "x-mcp": {"tool": "compose", "command": cmd}, "x-mutates": cmd in MUTATES,
           "requestBody": {"required": False, "content": {"application/json": {"schema": ref(rname)}}},
           "responses": {"200": {"description": "Result ok", "content": {"application/json": {"schema": ok_of(ref(RESULT[cmd]))}}},
@@ -227,53 +240,31 @@ for cmd in tool["commands"]:
                         "500": {"$ref": "#/components/responses/Internal"}}}
     if cmd != "help":  # help answers before init
         op["responses"]["503"] = {"$ref": "#/components/responses/Unavailable"}
-    if cmd in SUBJECT or cmd in ("touch",):
+    if cmd in SUBJECT or cmd in ("touch",) or cmd in STACKS:
         op["responses"]["404"] = {"$ref": "#/components/responses/NotFound"}
-    if cmd in ("up", "switch", "restart", "touch", "release", "claim"):
+    if cmd in ("up", "switch", "restart", "touch", "release", "claim") or cmd in STACKS:
         op["responses"]["409"] = {"$ref": "#/components/responses/Conflict"}
-    if cmd in SUBJECT or cmd in ("targets", "projects", "reload"):
+    if cmd in SUBJECT or cmd in ("targets", "projects", "reload") or cmd in STACKS:
         op["responses"]["502"] = {"$ref": "#/components/responses/EngineFailed"}
     paths["/v1/" + cmd] = {"post": op}
 
 # ---------------------------------------------------------------- planned stack ops (placeholders)
 PLANNED = [
-  ("stack/plan", "stack.plan", "hc-4-stack-plan", "Resolved graph to instances, compose -p names, start order; what is shared, private and already running (terraform-plan style). Lockfile of image digests. Pure, mutates nothing.",
-   {"stack": S},
-   obj({"stack": S, "resolution": ref("Resolution"),
-        "instances": arr(obj({"instance": ref("Instance"), "state": {"enum": ["shared-running", "shared-new", "private-new", "running"]}})),
-        "order": arr(S), "wiring": arr(ref("Wiring")), "lockfile": {"type": "object", "additionalProperties": S}})),
-  ("stack/up", "stack.up", "hc-6-stack-ops", "Bring a stack up over its plan: run id, per-run network, docker labels hive.run/hive.stack, up --wait plus health gating of dependents.",
-   {"stack": S, "run": ref("RunId"), "wait": B},
-   obj({"stack": S, "run": ref("RunId"), "instances": arr(obj({"id": S, "compose-project": S, "started?": B, "healthy?": B})),
-        "wiring": arr(ref("Wiring"))})),
-  ("stack/down", "stack.down", "hc-6-stack-ops", "Release a stack run; instances other stacks still need are spared (refcount). Volumes never removed.",
-   {"stack": S, "run": ref("RunId")},
-   obj({"run": ref("RunId"), "released": arr(S), "kept": {"type": "object", "additionalProperties": arr(S)}})),
-  ("stack/status", "stack.status", "hc-6-stack-ops", "Runs, instances with refcounts, claims and reaper countdown per stack.",
-   {"stack": S, "run": ref("RunId")},
-   obj({"runs": arr(obj({"run": ref("RunId"), "stack": S, "instances": arr(obj({"id": S, "refs": I, "healthy?": B}))}))})),
   ("test", "test", "hc-8-suites", "Expand suites x projects to the minimal union stack, run each runner (container or command) with TRACEPARENT and baggage test.id, collect exit code plus JUnit XML or TAP.",
    {"suites": arr(S), "projects": arr(S), "run": ref("RunId")},
    obj({"run": ref("RunId"), "cells": arr(obj({"suite": S, "project": S, "exit": I, "report": ref("Report")}))})),
-  ("why", "why", "hc-10-why", "Failure bundle for test T: the case, traces carrying test.id (Tempo/ClickHouse behind a port), container logs in its window, the resolved plan; written to the state dir plus a memory note.",
-   {"test": S, "run": ref("RunId")},
-   obj({"test": S, "run": ref("RunId"), "case": {"type": "object"}, "spans": arr({"type": "object"}), "logs": {"type": "object", "additionalProperties": S},
-        "plan": {"type": "object"}, "bundle": S, "memory-id": S})),
   ("flaky", "flaky", "hc-13-flaky", "Rank tests by intermittent failure across runs, so a flake is told apart from a regression.",
    {"suite": S, "limit": I, "since": S},
    obj({"tests": arr(obj({"id": S, "runs": I, "failures": I, "flips": I, "score": N, "verdict": {"enum": ["flaky", "regression", "stable"]}}))})),
-  ("faults", "faults", "hc-12-faults", "Toxiproxy interposed between a consumer and an instance (:needs {\"pg\" {:via :toxiproxy}}): list, add or remove toxics.",
-   {"run": ref("RunId"), "consumer": ref("ConsumerId"), "capability": ref("CapabilityId"),
-    "action": {"enum": ["list", "add", "remove"]}, "toxic": obj({"type": {"enum": ["latency", "bandwidth", "timeout", "reset_peer", "slicer", "limit_data"]}, "attributes": {"type": "object"}, "stream": {"enum": ["upstream", "downstream"]}})},
-   obj({"proxies": arr(obj({"name": S, "listen": S, "upstream": S, "toxics": arr({"type": "object"})}))})),
 ]
+
 components["Report"] = dict(obj({"format": {"enum": ["junit", "tap"]},
     "cases": arr(obj({"case/id": S, "name": S, "classname": S, "status": {"enum": ["passed", "failed", "error", "skipped"]},
                       "time-s": N, "message": S, "output": S}, ["case/id", "name", "status"])),
     "totals": obj({"passed": I, "failed": I, "error": I, "skipped": I})}, ["format", "cases", "totals"],
     desc="hc-8 Report as relayed by hc-lane-core (branch feat/hc8-report, promote/report.clj, uncommitted); hand-copied, regenerate once merged"),
     **{"x-status": "planned"})
-REQ_REQUIRED = {"stack.plan": ["stack"], "stack.up": ["stack"], "stack.down": ["stack", "run"], "why": ["test"]}
+REQ_REQUIRED = {}
 for path, op, card, desc, reqp, res in PLANNED:
     rn = "Req_" + op.replace(".", "_"); vn = "Res_" + op.replace(".", "_")
     components[rn] = dict(obj(reqp, REQ_REQUIRED.get(op, ())), **{"x-status": "planned", "x-params-from": "hc-lane-core provisional hc-6 params (hivemind 2026-11-22)" if op.startswith("stack.") else "plan step description"}); components[vn] = dict(res, **{"x-status": "planned"})
@@ -306,7 +297,8 @@ doc = {
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base",
   "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "0", "description": ":compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)"}}}],
   "tags": [{"name": "sections", "description": "existing section commands"}, {"name": "swarm", "description": "existing claim / nREPL routing commands"},
-           {"name": "stacks (planned)", "description": "hc-4/6/8/10/12/13 placeholders"},
+           {"name": "stacks", "description": "stack runs, fault injection and failure explanation (hc-4/6/10/12)"},
+           {"name": "stacks (planned)", "description": "hc-8/13 placeholders"},
            {"name": "meta", "description": "health and this document"}],
   "security": [],
   "x-trust-model": "No authentication. The server binds a loopback address only and refuses browser traffic (Host must be a loopback name, "

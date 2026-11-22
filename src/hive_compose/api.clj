@@ -33,14 +33,53 @@
 (def planned
   "Path segment -> hive_call op of the paths the spec marks x-status planned
    (plan 20261122140443-09c5c225). Answered 501 until they are implemented."
-  {"stack/plan" "stack.plan" "stack/up" "stack.up" "stack/down" "stack.down"
-   "stack/status" "stack.status" "test" "test" "why" "why" "flaky" "flaky" "faults" "faults"})
+  {"test" "test" "flaky" "flaky"})
 
 (def status-by-category
-  "HTTP status of a Result error category. Any other category answers 500."
+  "HTTP status of a Result error category. Every category the source answers
+   (r/err :ns/name ..) is mapped, which api-test checks against src/; any
+   other answers 500. 400 the request or the stack it names is invalid, 404 a
+   named thing is not there, 409 it conflicts with what runs, 502 a backend
+   (docker, toxiproxy, the trace store) failed, 503 the addon or a backend is
+   not ready or not configured, 500 a fault of the addon itself."
   {:compose/missing-param 400
    :compose/invalid-param 400
+   :compose/invalid-run 400
+   :compose/invalid-stack 400
+   :compose/invalid-version 400
+   :compose/invalid-range 400
+   :compose/invalid-consumer 400
+   :compose/invalid-extra-envs 400
+   :compose/invalid-wiring 400
+   :compose/invalid-resolution 400
+   :compose/inconsistent-resolution 400
+   :compose/unknown-consumer 400
+   :compose/unknown-instance 400
+   :compose/unknown-provider 400
+   :compose/unknown-via 400
+   :compose/dependency-cycle 400
+   :compose/name-collision 400
+   :compose/consumer-name-collision 400
+   :compose/alias-clash 400
+   :compose/alias-shadows-service 400
+   :compose/env-collision 400
+   :compose/otlp-attributes-ref 400
+   :compose/otlp-pair-broken 400
+   :compose/faults-alias-clash 400
+   :compose/faults-port-clash 400
+   :compose/faults-missing-port 400
+   :compose/faults-invalid-toxic 400
+   :compose/faults-unknown-toxic 400
+   :trace/bad-id 400
    :compose/unknown-command 404
+   :compose/unknown-stack 404
+   :compose/unknown-run 404
+   :compose/unknown-test 404
+   :compose/no-runs 404
+   :compose/no-results 404
+   :compose/faults-no-toxiproxy 404
+   :compose/faults-unknown-proxy 404
+   :trace/not-found 404
    :compose/unknown-route 404
    :compose/unknown-profile 404
    :compose/unknown-target 404
@@ -54,12 +93,40 @@
    :compose/not-claimed 409
    :compose/orphans-hold-resources 409
    :compose/held-by-another-section 409
+   :compose/run-exists 409
+   :compose/toxiproxy-proxy-conflict 409
    :compose/not-implemented 501
    :compose/command-failed 502
    :compose/secret-unresolved 502
    :secrets/unknown-backend 502
+   :compose/no-container 502
+   :compose/instance-unhealthy 502
+   :compose/stack-down-incomplete 502
+   :compose/toxiproxy-failed 502
+   :compose/toxiproxy-unreachable 502
+   :trace/unreachable 502
+   :trace/http-error 502
+   :trace/bad-json 502
    :compose/not-initialized 503
-   :compose/invalid-config 503})
+   :compose/invalid-config 503
+   :compose/no-compose-file 503
+   :compose/program-needs-command 503
+   :compose/stacks-unsupported 503
+   :compose/no-trace-query 503
+   :compose/instance-not-ready 503
+   :trace/not-ready 503
+   :compose/dispatch-threw 500
+   :compose/internal 500
+   :compose/invalid-result 500
+   :compose/release-threw 500
+   :compose/note-failed 500
+   :compose/notice-failed 500
+   :compose/notice-dropped 500
+   :compose/swarm-failed 500
+   :compose/orphan-check-failed 500
+   :compose/ownership-check-failed 500
+   :compose/proc-unreadable 500
+   :compose/api-bind-failed 500})
 
 (defn http-status
   "200 for an ok Result, else the status of its category (500 when unmapped)."
