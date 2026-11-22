@@ -97,7 +97,7 @@
              (update-vals (stub/networks (e c)) :members)))
       (is (= {"hive.run" run "hive.stack" "shop"} (get-in (stub/networks (e c)) ["hive-shop000001-shop" :labels]))))
     (testing "persisted additively"
-      (is (= #{:active :current :stacks} (set (keys @(:saved c)))))
+      (is (= #{:active :current :stacks :preexisting} (set (keys @(:saved c)))))
       (is (= :up (get-in @(:saved c) [:stacks run :status]))))))
 
 (deftest a-consumer-waits-for-a-healthy-instance
@@ -158,6 +158,42 @@
     (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")))
     (is (= {"kafka" [[:preexisting]] "zookeeper" [[:preexisting]]}
            (get-in down [:ok :runs 0 :kept 0 :kept])))))
+
+(deftest preexistence-is-global-and-never-cleared
+  (let [c (ctx {"kafka" #{"kafka" "zookeeper"}})
+        a (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])
+        b (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]
+    (is (= {"kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))))
+    (is (not (contains? (get-in @(:state c) [:stacks a]) :preexisting)) "never carried in a run entry")
+    (stacks/stack-down! c {:run a})
+    (stacks/stack-down! c {:run b})
+    (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "the last run to leave spares it too")
+    (is (= {"kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))) "the mark stays")
+    (let [r3 (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
+      (stacks/stack-down! c {:run r3})
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka"))))))
+
+(deftest two-instances-of-one-provider-sharing-a-dependency
+  ;; kafka and schema-registry both from project "kafka", both needing zookeeper;
+  ;; zookeeper ran before any run, kafka and registry did not
+  (let [projects' (-> projects
+                      (assoc-in ["kafka" :project/provides "registry"] {:service "registry" :version "7.6"})
+                      (assoc-in ["billing" :project/needs "registry"] {})
+                      (assoc-in ["shop" :project/needs "registry"] {}))
+        world' (assoc world "kafka" {"kafka" {:deps ["zookeeper"]} "registry" {:deps ["zookeeper"]} "zookeeper" {}})
+        c (assoc (ctx {"kafka" #{"zookeeper"}})
+                 :engine (stub/engine {} {"kafka" #{"zookeeper"}} world')
+                 :settings (assoc (settings all-stacks) :compose/projects projects'))
+        a (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])
+        b (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]
+    (is (and a b))
+    (is (= {"kafka" #{"zookeeper"}} (:preexisting @(:state c)))
+        "only the world's zookeeper is marked; b's probe saw a's kafka and registry, held by a")
+    (stacks/stack-down! c {:run a})
+    (is (= #{"kafka" "registry" "zookeeper"} (stub/running (e c) "kafka")) "b still binds both")
+    (stacks/stack-down! c {:run b})
+    (is (= #{"zookeeper"} (stub/running (e c) "kafka"))
+        "the last run releases what the runs started and spares the preexisting zookeeper")))
 
 (deftest down-spares-what-an-active-section-needs
   (let [c (ctx)

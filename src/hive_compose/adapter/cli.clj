@@ -83,8 +83,17 @@
       (into (if recreate? ["up" "-d" "--force-recreate" "--no-deps"] ["restart"]))
       (into services)))
 
-(defn logs-argv [p services tail]
-  (-> (base-argv p) (into ["logs" "--no-color" "--tail" (str tail)]) (into services)))
+(defn logs-argv
+  "`compose logs` of `services` (all when empty), the last `tail` lines each;
+   with `:profile/timestamps?` every line carries docker's RFC 3339 time, so
+   a time window can be cut from it (hc-10 why)."
+  [p services tail]
+  (-> (base-argv p)
+      (into ["logs" "--no-color" "--tail" (str tail)])
+      (cond-> (:profile/timestamps? p) (conj "--timestamps"))
+      (cond-> (:profile/since p) (into ["--since" (str (:profile/since p))]))
+      (cond-> (:profile/until p) (into ["--until" (str (:profile/until p))]))
+      (into services)))
 
 (defn containers-argv
   "Every container of `p`'s compose project, running or not, found by its
@@ -624,22 +633,32 @@
   "The files compose reads when given no -f, in its own order."
   ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
 
+(defn default-file
+  "The first of `compose-default-files` for which `exists?` is true, in
+   compose's own order; nil when none. Pure over the probe."
+  [exists?]
+  (first (filter exists? compose-default-files)))
+
 (defn- with-default-files
-  "`spec` naming its project's default compose file when it names none: an
-   override passed as `-f` replaces compose's default lookup, so the base file
-   must then be named too."
+  "Result<spec>: `spec` naming its project's default compose file when it
+   names none. An override passed as `-f` replaces compose's default lookup,
+   so the base file must be named before it; a project dir holding none of
+   `compose-default-files` is :compose/no-compose-file. The file probe is
+   here, at the boundary; `project-argv` stays pure."
   [spec]
   (if (or (seq (:files spec)) (nil? (:dir spec)))
-    spec
-    (if-let [f (first (filter #(.exists (io/file (:dir spec) %)) compose-default-files))]
-      (assoc spec :files [f])
-      spec)))
+    (r/ok spec)
+    (if-let [f (default-file #(.exists (io/file (:dir spec) %)))]
+      (r/ok (assoc spec :files [f]))
+      (r/err :compose/no-compose-file
+             {:project (:project spec) :dir (:dir spec) :looked-for compose-default-files
+              :hint "set :project/files, or add a compose file to the project dir"}))))
 
 (defn- stack-up!
   [{:keys [exec resolver up-timeout-ms override-dir]} spec]
   (if (empty? (:services spec))
     (r/ok {:out "" :skipped :no-services})
-    (r/let-ok [spec (r/ok (cond-> spec (override? spec) with-default-files))
+    (r/let-ok [spec (if (override? spec) (with-default-files spec) (r/ok spec))
                override (write-override! override-dir spec)
                resolved (secrets/resolve-env resolver (:env spec))]
       (let [declared (:env spec)
@@ -654,7 +673,8 @@
     (r/ok {:out "" :skipped :no-services})
     (let [override (let [p (override-path override-dir (:project spec))]
                      (when (.exists (io/file p)) p))
-          spec (cond-> spec override with-default-files)]
+          ;; a base file that has since gone still lets the down run on the override
+          spec (if override (let [x (with-default-files spec)] (if (r/ok? x) (:ok x) spec)) spec)]
       (r/map-ok (run exec {:profile/dir (:dir spec)} (down-project-argv spec override) timeout-ms
                      (env/rendered (:env spec)) identity)
                 (fn [out] {:out (clip out)})))))

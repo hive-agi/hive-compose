@@ -22,6 +22,7 @@
    Every created network and every container a stack run creates under a
    run-scoped compose project carries hive.run. No IO."
   (:require [clojure.string :as str]
+            [hive-compose.promote.otel :as otel]
             [hive-compose.promote.resources :as res]
             [hive-compose.promote.stack :as stack]
             [hive-compose.schema :as schema]))
@@ -167,6 +168,32 @@
     (cond-> (update step :services #(vec (remove pre %)))
       (seq spared) (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:preexisting]]])) spared))))
 
+(defn stack-needs-per-consumer
+  "{consumer Needs}: the stack's own `:stack/needs` as extra needs of each of
+   its container consumers, so a capability the stack needs (otel) is bound
+   by every consumer and joins every view network. Empty when the stack
+   needs nothing."
+  [stack]
+  (if-let [needs (not-empty (:stack/needs stack))]
+    (into {} (for [c (:stack/consumers stack) :when (container-consumer? c)] [c needs]))
+    {}))
+
+(def otel-capability "otel")
+
+(defn otlp-envs
+  "The extra-envs-fn for `promote.wiring/wirings`: a consumer bound to an
+   `otel` instance in `resolution` gets the OTLP env (endpoint on its view
+   network: `http://<alias>:4317`, the bound instance's first alias, which
+   is the name it joins that network under; with its protocol as a pair,
+   service name and hive.run.id). A consumer bound to none gets nothing: no
+   endpoint nobody answers."
+  [resolution run]
+  (fn [consumer]
+    (when-let [iid (get-in resolution [:resolution/bindings consumer otel-capability])]
+      (let [alias (or (first (get-in resolution [:resolution/instances iid :instance/aliases])) otel/service)]
+        [(otel/otlp-env {:run-id run :service (schema/slug consumer)
+                         :endpoint (str "http://" alias ":" (:otlp-grpc otel/ports))})]))))
+
 (defn without-provided
   "`services` of a consumer minus what its own provided instances (`ips`,
    hc-4 `:consumer/provider-of`) run, their depends_on closures included: a
@@ -186,6 +213,34 @@
     (cond-> step
       (seq spared) (-> (update :services #(vec (remove h %)))
                        (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:stack]]])) spared)))))
+
+(defn mark-preexisting
+  "Preexistence marks ({provider-project #{service}}) after a run found
+   `running` ({provider-project #{service}}: what of its shared instances'
+   footprints ran before it started). A running service is the world's, and
+   marked, unless another live run's instance holds it (`runs`, {run
+   StackPlan}, this run excluded; the last of them releases it) or an active
+   section holds it (`section-held`, {compose-project #{service}}, which
+   keeps and releases it). Shared instances run under their provider's
+   compose project, so `running` keys are both provider and compose project.
+   Marks only grow: a mark is never cleared, so whichever run leaves last
+   never removes what ran before the runs. Pure; computed against the state
+   current inside the swap, so concurrent runs cannot race it."
+  [marks running runs run section-held]
+  (let [others (held-by-others runs run)]
+    (reduce-kv (fn [m provider svcs]
+                 (let [fresh (remove #(or (others [provider %])
+                                          (contains? (get section-held provider #{}) %))
+                                     svcs)]
+                   (cond-> m (seq fresh) (update provider (fnil into (sorted-set)) fresh))))
+               (or marks {})
+               running)))
+
+(defn preexisting-of
+  "[service] marked preexisting for the provider project of release `step`
+   ({:project ..}): every down step spares them, whichever instance or run."
+  [marks step]
+  (seq (get marks (:project step))))
 
 (defn whole-project?
   "True when release `step` of a private instance takes its whole compose
