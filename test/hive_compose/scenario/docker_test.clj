@@ -165,8 +165,17 @@
    "b" {:stack/id "b" :stack/consumers ["b"]}
    "c" {:stack/id "c" :stack/consumers ["c"]}})
 
+(def ^:dynamic *explicit-files?*
+  "Give every project :project/files [\"compose.yml\"]. Without it the CLI
+   engine's stack override becomes the ONLY -f, and compose no longer reads
+   the project's compose.yml (finding s0)."
+  true)
+
 (defn- ctx [projects stacks-map]
-  (let [state-dir (str (java.nio.file.Files/createTempDirectory "hcv-state" (make-array java.nio.file.attribute.FileAttribute 0)))]
+  (let [projects (if *explicit-files?*
+                   (update-vals projects #(assoc % :project/files ["compose.yml"]))
+                   projects)
+        state-dir (str (java.nio.file.Files/createTempDirectory "hcv-state" (make-array java.nio.file.attribute.FileAttribute 0)))]
     {:engine (cli/make-engine {:compose/stack-dir (str state-dir "/stacks") :compose/resolver stub-resolver})
      :settings {:compose/default-ttl-minutes 60 :compose/default-idle-action :stop
                 :compose/up-timeout-ms 180000 :compose/profiles {}
@@ -381,3 +390,18 @@
       (is (r/ok? (stacks/stack-down! c {:run r1})))
       (is (r/ok? (stacks/stack-down! c {:run r2})))
       (finally (cleanup! c [r1 r2])))))
+
+(deftest ^:integration s0-docker-a-project-without-files-runs
+  "CLAIM (docker, repro for hc-6): a consumer project configured with only
+   :project/dir (no :project/files), as most configs are, comes up in a
+   stack. FAILS on 689dc10: the CLI engine passes the generated override as
+   the ONLY -f, so compose stops reading the project's compose.yml and
+   refuses 'service app has neither an image nor a build context'."
+  (binding [*explicit-files?* false]
+    (let [st (stamp) {:keys [projects]} (world st) run (str "s0" st) c (ctx projects stack-defs)]
+      (try
+        (let [up (stacks/stack-up! c {:stack "a" :run run})]
+          (evidence! :s0 {:error (:error up) :stderr (:stderr up) :argv (:argv up)})
+          (is (r/ok? up) (pr-str (select-keys up [:error :stderr :argv]))))
+        (stacks/stack-down! c {:run run})
+        (finally (cleanup! c [run]))))))
