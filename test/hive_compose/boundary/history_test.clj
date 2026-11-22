@@ -35,12 +35,12 @@
   (let [path (str (temp-dir) "/flake-history.ednl")
         h (history/file-history path)]
     (port/-append! h [(row "run-1" "s/a" :passed)])
-    (spit path "{:run/id \"run-2\" :case/id" :append true)
-    (testing "a later append after a torn line still reads"
-      (spit path "\n" :append true)
-      (port/-append! h [(row "run-3" "s/a" :passed)]))
+    (testing "a crash mid-write leaves a torn last line with no newline"
+      (spit path "{:run/id \"run-2\" :case/id" :append true))
+    (port/-append! h [(row "run-3" "s/a" :passed) (row "run-3" "s/b" :passed)])
     (let [res (port/-history h {})]
-      (is (= ["run-1" "run-3"] (mapv :run/id (:ok res))))
+      (is (= ["run-1" "run-3" "run-3"] (mapv :run/id (:ok res)))
+          "the next append starts on a fresh line, so none of its rows is lost")
       (is (= 1 (:skipped (meta (:ok res))))))))
 
 (deftest concurrent-appends-lose-no-row

@@ -288,7 +288,10 @@
         "flaky" (flaky/flaky ctx
                              {:suite (some-> (param params "suite") str)
                               :project (some-> (param params "project") str)}
-                             (or (some-> (param params "limit") long) 20))
+                             (let [l (param params "limit")]
+                               (cond (number? l) (long l)
+                                     (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
+                                     :else 20)))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
                                          :hint "command=help lists what each does"})))))

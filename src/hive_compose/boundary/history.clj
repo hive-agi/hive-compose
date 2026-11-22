@@ -13,7 +13,7 @@
             [hive-compose.port :as port]
             [hive-compose.promote.flaky :as flaky]
             [hive-dsl.result :as r])
-  (:import (java.io FileOutputStream)
+  (:import (java.io RandomAccessFile)
            (java.nio.charset StandardCharsets)))
 
 ;; SPDX-License-Identifier: MIT
@@ -26,21 +26,28 @@
 
 (defn append-rows!
   "Append `rows` to the EDN-lines file at `path`, creating it and its
-   directory when absent. Result<{:appended n}>."
+   directory when absent. When the file does not end in a newline (a torn
+   last line), one is written first, so the torn line stays alone and the
+   new rows read. Result<{:appended n}>."
   [path rows]
   (if (empty? rows)
     (r/ok {:appended 0})
     (r/try-effect* :compose/history-unwritable
-      (let [f (io/file path)
-            bytes (.getBytes (str (str/join "\n" (map line rows)) "\n") StandardCharsets/UTF_8)]
+      (let [f (.getCanonicalFile (io/file path))
+            body (str (str/join "\n" (map line rows)) "\n")]
         (io/make-parents f)
-        (locking (.intern (str path))
-          (with-open [out (FileOutputStream. f true)]
-            (let [ch (.getChannel out)
+        (locking (.intern (str f))
+          (with-open [raf (RandomAccessFile. f "rw")]
+            (let [ch (.getChannel raf)
                   lock (.lock ch)]
               (try
-                (.write out bytes)
-                (.force ch true)
+                (let [size (.size ch)
+                      torn? (and (pos? size)
+                                 (do (.seek raf (dec size)) (not= 10 (.read raf))))
+                      bytes (.getBytes (str (when torn? "\n") body) StandardCharsets/UTF_8)]
+                  (.seek raf size)
+                  (.write raf bytes)
+                  (.force ch true))
                 (finally (.release lock))))))
         {:appended (count rows)}))))
 

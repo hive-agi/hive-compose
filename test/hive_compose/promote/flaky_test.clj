@@ -18,7 +18,7 @@
   ([trend] (rows "c1" trend))
   ([case-id trend]
    (vec (map-indexed (fn [i ch]
-                       {:run/id (format "run-%04d" i)
+                       {:run/id (format "run%04d" i)
                         :suite/id "s"
                         :project "p"
                         :case/id (str "s/" case-id)
@@ -61,7 +61,7 @@
                (assoc-in [3 :run/sha] "bbb222"))
         r (flaky/case-report cfg rs)]
     (is (= :regression (:class r)))
-    (is (= {:run "run-0003" :at 4000 :status :failed :sha "bbb222"} (:since r)))
+    (is (= {:run "run0003" :at 4000 :status :failed :sha "bbb222"} (:since r)))
     (is (= "aaa111" (get-in r [:last-pass :sha])))
     (is (= 3 (:passes r)))
     (is (= 3 (:fails r)))
@@ -79,7 +79,13 @@
 (deftest a-run-recorded-twice-counts-once
   (let [rs (rows "PFP")
         r (flaky/case-report cfg (into rs rs))]
-    (is (= 3 (:runs r)))))
+    (is (= 3 (:runs r))))
+  (testing "recording a run again later never moves it in run order, and keeps its worst row"
+    (let [rs (rows "PPPFFF")
+          again (assoc (first rs) :at 99000 :case/status :failed)
+          r (flaky/case-report cfg (conj rs again))]
+      (is (= 6 (:runs r)))
+      (is (= "FPPFFF" (get-in r [:window :trend])) "run0000 still sits first, now with its worst row"))))
 
 (deftest rank-puts-flaky-first-and-filters-by-suite-and-project
   (let [all (concat (rows "steady" "PPPPPP")
@@ -97,25 +103,31 @@
     (is (= 4 (count (flaky/rank cfg (flaky/matching {:project "p"} all)))))))
 
 (deftest run-outcomes-reads-the-hc8-run-result
-  (let [run {:run/id "r-001" :suite/id :api :project "shop" :exit 1 :run/sha "deadbeef"
+  (let [run {:run/id "r001" :suite/id :api :project "shop" :exit 1 :run/sha "deadbeef"
              :report {:report/format :junit
                       :report/cases [{:case/id "api/Login.ok" :case/name "ok" :case/classname "Login"
                                       :case/status :passed :case/time-s 0.25}
                                      {:case/id "api/Login.bad" :case/status "failed"
                                       :case/time-s nil :case/message "boom"}]
                       :report/totals {:passed 1 :failed 1}}}
+        base {:run/id "r001" :suite/id "api" :project "shop" :run/sha "deadbeef" :at 42}
         out (flaky/run-outcomes run 42)]
-    (is (= [{:run/id "r-001" :suite/id "api" :project "shop" :run/sha "deadbeef" :at 42
-             :case/id "api/Login.ok" :case/status :passed :case/time-s 0.25}
-            {:run/id "r-001" :suite/id "api" :project "shop" :run/sha "deadbeef" :at 42
-             :case/id "api/Login.bad" :case/status :failed}]
-           out))
+    (is (= [(assoc base :case/id "api/Login.ok" :case/status :passed :case/time-s 0.25)
+            (assoc base :case/id "api/Login.bad" :case/status :failed)
+            (assoc base :case/id "api/(run)" :case/status :passed)]
+           out)
+        "the runner wrote its report: its own row passes, the cases carry the verdict")
     (is (every? #(nil? (schema/explain schema/CaseOutcome %)) out)))
   (testing "a runner dying before its report is one :error row"
-    (is (= [{:run/id "r-002" :suite/id "api" :at 7 :case/id "api/(run)" :case/status :error}]
-           (flaky/run-outcomes {:run/id "r-002" :suite/id "api" :exit 137 :report nil} 7))))
-  (testing "a clean run with no case records nothing"
-    (is (= [] (flaky/run-outcomes {:run/id "r-003" :suite/id "api" :exit 0} 7)))))
+    (is (= [{:run/id "r002" :suite/id "api" :at 7 :case/id "api/(run)" :case/status :error}]
+           (flaky/run-outcomes {:run/id "r002" :suite/id "api" :exit 137 :report nil} 7))))
+  (testing "a runner that died and then recovers reads :fixed, not a regression forever"
+    (let [runs (concat (for [i (range 3)] {:run/id (str "die" i) :suite/id "api" :exit 1 :run/at i})
+                       (for [i (range 3 6)] {:run/id (str "ok" i) :suite/id "api" :exit 0 :run/at i}))
+          rows (mapcat #(flaky/run-outcomes % 0) runs)]
+      (is (= :fixed (:class (flaky/case-report cfg rows))))))
+  (testing "a run with no case and no exit code records nothing"
+    (is (= [] (flaky/run-outcomes {:run/id "r003" :suite/id "api"} 7)))))
 
 ;; ---------------------------------------------------------------------------
 ;; properties
@@ -131,7 +143,7 @@
             statuses (gen/vector (gen/vector gen-status (count cases)) n)]
     (vec (for [i (range n)
                [j c] (map-indexed vector (distinct cases))]
-           {:run/id (format "run-%04d" i)
+           {:run/id (format "run%04d" i)
             :suite/id "s"
             :case/id c
             :case/status (get-in statuses [i j] :passed)
@@ -165,4 +177,4 @@
     (let [r (flaky/case-report cfg (rows (str (apply str (repeat passes "P"))
                                               (apply str (repeat fails "F")))))]
       (and (= :regression (:class r))
-           (= (format "run-%04d" passes) (get-in r [:since :run]))))))
+           (= (format "run%04d" passes) (get-in r [:since :run]))))))

@@ -14,7 +14,7 @@
       :settings (cond-> {} flaky-cfg (assoc :compose/flaky flaky-cfg))})))
 
 (defn- run [i statuses]
-  {:run/id (format "run-%03d" i)
+  {:run/id (format "run%03d" i)
    :suite/id "api"
    :project "shop"
    :exit (if (some #{:failed} (vals statuses)) 1 0)
@@ -26,17 +26,19 @@
   (let [h (stub/history)
         c (ctx h)]
     (doseq [[i s] (map-indexed vector [:passed :failed :passed :failed :passed :failed])]
-      (is (= 2 (:appended (:ok (sut/record-run! c (run i {"flap" s "steady" :passed})))))))
-    (is (= 12 (count (stub/rows h))))
+      (is (= 3 (:appended (:ok (sut/record-run! c (run i {"flap" s "steady" :passed})))))
+          "two cases plus the runner's own (run) row"))
+    (is (= 18 (count (stub/rows h))))
     (let [res (:ok (sut/flaky c {:suite "api" :project "shop"} 20))]
-      (is (= ["api/T.flap" "api/T.steady"] (mapv :case (:cases res))))
-      (is (= {:flaky 1 :stable 1} (:classes res)))
-      (is (= 2 (:total res)))
+      (is (= "api/T.flap" (:case (first (:cases res)))))
+      (is (= #{"api/T.flap" "api/T.steady" "api/(run)"} (set (map :case (:cases res)))))
+      (is (= {:flaky 1 :stable 2} (:classes res)))
+      (is (= 3 (:total res)))
       (is (= 20 (get-in res [:config :window]))))
     (testing "limit cuts the ranking, not the totals"
       (let [res (:ok (sut/flaky c {} 1))]
         (is (= 1 (count (:cases res))))
-        (is (= 2 (:total res)))))
+        (is (= 3 (:total res)))))
     (testing "another project has no history yet"
       (is (string? (:note (:ok (sut/flaky c {:project "blog"} 20))))))))
 

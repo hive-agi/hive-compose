@@ -60,10 +60,11 @@
                :report/cases [{:case/id \"<suite>/<classname>.<name>\"
                                :case/status :passed|:failed|:error|:skipped
                                :case/time-s seconds-or-nil ..} ..]}}
-   Only the keys above are read. A run whose report holds no case but whose
-   runner exited non-zero yields one :error row for the case
-   `<suite>/(run)`, so a runner that dies before writing its report still
-   shows in the history."
+   Only the keys above are read. One row per case, plus one for the runner
+   itself, case `<suite>/(run)`: :error when it exited non-zero with no case
+   in its report (it died before writing it), else :passed. So a runner that
+   dies shows in the history, and one that recovers reads :fixed instead of
+   staying a regression. A run with no case and no exit code records nothing."
   [run at]
   (let [suite (id-str (:suite/id run))
         base (cond-> {:run/id (id-str (:run/id run))
@@ -72,20 +73,17 @@
                (some? (:project run)) (assoc :project (id-str (:project run)))
                (some? (:run/sha run)) (assoc :run/sha (str (:run/sha run))))
         cases (get-in run [:report :report/cases])
-        exit (:exit run)]
-    (cond
-      (seq cases)
-      (mapv (fn [c]
-              (cond-> (assoc base
-                             :case/id (id-str (:case/id c))
-                             :case/status (keyword (:case/status c)))
-                (some? (:case/time-s c)) (assoc :case/time-s (:case/time-s c))))
-            cases)
-
-      (and (number? exit) (not (zero? exit)))
-      [(assoc base :case/id (str suite "/(run)") :case/status :error)]
-
-      :else [])))
+        exit (:exit run)
+        died? (and (number? exit) (not (zero? exit)) (empty? cases))
+        runner (assoc base :case/id (str suite "/(run)")
+                      :case/status (if died? :error :passed))]
+    (cond-> (mapv (fn [c]
+                    (cond-> (assoc base
+                                   :case/id (id-str (:case/id c))
+                                   :case/status (keyword (:case/status c)))
+                      (some? (:case/time-s c)) (assoc :case/time-s (:case/time-s c))))
+                  cases)
+      (or (seq cases) (number? exit)) (conj runner))))
 
 ;; ---------------------------------------------------------------------------
 ;; one case
@@ -101,15 +99,18 @@
   "A total order over the rows of one run, so which one is kept never depends
    on the order they arrived in."
   [row]
-  [(:at row) (status-rank (:case/status row) -1) (pr-str (into (sorted-map) row))])
+  [(status-rank (:case/status row) -1) (pr-str (into (sorted-map) row))])
 
 (defn ordered
-  "The rows of one case in run order, one per run: of the rows a run holds the
-   latest (then the worst) is kept."
+  "The rows of one case in run order, one per run. A run recorded more than
+   once keeps its worst row (:error > :failed > :passed > :skipped) at the
+   earliest time it was recorded, so recording a run again never moves it
+   in run order."
   [rows]
   (->> (group-by :run/id rows)
        vals
-       (map #(last (sort-by tie-break %)))
+       (map (fn [rs]
+              (assoc (last (sort-by tie-break rs)) :at (apply min (map :at rs)))))
        (sort-by (juxt :at :run/id))))
 
 (defn- verdict [status]

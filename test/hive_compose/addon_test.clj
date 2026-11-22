@@ -90,13 +90,13 @@
     (addon/initialize! a {})
     (try
       (doseq [[i s] (map-indexed vector [:passed :failed :passed :failed])]
-        (is (= 1 (:appended (:ok (record! {:run/id (str "run-" i) :suite/id "api" :project "shop"
+        (is (= 2 (:appended (:ok (record! {:run/id (str "run" i) :suite/id "api" :project "shop"
                                            :exit 0
                                            :report {:report/cases [{:case/id "api/T.flap" :case/status s}]}}))))))
       (is (.exists (io/file dir "flake-history.ednl")) "the history lives beside the state file")
       (let [{:keys [error? body]} (call a {"command" "flaky" "suite" "api" "limit" 5})]
         (is (not error?))
-        (is (= ["api/T.flap"] (mapv :case (:cases body))))
+        (is (= ["api/T.flap" "api/(run)"] (mapv :case (:cases body))))
         (is (= "flaky" (:class (first (:cases body))))))
       (is (= 0 (:total (:body (call a {"command" "flaky" "project" "blog"})))))
       (finally (addon/shutdown! a)))))

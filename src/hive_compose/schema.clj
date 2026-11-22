@@ -144,9 +144,10 @@
   [:enum :passed :failed :error :skipped])
 
 (def RunIdLocal
-  "A run id. The same rule as hc-2's RunId (kept local so flake history does
-   not depend on that branch; reconcile by pointing this at schema/RunId)."
-  [:re #"^[a-z0-9][a-z0-9-]{2,39}$"])
+  "A run id: hc-2's RunId rule (PR #37), copied so flake history does not
+   depend on that branch.
+   TODO(hc-2): once #37 lands, replace this with schema/RunId."
+  [:re #"^[a-z0-9]{3,40}\z"])
 
 (def CaseOutcome
   "One row of flake history: how case `:case/id` of suite `:suite/id` ended in
