@@ -8,7 +8,10 @@
             [clojure.test :refer [deftest is testing]]
             [hive-compose.boundary.runs :as runs]
             [hive-compose.pipeline.why :as sut]
+            [hive-compose.port :as port]
+            [hive-compose.promote.suite :as suite]
             [hive-compose.stub :as stub]
+            [hive-compose.stub-runner :as stub-runner]
             [hive-compose.stub-trace :as stub-trace]
             [hive-dsl.result :as r]))
 
@@ -162,6 +165,36 @@
     (let [res (sut/why! (ctx dir "run1") {:test "nope"})]
       (is (= :compose/unknown-test (:error res)))
       (is (= ["orders-suite/orders/orders-suite/orders.place_boom_order"] (:known res))))))
+
+(deftest why-names-the-oom-killed-runner-and-its-cap
+  (let [dir (temp-dir)
+        suites {"hog-suite" {:suite/id "hog-suite" :suite/image "hive-compose-e2e/hog:dev"
+                             :suite/resources {:mem "256m"}}}
+        ids (atom 0)
+        spec (:ok (suite/runner-spec {:suites suites :run "run1" :state-dir dir
+                                      :id-source (fn [n] (format (str "%0" (* 2 n) "x") (swap! ids inc)))}
+                                     {:suite/id "hog-suite" :project "w"}))
+        runner (stub-runner/capped-suite-runner {"hog-suite/w" {:peak-mem (* 512 1024 1024)}})
+        answer (port/-run! runner spec)
+        cell (suite/cell-result "run1" (:cell spec)
+                                (suite/runner-outcome (:ok answer) (r/err :report/none {:dir (:reports-dir spec)})))]
+    (testing "the capped cell is OOM-killed and its result carries the finding"
+      (is (= {:mem "256m"} (:resources spec)) "the suite's cap reaches the runner spec")
+      (is (= 137 (:exit cell)))
+      (is (= :error (:status cell)))
+      (is (= "hog-suite/w OOM-killed at 256m" (get-in cell [:oom :oom/line])))
+      (is (= "hog-suite/w OOM-killed at 256m"
+             (get-in (suite/matrix-summary [cell]) [:failures 0 :oom/line]))))
+    (is (r/ok? (runs/write-result! dir cell)) "the codec keeps :oom")
+    (is (= (:oom cell) (:oom (first (:results (runs/read-results dir "run1"))))))
+    (let [res (sut/why! (ctx dir "run1" :traces []) {:test "hog-suite/w"})
+          b (:ok res)]
+      (is (r/ok? res) (pr-str res))
+      (is (= "hog-suite/w OOM-killed at 256m" (get-in b [:why/cell :oom/line])))
+      (is (= (* 256 1024 1024) (get-in b [:why/cell :oom/cap])))
+      (is (str/includes? (:why/summary b) "hog-suite/w OOM-killed at 256m") (:why/summary b))
+      (is (str/includes? (:why/markdown b) "hog-suite/w OOM-killed at 256m"))
+      (is (str/includes? (slurp (get-in b [:why/files :md])) "OOM-killed at 256m")))))
 
 (deftest why-without-traces-or-results
   (let [dir (temp-dir)]
