@@ -139,6 +139,13 @@
   (-health [q]
     "Result<{:ready? true}>: the trace store answers, or why it does not."))
 
+(defprotocol IHostMemory
+  "The host's memory, so a stack plan can be admitted against what is free
+   and the reaper can relieve pressure (hc-16a). Stubbed in tests."
+  (-mem-available [m]
+    "Result<long>: MemAvailable in bytes (Linux /proc/meminfo), or why it
+     cannot be read. Never a throw."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
