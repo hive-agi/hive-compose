@@ -157,13 +157,16 @@
 (defn otlp-envs
   "The extra-envs-fn for `promote.wiring/wirings`: a consumer bound to an
    `otel` instance in `resolution` gets the OTLP env (endpoint on its view
-   network, `http://otel:4317`, with its protocol as a pair, service name and
-   hive.run.id). A consumer bound to none gets nothing: no endpoint nobody
-   answers."
+   network: `http://<alias>:4317`, the bound instance's first alias, which
+   is the name it joins that network under; with its protocol as a pair,
+   service name and hive.run.id). A consumer bound to none gets nothing: no
+   endpoint nobody answers."
   [resolution run]
   (fn [consumer]
-    (when (get-in resolution [:resolution/bindings consumer otel-capability])
-      [(otel/otlp-env {:run-id run :service (schema/slug consumer)})])))
+    (when-let [iid (get-in resolution [:resolution/bindings consumer otel-capability])]
+      (let [alias (or (first (get-in resolution [:resolution/instances iid :instance/aliases])) otel/service)]
+        [(otel/otlp-env {:run-id run :service (schema/slug consumer)
+                         :endpoint (str "http://" alias ":" (:otlp-grpc otel/ports))})]))))
 
 (defn without-provided
   "`services` of a consumer minus what its own provided instances (`ips`,
@@ -185,31 +188,33 @@
       (seq spared) (-> (update :services #(vec (remove h %)))
                        (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:stack]]])) spared)))))
 
-(defn preexisting-key
-  "The global preexistence key of instance plan `ip`: its provider project
-   and its service, `<provider>/<service>` (\"infra/kafka\")."
-  [ip]
-  (str (:instance/provider ip) "/" (:instance/service ip)))
-
 (defn mark-preexisting
-  "`marks` ({\"<provider>/<service>\" #{service}}) with each instance of
-   `instances` ({id ip}) that `pre` ({instance-id [service]}) found running
-   outside every run marked. Marks only grow: a mark is never cleared, so
-   whichever run leaves last never removes what ran before the runs."
-  [marks instances pre]
-  (reduce (fn [m [iid svcs]]
-            (if-let [ip (get instances iid)]
-              (update m (preexisting-key ip) (fnil into (sorted-set)) svcs)
-              m))
-          (or marks {})
-          pre))
+  "Preexistence marks ({provider-project #{service}}) after a run found
+   `running` ({provider-project #{service}}: what of its shared instances'
+   footprints ran before it started). A running service is the world's, and
+   marked, unless another live run's instance holds it (`runs`, {run
+   StackPlan}, this run excluded; the last of them releases it) or an active
+   section holds it (`section-held`, {compose-project #{service}}, which
+   keeps and releases it). Shared instances run under their provider's
+   compose project, so `running` keys are both provider and compose project.
+   Marks only grow: a mark is never cleared, so whichever run leaves last
+   never removes what ran before the runs. Pure; computed against the state
+   current inside the swap, so concurrent runs cannot race it."
+  [marks running runs run section-held]
+  (let [others (held-by-others runs run)]
+    (reduce-kv (fn [m provider svcs]
+                 (let [fresh (remove #(or (others [provider %])
+                                          (contains? (get section-held provider #{}) %))
+                                     svcs)]
+                   (cond-> m (seq fresh) (update provider (fnil into (sorted-set)) fresh))))
+               (or marks {})
+               running)))
 
 (defn preexisting-of
-  "[service] of instance plan `ip` marked preexisting in `marks`; nil for a
-   private instance (its compose project is the run's own)."
-  [marks ip]
-  (when (and ip (:instance/share? ip))
-    (seq (get marks (preexisting-key ip)))))
+  "[service] marked preexisting for the provider project of release `step`
+   ({:project ..}): every down step spares them, whichever instance or run."
+  [marks step]
+  (seq (get marks (:project step))))
 
 (defn whole-project?
   "True when release `step` of a private instance takes its whole compose
