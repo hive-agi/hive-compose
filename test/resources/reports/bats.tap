@@ -1,0 +1,7 @@
+1..4
+ok 1 addition works
+not ok 2 subtraction works
+# (in test file test/math.bats, line 9)
+#   `[ "$result" -eq 1 ]' failed
+ok 3 division by zero # skip not implemented
+ok 4 slow path # SKIP
