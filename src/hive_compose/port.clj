@@ -120,6 +120,25 @@
      `hive-compose.promote.orphan`. An error when the table cannot be read
      (another OS, no /proc), never a throw."))
 
+(defprotocol ITraceQuery
+  "The traces a stack's services exported, read back from the trace store
+   (Tempo, ClickHouse ..), so a failed test can be explained by the spans
+   that carry its test.id. See `hive-compose.promote.trace` for the data."
+  (-find-traces [q query]
+    "Result<[{:trace/id :trace/root-service :trace/root-name :trace/start-ms
+     :trace/duration-ms}]>: the traces with a span matching every entry of
+     `(:attrs query)` ({\"hive.run.id\" \"r1\" \"test.id\" \"t\"}) that started
+     between `:start-ms` and `:end-ms` (epoch ms, both optional), at most
+     `:limit` of them. None found is an empty vector, not an error.")
+  (-trace [q trace-id]
+    "Result<{:trace/id :trace/spans [{:span/id :span/parent-id :span/name
+     :span/service :span/start-ms :span/duration-ms :span/status
+     :span/status-message :span/attrs}]}>: every span of the trace `trace-id`
+     (hex). :span/status is :ok, :error or :unset. A trace the store does not
+     hold is :trace/not-found.")
+  (-health [q]
+    "Result<{:ready? true}>: the trace store answers, or why it does not."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
