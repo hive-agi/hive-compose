@@ -1,0 +1,30 @@
+# hive-compose e2e fixture, project A: orders (Go).
+# Every endpoint comes from the host environment; nothing is hardcoded.
+services:
+  orders:
+    build: .
+    image: hive-compose-e2e/orders:dev
+    ports:
+      - "${ORDERS_PORT:-18080}:8080"
+    expose:
+      - "8080"
+    environment:
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-}
+      TOPIC_PREFIX: ${TOPIC_PREFIX:-}
+      HIVE_RUN_ID: ${HIVE_RUN_ID:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-orders}
+    healthcheck:
+      test: ["CMD", "/orders", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - hive
+
+networks:
+  hive:
+    name: ${HIVE_NETWORK:-hive-e2e}
+    external: true
