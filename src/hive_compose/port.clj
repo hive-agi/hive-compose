@@ -165,6 +165,48 @@
      end. A runner that exits non-zero, is OOM-killed or times out is an ok
      answer; an error only when it could not be started at all."))
 
+(defprotocol IStackEngine
+  "Optional engine capability: what a stack run needs beyond sections. View
+   networks (one per consumer and run), compose projects brought up with
+   labels and networks a stack adds, and what runs under given labels.
+
+   A ProjectSpec is {:project name :dir path :files [path] :services [svc]
+   :env {VAR EnvValue} :container-env [VAR] :labels {k v} :networks [name]
+   :wait? bool :wait-timeout-s n :all? bool}. `:env` is the environment of
+   the compose process (interpolation; its secret references read only when
+   containers are created); `:container-env` names the variables of `:env`
+   passed into every service of `:services`; `:labels` land on every
+   container of `:services`; with `:networks` those services attach to these
+   external networks instead of the project's default one (so Docker DNS on
+   them is never ambiguous; list every service that must reach another). An engine applies labels, networks and
+   container-env through a generated compose override (compose has no label
+   flag); a spec with none of them runs the project's own files untouched."
+  (-network-create! [e network labels]
+    "Result<{:network :created? bool}>: create bridge network `network` with
+     `labels` ({k v}). Idempotent: an existing network answers :created? false.")
+  (-network-rm! [e network]
+    "Result<{:network :removed? bool :disconnected [container]}>: disconnect
+     every container still attached to `network`, then remove it. An absent
+     network answers :removed? false.")
+  (-network-connect! [e network target aliases]
+    "Result<{:network :containers [name]}>: connect every container of
+     `target` ({:project :service}) to `network` under `aliases`. Idempotent: a
+     container already attached counts as connected.")
+  (-up-project! [e spec]
+    "Result<{:out}>: `compose up -d` (`--wait` when :wait?) of ProjectSpec
+     `spec`. Empty `:services` is a no-op.")
+  (-down-project! [e spec]
+    "Result<{:out}>: remove the containers of `spec`'s `:services`, or with
+     `:all?` the whole compose project (its containers and own networks).
+     Never volumes.")
+  (-running-labelled [e labels]
+    "Result<[{:name :project :service :labels {k v} :state :health}]>: every
+     container, running or not, carrying all `labels` ({k v}). :state is the
+     docker state string (\"running\", \"exited\"), :health one of :healthy
+     :unhealthy :starting :none.")
+  (-networks-labelled [e labels]
+    "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
+
 (defprotocol IToxiproxyClient
   "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is
    {:name :listen :upstream :enabled :toxics [toxic]}, a toxic {\"name\"
