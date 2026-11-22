@@ -60,29 +60,60 @@
 
 (def ^:private bad #{:failed :error})
 
+(defn- cell-id [res] (str (:suite/id res) "/" (:project res)))
+
+(defn cell-case
+  "The case a failed cell result `res` stands for when no failed case of its
+   report explains it (its runner was OOM-killed, died or timed out before
+   it reported): id `<suite>/<project>`, the cell's status, and as message
+   the OOM finding's line, else what the runner exited with. Nil for a
+   passed cell or one whose report holds a failed case."
+  [res]
+  (when (and (bad (:status res))
+             (not-any? #(bad (:case/status %)) (get-in res [:report :report/cases])))
+    {:case/id (cell-id res)
+     :case/name (cell-id res)
+     :case/status (:status res)
+     :case/message (or (get-in res [:oom :oom/line])
+                       (str "the runner exited " (if (some? (:exit res)) (:exit res) "without an exit code")
+                            " and no failed case explains it"))
+     :case/cell? true}))
+
+(defn- newest-bad-first [{:keys [result case]}]
+  [(if (bad (:case/status case)) 0 1)
+   (- (or (:finished-at result) 0))
+   (str (:run/id result))])
+
 (defn find-case
   "Result<{:result :case}>: the case `test` names among `results` (cell
    results), a failed or errored one before a passed one, then the newest
-   run (latest :finished-at, then run id). :compose/unknown-test lists the
-   failed cases there are."
+   run (latest :finished-at, then run id). A failed cell with no failed case
+   (`cell-case`, e.g. an OOM-killed runner) is named by `<suite>/<project>`
+   when no case of that name exists. :compose/unknown-test lists the failed
+   cases there are."
   [results test]
   (let [hits (for [res results
                    c (get-in res [:report :report/cases])
                    :when (contains? (case-names res c) test)]
                {:result res :case c})
-        best (first (sort-by (fn [{:keys [result case]}]
-                               [(if (bad (:case/status case)) 0 1)
-                                (- (or (:finished-at result) 0))
-                                (str (:run/id result))])
-                             hits))]
+        cells (for [res results
+                    :when (= test (cell-id res))
+                    :let [c (cell-case res)]
+                    :when c]
+                {:result res :case c})
+        best (or (first (sort-by newest-bad-first hits))
+                 (first (sort-by newest-bad-first cells)))]
     (if best
       (r/ok best)
       (r/err :compose/unknown-test
              {:test test
-              :known (vec (take 20 (sort (distinct (for [res results
-                                                         c (get-in res [:report :report/cases])
-                                                         :when (bad (:case/status c))]
-                                                     (str (:suite/id res) "/" (:project res) "/" (:case/id c)))))))
+              :known (vec (take 20 (sort (distinct (concat
+                                                    (for [res results
+                                                          c (get-in res [:report :report/cases])
+                                                          :when (bad (:case/status c))]
+                                                      (str (cell-id res) "/" (:case/id c)))
+                                                    (for [res results :when (cell-case res)]
+                                                      (cell-id res)))))))
               :hint "test=<case id> or <suite>/<project>/<case id>; run=<run> narrows"}))))
 
 (defn locate
@@ -230,7 +261,7 @@
           slack (or (:why/slack-ms ctx) why/default-slack-ms)
           {:keys [logs clipped] lerr :errors} (fetch-logs ctx rid (or (:why/tail ctx) default-tail) window slack)
           b (why/bundle {:case case
-                         :test-id (leaf (:case/id case))
+                         :test-id (if (:case/cell? case) (:case/id case) (leaf (:case/id case)))
                          :cell-result result
                          :traces traces
                          :logs logs

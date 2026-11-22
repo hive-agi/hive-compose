@@ -153,6 +153,42 @@
      :budget/saved-mem (max 0 (- unshared total))
      :budget/uncapped (vec (sort (keep #(when-not (:mem (:caps %)) (:id %)) rows)))}))
 
+(defn inst-mem
+  "Bytes InstanceCaps `c` takes: its own mem cap plus its closure services'
+   (`:closure` {service bytes}, private instances, see `with-closure`)."
+  [c]
+  (+ (or (:mem c) 0) (reduce + 0 (vals (:closure c)))))
+
+(defn with-closure
+  "Budget `b` with the depends_on closure of every PRIVATE instance of
+   StackPlan `sp` (`:instance/needs` beyond `:instance/services`) counted:
+   each closure service at its own compose mem_limit (`facts` {instance-id
+   {service {:mem-limit ..}}}) or, when it has none, at
+   :compose/default-resources :mem; a service with neither stays uncounted.
+   They land under the instance's `:closure` and in the totals. An unbounded
+   instance gets none. A shared instance's closure runs from its provider's
+   own files and is left out."
+  [b settings sp facts]
+  (let [d (:compose/default-resources settings)
+        dflt (when (map? d) (parse-mem (:mem d)))
+        extra (into {}
+                    (for [[iid ip] (:stack/instances sp)
+                          :when (not (:instance/share? ip))
+                          :let [c (get-in b [:budget/instances iid])
+                                svcs (set (:instance/services ip))
+                                cl (into (sorted-map)
+                                         (keep (fn [s]
+                                                 (when-let [m (or (parse-mem (get-in facts [iid s :mem-limit])) dflt)]
+                                                   [s m])))
+                                         (remove svcs (distinct (:instance/needs ip))))]
+                          :when (and c (not (:unbounded? c)) (seq cl))]
+                      [iid cl]))
+        add (reduce + 0 (mapcat vals (vals extra)))]
+    (-> b
+        (update :budget/instances #(reduce-kv (fn [m iid cl] (assoc-in m [iid :closure] cl)) % extra))
+        (update :budget/total-mem + add)
+        (update :budget/unshared-mem + add))))
+
 ;; ---------------------------------------------------------------------------
 ;; Admission
 
@@ -174,7 +210,8 @@
 
 (defn- over-message
   [basis limit total]
-  (str "the stack's capped memory " (human-mem total)
+  (str (if (= :budget basis) "the capped memory of every live stack plus this one " "the stack's capped memory ")
+       (human-mem total)
        (case basis
          :stack " exceeds its :stack/budget "
          :budget " exceeds :compose/budget "
@@ -186,14 +223,18 @@
   "Result<Budget>: `b` (from `budget`) when its capped total fits every one
    of `lims` (from `limits`), else :compose/over-budget with
    schema/OverBudget data for the first limit it exceeds, in the order
-   :stack, :budget, :host. The host limit is compared with the memory of the
-   instances not in `running` (ids already up take no new memory)."
-  ([b lims] (admit b lims #{}))
-  ([b lims running]
+   :stack, :budget, :host. :stack compares this stack's total; :budget is
+   host-wide: `others-mem` (the capped memory of every other live run's
+   instances this stack does not share, each counted once) plus this total.
+   The host limit is compared with the memory of the instances not in
+   `running` (ids already up take no new memory)."
+  ([b lims] (admit b lims #{} 0))
+  ([b lims running] (admit b lims running 0))
+  ([b lims running others-mem]
    (let [total (:budget/total-mem b)
-         running-mem (reduce + 0 (keep (fn [[id c]] (when (contains? (set running) id) (:mem c)))
+         running-mem (reduce + 0 (keep (fn [[id c]] (when (contains? (set running) id) (inst-mem c)))
                                        (:budget/instances b)))
-         demand {:stack total :budget total :host (- total running-mem)}
+         demand {:stack total :budget (+ total (or others-mem 0)) :host (- total running-mem)}
          [basis limit] (first (filter (fn [[k lim]] (> (get demand k) lim))
                                       (keep (fn [k] (when-let [l (get lims k)] [k l]))
                                             [:stack :budget :host])))]
@@ -206,10 +247,11 @@
                          :total-mem t
                          :over (- t limit)
                          :instances (->> (:budget/instances b)
-                                         (keep (fn [[id c]] (when (:mem c) {:instance id :mem (:mem c)})))
+                                         (keep (fn [[id c]] (when (pos? (inst-mem c)) {:instance id :mem (inst-mem c)})))
                                          (sort-by (juxt (comp - :mem) :instance))
                                          vec)
                          :message (over-message basis limit t)}
+                  (= :budget basis) (assoc :others-mem (or others-mem 0))
                   (= :host basis) (assoc :available (:available lims)
                                          :reserve (:reserve lims)
                                          :running-mem running-mem))))))))
@@ -224,17 +266,43 @@
   (let [reserve (parse-mem (:compose/host-reserve settings))]
     (boolean (and reserve (some? available) (< available reserve)))))
 
+(defn freed-mem
+  "{:bytes n :unknown? bool}: what taking run `rid` of `runs` ({run {:plan
+   StackPlan :budget Budget}}) down frees: the capped memory (closure
+   included) of its instances no other run binds; a shared instance another
+   run holds stays up. :unknown? when one of the released instances has no
+   mem cap (or the run recorded no budget), so it may free memory nobody
+   counted."
+  [runs rid]
+  (let [e (get runs rid)
+        others (set (for [[r o] runs :when (not= r rid)
+                          [iid ip] (get-in o [:plan :stack/instances])
+                          :when (:instance/share? ip)]
+                      iid))
+        released (for [[iid _] (get-in e [:plan :stack/instances]) :when (not (others iid))]
+                   (get-in e [:budget :budget/instances iid]))]
+    {:bytes (reduce + 0 (map inst-mem (remove nil? released)))
+     :unknown? (boolean (or (nil? (:budget e))
+                            (some #(or (nil? %) (nil? (:mem %))) released)))}))
+
 (defn pressure-victim
-  "The run the pressure guard stops, nil when none qualifies: among `runs`
-   ({run {:stack/id :claims {agent {:seen ms}} :last-touch ms :idle-action ..}})
-   those with no claim seen within `claim-ttl-ms` of `now` and not
-   `:idle-action :none`, the one whose stack has the lowest `:stack/priority`
-   (default 0), then the longest idle, then the smallest run id."
-  [settings runs now claim-ttl-ms]
+  "The run the pressure guard stops, nil when none qualifies. A candidate of
+   `runs` ({run {:stack/id :claims {agent {:seen ms}} :last-touch ms
+   :idle-action .. :plan :budget}}) is IDLE: no claim seen within
+   `claim-ttl-ms` of `now`, untouched for at least `idle-ms`, and not
+   `:idle-action :none`; and taking it down frees memory (`freed-mem`: some
+   bytes, or an uncapped release). Among them the one whose stack has the
+   lowest `:stack/priority` (default 0), then the longest idle, then the
+   smallest run id."
+  [settings runs now {:keys [claim-ttl-ms idle-ms]}]
   (let [prio #(get-in settings [:compose/stacks % :stack/priority] 0)
-        live? (fn [e] (some #(< (- now (:seen % 0)) claim-ttl-ms) (vals (:claims e))))]
+        live? (fn [e] (some #(< (- now (:seen % 0)) claim-ttl-ms) (vals (:claims e))))
+        frees? (fn [run] (let [{:keys [bytes unknown?]} (freed-mem runs run)] (or unknown? (pos? bytes))))]
     (->> runs
-         (remove (fn [[_ e]] (or (live? e) (= :none (:idle-action e)))))
+         (remove (fn [[_ e]] (or (live? e)
+                                 (= :none (:idle-action e))
+                                 (< (- now (:last-touch e 0)) (or idle-ms 0)))))
+         (filter (comp frees? key))
          (sort-by (fn [[run e]] [(prio (:stack/id e)) (:last-touch e 0) run]))
          ffirst)))
 
@@ -285,14 +353,34 @@
 
 (defn service-override
   "The compose override entries of one capped service: \"mem_limit\" (bytes)
-   and \"cpus\" from `caps`, and, when `jvm?`, \"environment\"
-   {JAVA_TOOL_OPTIONS ..} merged with the service's own value `own-opts`.
-   {} for an unbounded service that is no JVM."
+   and \"cpus\" from `caps`, and, when `jvm?` AND a mem_limit is written,
+   \"environment\" {JAVA_TOOL_OPTIONS ..} merged with the service's own value
+   `own-opts`. Without a mem_limit the JVM keeps its default heap (25% of
+   the host): 75% of an uncapped host would be worse. {} when nothing applies."
   [caps jvm? own-opts]
-  (cond-> {}
-    (and (:mem caps) (not (:unbounded? caps))) (assoc "mem_limit" (:mem caps))
-    (and (:cpus caps) (not (:unbounded? caps))) (assoc "cpus" (:cpus caps))
-    jvm? (assoc "environment" {java-tool-options (merge-jvm-options [jvm-flag] own-opts)})))
+  (let [mem? (and (:mem caps) (not (:unbounded? caps)))]
+    (cond-> {}
+      mem? (assoc "mem_limit" (:mem caps))
+      (and (:cpus caps) (not (:unbounded? caps))) (assoc "cpus" (:cpus caps))
+      (and jvm? mem?) (assoc "environment" {java-tool-options (merge-jvm-options [jvm-flag] own-opts)}))))
+
+(defn parse-xmx
+  "Bytes of the last -Xmx in JVM options `opts`, nil when none."
+  [opts]
+  (some-> (last (re-seq #"-Xmx([0-9]+[kKmMgGtT]?)" (str opts))) second parse-mem))
+
+(defn xmx-warnings
+  "Lines warning of a service whose own -Xmx exceeds the mem_limit it gets:
+   `b` a Budget, `facts` {instance-id {service {:java-tool-options}}}."
+  [b facts]
+  (vec (for [[iid fs] (sort-by key facts)
+             :let [c (get-in b [:budget/instances iid])]
+             [svc f] (sort-by key fs)
+             :let [cap (or (get-in c [:closure svc]) (:mem c) (parse-mem (:mem-limit f)))
+                   xmx (parse-xmx (:java-tool-options f))]
+             :when (and cap xmx (> xmx cap))]
+         (str "WARN " iid " " svc ": its own -Xmx " (human-mem xmx)
+              " exceeds its mem_limit " (human-mem cap) " (it will be OOM-killed under load)"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Rendering for `compose plan`
@@ -305,6 +393,8 @@
          (:unbounded? caps) "unbounded"
          (:mem caps) (str "mem " (human-mem (:mem caps)) " (" (name (:source caps)) ")")
          :else "no mem cap")
+       (when (seq (:closure caps))
+         (str ", closure " (str/join " " (map (fn [[s m]] (str s "=" (human-mem m))) (:closure caps)))))
        (when (:cpus caps) (str ", cpus " (:cpus caps)))
        (when (true? (:jvm? caps)) ", jvm")))
 

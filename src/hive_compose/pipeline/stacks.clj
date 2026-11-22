@@ -20,13 +20,23 @@
 
    Runs persist under `:stacks {run entry}` in the state, beside `:active`.
    An entry: {:stack/id :run :started-at :last-touch :plan StackPlan
-   :preexisting {instance-id [service]} :networks [name] :consumers {consumer
-   {:compose-project :services}} :status :up|:partial :claims {agent Claim}
-   :orphaned-at ms}."
+   :networks [name] :consumers {consumer {:compose-project :services}}
+   :status :up|:partial :claims {agent Claim} :orphaned-at ms}. What ran
+   before the runs is global, not per run: `:preexisting {provider-project
+   #{service}}` beside `:stacks` (`run/mark-preexisting`,
+   `run/reconcile-preexisting`).
+
+   stack-up!, stack-down!, reap!, claim! and release-claim! are serialized
+   on one lock per state: the monitor of the context's state atom (a
+   reloaded context shares the atom, so it shares the lock). Each holds it
+   across its plan, its engine IO and its state writes, so no down plans a
+   release an up then relies on, and no probe reads a world another stack
+   op is changing. Reads (stack-status, plan) take no lock."
   (:require [clojure.string :as str]
             [hive-compose.port :as port]
             [hive-compose.promote.capability :as capability]
             [hive-compose.promote.plan :as plan]
+            [hive-compose.promote.resources :as resources]
             [hive-compose.promote.stack :as stack]
             [hive-compose.promote.stack-run :as run]
             [hive-compose.promote.target :as target]
@@ -47,10 +57,21 @@
 
 (defn- stacks [ctx] (:stacks @(:state ctx) {}))
 
+(defn- plans-of
+  "{run StackPlan} of every run recorded in state value `st`."
+  [st]
+  (into {} (map (fn [[k e]] [k (:plan e)])) (:stacks st)))
+
 (defn- live-plans
   "{run StackPlan} of every recorded run."
   [ctx]
-  (into {} (map (fn [[k e]] [k (:plan e)])) (stacks ctx)))
+  (plans-of @(:state ctx)))
+
+(defmacro ^:private serialized
+  "`body` holding the stack lock of `ctx`: the monitor of its state atom, one
+   per state, reentrant (reap! and release-claim! call stack-down!)."
+  [ctx & body]
+  `(locking (:state ~ctx) ~@body))
 
 (defn- random-hex []
   (let [b (byte-array 3)]
@@ -145,18 +166,121 @@
           {} (:active @(:state ctx))))
 
 (defn resolve-plan
-  "Result<{:resolution :plan :wirings}> of stack `stack-id` for run `run-id`:
-   resolution (hc-3), StackPlan (hc-4) and Wirings (hc-5). Pure, no engine."
+  "Result<{:resolution :plan :wirings :budget}> of stack `stack-id` for run
+   `run-id`: resolution (hc-3), StackPlan (hc-4), Wirings (hc-5) and the
+   capped-memory Budget (hc-16a). Pure, no engine."
   [ctx stack-id run-id]
-  (let [settings (:settings ctx)]
+  (let [settings (:settings ctx)
+        projects (:compose/projects settings)]
     (r/let-ok [s (stack-config ctx stack-id)
                ;; a stack's own needs (otel, ...) are needs of every container
-               ;; consumer in it, shared: one instance joins each view network
-               res (capability/resolve-stack (:compose/projects settings) s
-                                             {:extra (run/stack-needs-per-consumer s)})
+               ;; consumer in it, shared: one instance joins each view network.
+               ;; Built as capability/resolve-stack builds it, so the budget
+               ;; (hc-16a) sees the same Need :resources.
+               needs (capability/consumer-needs projects (:stack/consumers s)
+                                                (cond-> (run/stack-needs-per-consumer s)
+                                                  (seq (:stack/needs s))
+                                                  (update (capability/stack-consumer s) merge (:stack/needs s))))
+               res (capability/resolve-needs projects needs)
                sp (stack/stack-plan settings res run-id {:stack stack-id})
                ws (wiring/wirings settings res run-id (run/otlp-envs res run-id))]
-      (r/ok {:resolution res :plan sp :wirings ws}))))
+      (r/ok {:resolution res :plan sp :wirings ws
+             :budget (resources/budget settings s needs res)}))))
+
+;; ---------------------------------------------------------------------------
+;; resource caps (hc-16a)
+
+(defn- mem-available
+  "MemAvailable in bytes from the context's IHostMemory, nil when there is
+   none or it cannot be read (admission then checks the budgets alone)."
+  [ctx]
+  (when-let [m (:host-memory ctx)]
+    (when (satisfies? port/IHostMemory m)
+      (let [x (port/-mem-available m)] (when (r/ok? x) (:ok x))))))
+
+(defn- running-instances
+  "Ids of the shared instances of `sp` already up: held by another live run,
+   or whose answering service runs now in its compose project (`running`,
+   {compose-project #{service}} from `running-footprints`). They take no new
+   host memory."
+  [ctx sp running]
+  (let [held (set (for [[_ other] (live-plans ctx)
+                        [iid ip] (:stack/instances other)
+                        :when (:instance/share? ip)]
+                    iid))]
+    (set (for [[iid ip] (:stack/instances sp)
+               :when (:instance/share? ip)
+               :when (or (held iid)
+                         (contains? (get running (:instance/compose-project ip) #{})
+                                    (:instance/service ip)))]
+           iid))))
+
+(defn others-mem
+  "What :compose/budget is already spent on besides `budget` (this stack's):
+   the capped memory (closures included) of every live run's instances.
+
+   A SHARED instance is one container whoever binds it, so it is keyed by
+   its id, counted once at the largest cap any run gives it, and for one
+   this stack binds too only what the live runs give it beyond this stack's
+   own count. A PRIVATE instance is a container per run: its id
+   (`<provider>/<cap>@<consumer>`) carries no run, so it is keyed by its
+   compose project and always adds; two runs of one stack sum, they never
+   collapse into one. A run recorded before runs carried :budget counts 0."
+  [ctx budget]
+  (let [mine   (:budget/instances budget)
+        key-of (fn [iid ip] (if (:instance/share? ip) iid [:private (:instance/compose-project ip) iid]))
+        live   (reduce (fn [m [k c]] (update m k (fnil max 0) (resources/inst-mem c)))
+                       {}
+                       (for [[_ e] (stacks ctx)
+                             [iid ip] (get-in e [:plan :stack/instances])]
+                         [(key-of iid ip) (get-in e [:budget :budget/instances iid] {})]))]
+    (reduce + 0 (for [[k m] live]
+                  (if-let [c (when (string? k) (get mine k))]
+                    (max 0 (- m (resources/inst-mem c)))
+                    m)))))
+
+(defn admit
+  "Result<Budget>: `budget` admitted against :stack/budget, :compose/budget
+   (host-wide: every live run's capped memory plus this stack's) and the
+   host's MemAvailable minus :compose/host-reserve, the instances in
+   `running` (ids) counting as already paid; else :compose/over-budget."
+  [ctx stack-id budget running]
+  (resources/admit budget
+                   (resources/limits (:settings ctx)
+                                     (get-in ctx [:settings :compose/stacks stack-id])
+                                     (mem-available ctx))
+                   running
+                   (others-mem ctx budget)))
+
+(defn- service-facts
+  "{service {:image :java-tool-options :mem-limit}} of `services` of the
+   provider of `ip`, {} when the engine cannot tell."
+  [ctx engine ip services]
+  (if (and (seq services) (satisfies? port/IServiceImages engine))
+    (let [proj (project-of ctx (:instance/provider ip))
+          f (port/-service-facts engine (target/project-profile proj) (vec services))]
+      (if (r/ok? f) (:ok f) {}))
+    {}))
+
+(defn- private-facts
+  "{instance-id {service facts}} of every private instance's closure."
+  [ctx engine sp]
+  (into {} (for [[iid ip] (:stack/instances sp)
+                 :when (not (:instance/share? ip))]
+             [iid (service-facts ctx engine ip (distinct (concat (:instance/services ip) (:instance/needs ip))))])))
+
+(defn- instance-caps-overrides
+  "{service override} capping planned instance `ip`: a PRIVATE instance gets
+   its caps and JVM flag in its stack override; a shared one runs from its
+   provider's own files with no override (hc-6), so its caps are summed and
+   admitted but not written (writing them would recreate it under the
+   consumers already using it)."
+  [ctx engine budget ip]
+  (if (:instance/share? ip)
+    {}
+    (let [caps (get-in budget [:budget/instances (:instance/id ip)] {})
+          facts (service-facts ctx engine ip (distinct (concat (:instance/services ip) (:instance/needs ip))))]
+      (run/instance-overrides (:settings ctx) ip caps facts))))
 
 (defn- consumer-services
   "Result<[service]>: what consumer `c` runs: the services of its section
@@ -182,9 +306,10 @@
 (defn- up-instance!
   "Result<row>: instance `ip` up (waited and gated when `wait?`) and joined
    to each of its consumers' view networks under its aliases."
-  [ctx engine ip wait?]
+  [ctx engine ip wait? budget]
   (let [spec (cond-> (run/instance-spec (:settings ctx) ip wait?)
-               (and wait? (wait-timeout-s ctx)) (assoc :wait-timeout-s (wait-timeout-s ctx)))
+               (and wait? (wait-timeout-s ctx)) (assoc :wait-timeout-s (wait-timeout-s ctx))
+               true (run/with-overrides (instance-caps-overrides ctx engine budget ip)))
         iid (:instance/id ip)]
     (r/let-ok [_ (let [u (port/-up-project! engine spec)]
                    (if (r/err? u)
@@ -232,46 +357,73 @@
              :compose-project (run/consumer-compose-project settings c (:stack/run sp))
              :services services}))))
 
-(defn- pick-run-id [ctx stack-id run-id]
+(defn- pick-run-id
+  "Result<rid>: `run-id`, else a fresh `<stack><6 hex>`, when it is a RunId.
+   Whether it is free is decided only by `claim-run!`, inside its swap."
+  [ctx stack-id run-id]
   (let [rid (or run-id (run/run-id stack-id ((or (:rand-hex ctx) random-hex))))]
-    (cond
-      (not (m/validate schema/RunId rid))
-      (r/err :compose/invalid-run {:run rid :problems (schema/explain schema/RunId rid)})
-      (contains? (stacks ctx) rid)
-      (r/err :compose/run-exists {:run rid :hint "stack-down run=<id> first, or omit run for a fresh id"})
-      :else (r/ok rid))))
+    (if (m/validate schema/RunId rid)
+      (r/ok rid)
+      (r/err :compose/invalid-run {:run rid :problems (schema/explain schema/RunId rid)}))))
+
+(defn- run-exists [rid]
+  (r/err :compose/run-exists {:run rid :hint "stack-down run=<id> first, or omit run for a fresh id"}))
+
+(defn- probed-footprints
+  "#{[compose-project service]}: the footprints of `sp`'s shared instances,
+   what `running-footprints` probed."
+  [sp]
+  (into #{} (comp (map val) (filter :instance/share?) (mapcat stack/instance-footprint))
+        (:stack/instances sp)))
+
+(defn- claim-run!
+  "Result<rid>: record run `rid` (`entry`) in ONE swap that first checks the
+   id is free (else :compose/run-exists, nothing changed), then reconciles
+   the preexistence marks against this run's probe (`running` of the
+   `probed` footprints): a mark the probe disproves is dropped
+   (`run/reconcile-preexisting`), a world service found running is marked
+   (`run/mark-preexisting`), both against the runs recorded at that moment."
+  [ctx rid entry running probed held]
+  (let [[old _] (swap-vals! (:state ctx)
+                            (fn [st]
+                              (if (contains? (:stacks st) rid)
+                                st
+                                (let [runs (plans-of st)]
+                                  (-> st
+                                      (update :preexisting run/reconcile-preexisting probed running runs rid)
+                                      (update :preexisting run/mark-preexisting running runs rid held)
+                                      (assoc-in [:stacks rid] entry))))))]
+    (if (contains? (:stacks old) rid)
+      (run-exists rid)
+      (do (persist! ctx) (r/ok rid)))))
 
 (defn stack-up!
   "Result<{:run :stack :instances [..] :consumers [..] :networks [..]}>: run
    stack `stack` (`opts` {:stack id :run id? :wait? (default true)}). The run
    is recorded before anything starts, so a failure midway answers an error
-   carrying `:run` that stack-down! releases."
+   carrying `:run` that stack-down! releases. Holds the stack lock
+   throughout; a run id already recorded answers :compose/run-exists."
   [ctx {stack-id :stack run-id :run wait? :wait? :or {wait? true}}]
-  (r/let-ok [engine (stack-engine ctx)
-             rid (pick-run-id ctx stack-id run-id)
-             {sp0 :plan ws :wirings} (resolve-plan ctx stack-id rid)
-             sp (with-needs engine (:settings ctx) sp0)
-             running (running-footprints engine (:settings ctx) sp)]
-    (let [t (now ctx)
-          consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))
-          held (section-held ctx)]
-      ;; preexistence is global and permanent: marked by the first run that
-      ;; finds a service running outside every run and section, never cleared.
-      ;; One swap marks against the :stacks current at that moment and records
-      ;; this run, so two runs starting together cannot both miss the other.
-      (swap! (:state ctx)
-             (fn [st]
-               (-> st
-                   (update :preexisting run/mark-preexisting running
-                           (into {} (map (fn [[k e]] [k (:plan e)])) (:stacks st)) rid held)
-                   (assoc-in [:stacks rid] {:stack/id stack-id :run rid :started-at t :last-touch t
-                                            :plan sp :networks (:stack/networks sp)
-                                            :consumers {} :status :partial}))))
-      (persist! ctx)
-      (let [res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
+  (serialized ctx
+    (r/let-ok [engine (stack-engine ctx)
+               rid (pick-run-id ctx stack-id run-id)
+               {sp0 :plan ws :wirings budget0 :budget} (resolve-plan ctx stack-id rid)
+               sp (with-needs engine (:settings ctx) sp0)
+               budget (r/ok (resources/with-closure budget0 (:settings ctx) sp (private-facts ctx engine sp)))
+               running (running-footprints engine (:settings ctx) sp)
+               ;; hc-16a: refused before anything is recorded or started; under
+               ;; the stack lock, so no other up is admitted against the same room
+               _ (admit ctx stack-id budget (running-instances ctx sp running))
+               t (r/ok (now ctx))
+               _ (claim-run! ctx rid {:stack/id stack-id :run rid :started-at t :last-touch t
+                                      :plan sp :budget budget :networks (:stack/networks sp)
+                                      :consumers {} :status :partial}
+                             running (probed-footprints sp) (section-held ctx))]
+      (let [consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))
+            res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
                                         (:stack/networks sp))
                            instances (all-ok (fn [{:step/keys [id]}]
-                                               (up-instance! ctx engine (get-in sp [:stack/instances id]) wait?))
+                                               (up-instance! ctx engine (get-in sp [:stack/instances id]) wait? budget))
                                              (filter #(= :instance (:step/kind %)) (:stack/start-order sp)))
                            cs (all-ok (fn [c]
                                         ;; recorded BEFORE its up: a failed up leaves
@@ -322,7 +474,11 @@
                 (constantly step))
       :else (r/ok step))))
 
-(defn- down-run! [ctx engine rid]
+(defn- down-run!
+  "Result<report>: run `rid` taken down: its release planned against the
+   state, the IO done and the entry dropped. Called under the stack lock
+   (stack-down!), so no up records itself between the plan and the IO."
+  [ctx engine rid]
   (let [e (get (stacks ctx) rid)
         sp (:plan e)
         steps (mapv #(run/sparing-preexisting % (run/preexisting-of (:preexisting @(:state ctx)) %))
@@ -345,12 +501,13 @@
 
 (defn stack-down!
   "Result<{:runs [report]}>: take down `opts` {:run id} or every run of
-   {:stack id}. Volumes are never removed."
+   {:stack id}. Volumes are never removed. Holds the stack lock throughout."
   [ctx opts]
-  (r/let-ok [engine (stack-engine ctx)
-             rids (runs-of ctx opts)
-             reports (all-ok #(down-run! ctx engine %) rids)]
-    (r/ok {:runs reports})))
+  (serialized ctx
+    (r/let-ok [engine (stack-engine ctx)
+               rids (runs-of ctx opts)
+               reports (all-ok #(down-run! ctx engine %) rids)]
+      (r/ok {:runs reports}))))
 
 ;; ---------------------------------------------------------------------------
 ;; reads
@@ -383,17 +540,34 @@
       (r/ok {:stacks (vec rows)}))))
 
 (defn plan
-  "Result<{:diff :text}>: hc-4 plan-diff of stack `stack-id` against what
-   runs now (by compose project label), and its rendering."
+  "Result<{:diff :text :budget :admission}>: hc-4 plan-diff of stack
+   `stack-id` against what runs now (by compose project label), the capped
+   memory of every instance with the total and what sharing saves (hc-16a),
+   and the rendering of both. `:admission` is :ok, or the
+   :compose/over-budget error stack-up would answer (then the text says so)."
   [ctx {stack-id :stack run-id :run}]
   (r/let-ok [engine (stack-engine ctx)
-             {sp :plan} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")))
+             {sp0 :plan budget0 :budget} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")))
+             sp (with-needs engine (:settings ctx) sp0)
              running (all-ok (fn [cp] (r/map-ok (project-health engine cp)
                                                 (fn [h] (for [[s {:keys [state]}] h :when (= "running" state)]
                                                           {:project cp :service s}))))
-                             (distinct (map :instance/compose-project (vals (:stack/instances sp)))))]
-    (let [d (stack/plan-diff sp (apply concat running))]
-      (r/ok {:diff d :text (stack/render-diff d)}))))
+                             (distinct (map :instance/compose-project (vals (:stack/instances sp)))))
+             footprints (running-footprints engine (:settings ctx) sp)]
+    (let [facts (private-facts ctx engine sp)
+          budget (resources/with-closure budget0 (:settings ctx) sp facts)
+          d (stack/plan-diff sp (apply concat running))
+          ;; the same basis stack-up! admits on: held by a live run or running
+          verdict (admit ctx stack-id budget (running-instances ctx sp footprints))
+          admission (if (r/ok? verdict) :ok (dissoc verdict :ok))
+          warns (resources/xmx-warnings budget facts)]
+      (r/ok {:diff d
+             :budget budget
+             :admission admission
+             :warnings warns
+             :text (str (stack/render-diff d) "\n\n" (resources/summary budget)
+                        (when (seq warns) (str "\n" (str/join "\n" warns)))
+                        (when (not= :ok admission) (str "\nREFUSED: " (:message admission))))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; claims and the reaper
@@ -407,44 +581,77 @@
 (defn claim!
   "Result<{:run :claims}>: `agent` holds run `rid`; renews an existing claim."
   [ctx rid agent {:keys [note]}]
-  (cond
-    (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
-    (not (contains? (stacks ctx) rid)) (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (stacks ctx))))})
-    :else (let [t (now ctx)]
-            (record! ctx rid (fn [e] (-> e
-                                         (update-in [:claims agent] #(cond-> (assoc (or % {:since t}) :seen t)
-                                                                        note (assoc :note note)))
-                                         (assoc :last-touch t)
-                                         (dissoc :orphaned-at))))
-            (r/ok {:run rid :claims (get-in (stacks ctx) [rid :claims])}))))
+  (serialized ctx
+    (cond
+      (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
+      (not (contains? (stacks ctx) rid)) (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (stacks ctx))))})
+      :else (let [t (now ctx)]
+              (record! ctx rid (fn [e] (-> e
+                                           (update-in [:claims agent] #(cond-> (assoc (or % {:since t}) :seen t)
+                                                                          note (assoc :note note)))
+                                           (assoc :last-touch t)
+                                           (dissoc :orphaned-at))))
+              (r/ok {:run rid :claims (get-in (stacks ctx) [rid :claims])})))))
 
 (defn release-claim!
   "Result<{:run :claims ..}>: `agent` gives up run `rid`. With no claim left the
    run is orphaned (reaped after the orphan TTL), or taken down now with `stop?`."
   [ctx rid agent {:keys [stop?]}]
-  (if-not (contains? (stacks ctx) rid)
-    (r/err :compose/unknown-run {:run rid})
-    (do (record! ctx rid (fn [e] (let [e (-> e (update :claims dissoc agent) (assoc :last-touch (now ctx)))]
-                                   (if (empty? (:claims e)) (assoc e :orphaned-at (now ctx)) e))))
-        (let [left (get-in (stacks ctx) [rid :claims])]
-          (if (and stop? (empty? left))
-            (r/map-ok (stack-down! ctx {:run rid}) #(assoc % :run rid :claims {}))
-            (r/ok {:run rid :claims (or left {})}))))))
+  (serialized ctx
+    (if-not (contains? (stacks ctx) rid)
+      (r/err :compose/unknown-run {:run rid})
+      (do (record! ctx rid (fn [e] (let [e (-> e (update :claims dissoc agent) (assoc :last-touch (now ctx)))]
+                                     (if (empty? (:claims e)) (assoc e :orphaned-at (now ctx)) e))))
+          (let [left (get-in (stacks ctx) [rid :claims])]
+            (if (and stop? (empty? left))
+              (r/map-ok (stack-down! ctx {:run rid}) #(assoc % :run rid :claims {}))
+              (r/ok {:run rid :claims (or left {})})))))))
 
 (defn- ttls [settings]
   {:ttl-ms (* 60000 (or (:compose/default-ttl-minutes settings) 60))
    :orphan-ttl-ms (* 60000 (or (:compose/orphan-ttl-minutes settings) (:compose/default-ttl-minutes settings) 60))
    :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) 30))})
 
+(defn- down-row [ctx rid extra]
+  (let [x (try (stack-down! ctx {:run rid})
+               (catch Throwable t (r/err :compose/release-threw {:message (str t)})))]
+    (merge (if (r/ok? x) {:run rid :ok? true} {:run rid :ok? false :error x}) extra)))
+
+(defn- pressure-idle-ms
+  "How long a run must be untouched before the pressure guard may stop it:
+   the orphan TTL (the reaper's shortest idle threshold), so a run in use
+   just now is never taken."
+  [settings]
+  (:orphan-ttl-ms (ttls settings)))
+
+(defn pressure-step!
+  "The reaper's memory pressure guard (hc-16a): when the host's MemAvailable
+   is below :compose/host-reserve, stop ONE run, the idle unclaimed run of
+   the lowest :stack/priority (resources/pressure-victim). Answers its row
+   (with :reason :memory-pressure, :available, :reserve), or nil."
+  [ctx]
+  (let [settings (:settings ctx)
+        available (mem-available ctx)]
+    (when (resources/under-pressure? settings available)
+      (when-let [rid (resources/pressure-victim settings (stacks ctx) (now ctx)
+                                                {:claim-ttl-ms (:claim-ttl-ms (ttls settings))
+                                                 :idle-ms (pressure-idle-ms settings)})]
+        (down-row ctx rid {:reason :memory-pressure
+                           :available available
+                           :reserve (resources/parse-mem (:compose/host-reserve settings))})))))
+
 (defn reap!
-  "{:reaped [report]}: take down every idle, unclaimed run. A run that cannot
-   be taken down answers its error row and stays."
+  "{:reaped [report]}: take down every idle, unclaimed run, then, while the
+   host is under memory pressure, the lowest-priority unclaimed run (one per
+   pass, so the next pass sees what it freed). A run that cannot be taken
+   down answers its error row and stays. Holds the stack lock from choosing
+   the idle runs and the pressure victim to the last down, so no claim, up
+   or down lands between a choice and its release."
   [ctx]
   (if-not (satisfies? port/IStackEngine (:engine ctx))
     {:reaped []}
-    (let [rids (run/idle-runs (stacks ctx) (now ctx) (ttls (:settings ctx)))]
-      {:reaped (mapv (fn [rid]
-                       (let [x (try (stack-down! ctx {:run rid})
-                                    (catch Throwable t (r/err :compose/release-threw {:message (str t)})))]
-                         (if (r/ok? x) {:run rid :ok? true} {:run rid :ok? false :error x})))
-                     rids)})))
+    (serialized ctx
+      (let [rids (run/idle-runs (stacks ctx) (now ctx) (ttls (:settings ctx)))
+            idle (mapv #(down-row ctx % nil) rids)
+            pressure (pressure-step! ctx)]
+        {:reaped (cond-> idle pressure (conj pressure))}))))

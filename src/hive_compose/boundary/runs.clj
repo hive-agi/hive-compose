@@ -59,10 +59,22 @@
   "A suite or project directory name: one path segment, never . or .."
   [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.-]*\z"] [:fn #(not (re-matches #"\.+" %))]])
 
+(def OomFinding
+  "An OOM kill of the cell's runner (hc-16b `hive-compose.promote.oom`):
+   which service, at which cap, and the line `why` prints."
+  [:map
+   [:oom/service [:string {:min 1}]]
+   [:oom/source [:enum :container :scope :ulimit]]
+   [:oom/line [:string {:min 1}]]
+   [:oom/cap {:optional true} pos-int?]
+   [:oom/exit {:optional true} [:maybe :int]]])
+
 (def CellResult
   "What result.edn holds: hc-8 `hive-compose.promote.suite/cell-result`.
    Open: extra keys are kept. `:report` is a Report
-   (hive-compose.promote.report/Report), checked here only for its cases."
+   (hive-compose.promote.report/Report), checked here only for its cases.
+   `:oom` is the runner's OOM finding (hc-16b), present only when it was
+   OOM-killed."
   [:map
    [:run/id RunDir]
    [:suite/id PathPart]
@@ -74,7 +86,8 @@
    [:report-error {:optional true} :map]
    [:started-at {:optional true} :int]
    [:finished-at {:optional true} :int]
-   [:duration-ms {:optional true} :int]])
+   [:duration-ms {:optional true} :int]
+   [:oom {:optional true} OomFinding]])
 
 (def ^:private valid-result? (m/validator CellResult))
 

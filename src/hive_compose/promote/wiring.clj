@@ -27,6 +27,7 @@
   (:require [clojure.string :as str]
             [hive-compose.promote.env :as env]
             [hive-compose.promote.names :as names]
+            [hive-compose.promote.otel :as otel]
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
             [malli.core :as m]))
@@ -45,38 +46,26 @@
 (def run-attribute "hive.run.id")
 
 ;; ---------------------------------------------------------------------------
-;; OTEL_RESOURCE_ATTRIBUTES: comma-separated k=v, merged per key.
+;; OTEL_RESOURCE_ATTRIBUTES: comma-separated k=v, merged per key through
+;; hive-compose.promote.otel, the one codec of that variable.
 
-(defn parse-attributes
-  "`s` (`k1=v1,k2=v2`) as a vector of [k v] in order. Blank entries and
-   entries without `=` are dropped; a repeated key keeps its last value."
+(defn- tidy-attributes
+  "`s` with every entry written `k=v`, key and value trimmed around the first
+   `=`; entries without `=` are dropped. Values stay as encoded."
   [s]
-  (reduce (fn [acc part]
-            (let [part (str/trim part)
-                  i (str/index-of part "=")]
-              (if (or (nil? i) (zero? i))
-                acc
-                (let [k (str/trim (subs part 0 i))
-                      v (str/trim (subs part (inc i)))
-                      at (first (keep-indexed (fn [n [k' _]] (when (= k k') n)) acc))]
-                  (if at (assoc acc at [k v]) (conj acc [k v]))))))
-          []
-          (str/split (or s "") #",")))
+  (->> (str/split (str s) #",")
+       (keep (fn [e]
+               (when-let [i (str/index-of e "=")]
+                 (str (str/trim (subs e 0 i)) "=" (str/trim (subs e (inc i)))))))
+       (str/join ",")))
 
 (defn merge-attributes
-  "The attribute strings `ss` merged per key, later wins, first position of a
-   key kept: (merge-attributes [\"a=1,b=2\" \"b=3\"]) => \"a=1,b=3\"."
+  "The attribute strings `ss` merged per key with
+   `otel/merge-resource-attributes`: a later value wins, a key keeps the
+   position it first had, an entry with no `=` or an empty key is dropped:
+   (merge-attributes [\"a=1,b=2\" \"b=3\"]) => \"a=1,b=3\"."
   [ss]
-  (->> ss
-       (map parse-attributes)
-       (reduce (fn [acc kvs]
-                 (reduce (fn [acc [k v]]
-                           (let [at (first (keep-indexed (fn [n [k' _]] (when (= k k') n)) acc))]
-                             (if at (assoc acc at [k v]) (conj acc [k v]))))
-                         acc kvs))
-               [])
-       (map (fn [[k v]] (str k "=" v)))
-       (str/join ",")))
+  (reduce otel/merge-resource-attributes "" (map tidy-attributes ss)))
 
 ;; ---------------------------------------------------------------------------
 ;; Merge of Env maps with the OTLP rules.

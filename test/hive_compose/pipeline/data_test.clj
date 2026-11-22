@@ -115,6 +115,22 @@
       (is (= :compose/data-step-failed (:error res)))
       (is (= :compose/data-runner-unsupported (get-in (last (:steps res)) [:error :error]))))))
 
+(deftest a-run-taken-down-during-its-phase-is-not-revived
+  ;; at the phase's last step (the database create) another caller's down has
+  ;; dropped the run's entry (only its state write is replayed here, so the
+  ;; step itself still succeeds); the phase's state write must not recreate it
+  (let [c (ctx) run (up! c) fired (atom false)]
+    (stub/on-call! (:engine c) (fn [call]
+                                 (when (and (= :exec (first call))
+                                            (re-find #"^CREATE DATABASE" (str (last (get call 3))))
+                                            (compare-and-set! fired false true))
+                                   (swap! (:state c) update :stacks dissoc run))))
+    (let [res (pdata/run-phase! c run :before-suite)]
+      (stub/on-call! (:engine c) nil)
+      (is @fired "the down ran inside the phase")
+      (is (= :compose/unknown-run (:error res)) (pr-str res))
+      (is (not (contains? (:stacks @(:state c)) run)) "no bare {:data ..} entry"))))
+
 (deftest a-stack-without-lifecycle-is-a-no-op
   (let [c (update-in (ctx) [:settings :compose/projects]
                      (fn [ps] (-> ps
