@@ -134,8 +134,11 @@
             e (cli/make-engine {:exec (fn [argv opts] (swap! calls conj [argv opts]) (r/ok {:exit 0 :stdout "" :stderr ""}))
                                 :compose/resolver (stub-resolver fetches)
                                 :compose/stack-dir dir})
-            spec (run/consumer-spec (settings) rid "ab" "a" ["app"] wa
-                                    (keys (:wiring/env wa)) false)]
+            proj (tmp-dir)
+            _ (spit (io/file proj "compose.yaml") "services: {app: {image: busybox}}\n")
+            spec (assoc (run/consumer-spec (settings) rid "ab" "a" ["app"] wa
+                                           (keys (:wiring/env wa)) false)
+                        :dir proj)]
         (is (= [] @fetches))
         (is (r/ok? (port/-up-project! e spec)))
         (is (= [secret-path] @fetches))
