@@ -18,6 +18,8 @@
             [hive-addon.protocol :as addon]
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
+            [hive-compose.adapter.runner :as suite-runner]
+            [hive-compose.pipeline.suites :as suites]
             [hive-compose.boundary.files :as files]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
@@ -110,6 +112,8 @@
     {:engine (or (:compose/engine cfg)
                  (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
      :runner (or (:compose/runner cfg) (host/make-runner cfg))
+     :suite-runner (or (:compose/suite-runner cfg)
+                       (suite-runner/make-runner (select-keys cfg [:compose/resolver])))
      :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
      :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
      :processes (if (contains? cfg :compose/process-table)
@@ -191,7 +195,8 @@
    "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
    "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
    "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
-   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"))
+   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
+   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need, each suite's runner (a container on the project's view network, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir, results recorded; down when every cell passed, kept up for inspection when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true)"))
 
 (def commands
   (vec (keys command-help)))
@@ -237,6 +242,18 @@
   (cond-> {}
     (param params "stack") (assoc :stack (str (param params "stack")))
     (param params "run") (assoc :run (str (param params "run")))
+    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
+
+(defn- test-opts
+  "The options of `test` from the tool params: suites, projects (\"X,Y\" or a
+   list), run, keep_up, dry_run, wait."
+  [params]
+  (cond-> {}
+    (param params "suites") (assoc :suites (param params "suites"))
+    (param params "projects") (assoc :projects (param params "projects"))
+    (param params "run") (assoc :run (str (param params "run")))
+    (some? (flag params "keep_up")) (assoc :keep-up? (flag params "keep_up"))
+    (some? (flag params "dry_run")) (assoc :dry-run? (flag params "dry_run"))
     (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
 
 (defn- announced
@@ -288,6 +305,7 @@
         "stack-down" (stacks/stack-down! ctx (stack-opts params))
         "stack-status" (stacks/stack-status ctx (stack-opts params))
         "plan" (stacks/plan ctx (stack-opts params))
+        "test" (suites/test! ctx (test-opts params))
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
@@ -331,6 +349,7 @@
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
+                     "SUITES: test suites=X,Y projects=A,B runs the suite x project matrix on one union stack and answers per-cell verdicts from exit code and JUnit/TAP; a failed matrix stays up for inspection. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -349,7 +368,11 @@
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan] run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|test] run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>"}
+                              "suites" {:type "string" :description "[test] suite ids under :compose/suites, X,Y (default all)"}
+                              "projects" {:type "string" :description "[test] projects under test, A,B (default every project a selected suite applies to)"}
+                              "keep_up" {:type "boolean" :description "[test] keep the stack up even when every cell passed (a failed matrix always stays up)"}
+                              "dry_run" {:type "boolean" :description "[test] answer the matrix, the stack plan and every runner spec; start nothing"}}
                  :required ["command"]}
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
