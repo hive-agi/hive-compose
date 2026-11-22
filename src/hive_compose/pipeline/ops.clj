@@ -669,8 +669,13 @@
         strays (reduce (fn [taken [_ proj]]
                          (let [whole (target/project-profile proj)
                                running (port/-running engine whole)
+                               ;; what a live stack run holds is the run's, never a stray
+                               held (get (stack/stack-held (into {} (map (fn [[k e]] [k (:plan e)]))
+                                                                 (:stacks @(:state ctx))))
+                                         (profile/project whole) #{})
                                unowned (when (r/ok? running)
-                                         (vec (remove (owned (profile/project whole) taken) (:ok running))))]
+                                         (vec (remove (some-fn (owned (profile/project whole) taken) held)
+                                                      (:ok running))))]
                            (if (seq unowned)
                              (let [closure (port/-closure engine (assoc whole :profile/services unowned))
                                    needs (if (r/ok? closure) (:ok closure) unowned)]

@@ -60,7 +60,8 @@
    stack ran, the stack runs (`:stacks`, absent from older files)."
   [st]
   (cond-> {:active (or (:active st) {}) :current (:current st)}
-    (contains? st :stacks) (assoc :stacks (or (:stacks st) {}))))
+    (contains? st :stacks) (assoc :stacks (or (:stacks st) {}))
+    (contains? st :preexisting) (assoc :preexisting (or (:preexisting st) {}))))
 
 (defn sync-state!
   "Merge the live state with the file at `path` and write the merge.

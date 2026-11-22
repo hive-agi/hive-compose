@@ -26,6 +26,7 @@
   (:require [clojure.string :as str]
             [hive-compose.port :as port]
             [hive-compose.promote.capability :as capability]
+            [hive-compose.promote.plan :as plan]
             [hive-compose.promote.stack :as stack]
             [hive-compose.promote.stack-run :as run]
             [hive-compose.promote.target :as target]
@@ -40,7 +41,7 @@
 (def claim-prefix "stack:")
 
 (defn- persist! [{:keys [state save!]}]
-  (when save! (save! (select-keys @state [:active :current :stacks]))))
+  (when save! (save! (select-keys @state [:active :current :stacks :preexisting]))))
 
 (defn- now [ctx] ((:now ctx)))
 
@@ -119,25 +120,29 @@
            (:stack/instances sp))
    (fn [rows] (stack/with-needs sp (into {} rows)))))
 
-(defn- preexisting
-  "Result<{instance-id [service]}>: what of each shared instance's closure ran
-   before this run and no other live run (in `runs`, {run StackPlan}) holds:
-   the world before stacks, never removed by this run. What another live run
-   holds is left to the refcount, so the last run releases it."
-  [engine settings sp runs]
-  (let [others (run/held-by-others runs (:stack/run sp))]
-    (r/map-ok
-     (all-ok (fn [[iid ip]]
-               (if (:instance/share? ip)
-                 (let [proj (get-in settings [:compose/projects (:instance/provider ip)])
-                       cp (:instance/compose-project ip)]
-                   (r/map-ok (port/-running engine (target/project-profile proj))
-                             (fn [up] [iid (vec (sort (for [[_ s :as k] (stack/instance-footprint ip)
-                                                            :when (and (contains? (set up) s) (not (others k)))]
-                                                        s)))])))
-                 (r/ok [iid []])))
-             (:stack/instances sp))
-     #(into (sorted-map) (remove (comp empty? second)) %))))
+(defn- running-footprints
+  "Result<{compose-project #{service}}>: what of each shared instance's
+   footprint runs now, by the compose project it runs under (its provider's).
+   Only the probe; what counts as preexisting is decided in
+   `run/mark-preexisting`, against the state current at the swap."
+  [engine settings sp]
+  (r/map-ok
+   (all-ok (fn [[_ ip]]
+             (if (:instance/share? ip)
+               (let [proj (get-in settings [:compose/projects (:instance/provider ip)])]
+                 (r/map-ok (port/-running engine (target/project-profile proj))
+                           (fn [up] [(:instance/compose-project ip)
+                                     (into (sorted-set) (filter (set up))
+                                           (map second (stack/instance-footprint ip)))])))
+               (r/ok nil)))
+           (:stack/instances sp))
+   #(apply merge-with into {} (keep (fn [[k v]] (when (seq v) {k v})) %))))
+
+(defn- section-held
+  "{compose-project #{service}} the active sections hold (promote.plan footprint)."
+  [ctx]
+  (reduce (fn [m [_ a]] (update m (:project a) (fnil into #{}) (plan/footprint a)))
+          {} (:active @(:state ctx))))
 
 (defn resolve-plan
   "Result<{:resolution :plan :wirings}> of stack `stack-id` for run `run-id`:
@@ -149,10 +154,12 @@
   ([ctx stack-id run-id extra]
    (let [settings (:settings ctx)]
      (r/let-ok [s (stack-config ctx stack-id)
+                ;; a stack's own needs (otel, ...) are needs of every container
+                ;; consumer in it, shared: one instance joins each view network
                 res (capability/resolve-stack (:compose/projects settings) s
-                                              (cond-> {} (seq extra) (assoc :extra extra)))
+                                              {:extra (merge-with merge (run/stack-needs-per-consumer s) extra)})
                 sp (stack/stack-plan settings res run-id {:stack stack-id})
-                ws (wiring/wirings settings res run-id)]
+                ws (wiring/wirings settings res run-id (run/otlp-envs res run-id))]
        (r/ok {:resolution res :plan sp :wirings ws})))))
 
 (defn- consumer-services
@@ -249,18 +256,34 @@
              rid (pick-run-id ctx stack-id run-id)
              {sp0 :plan ws :wirings} (resolve-plan ctx stack-id rid extra)
              sp (with-needs engine (:settings ctx) sp0)
-             pre (preexisting engine (:settings ctx) sp (live-plans ctx))]
+             running (running-footprints engine (:settings ctx) sp)]
     (let [t (now ctx)
-          consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))]
-      (record! ctx rid (constantly {:stack/id stack-id :run rid :started-at t :last-touch t
-                                    :plan sp :preexisting pre :networks (:stack/networks sp)
-                                    :consumers {} :status :partial}))
+          consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))
+          held (section-held ctx)]
+      ;; preexistence is global and permanent: marked by the first run that
+      ;; finds a service running outside every run and section, never cleared.
+      ;; One swap marks against the :stacks current at that moment and records
+      ;; this run, so two runs starting together cannot both miss the other.
+      (swap! (:state ctx)
+             (fn [st]
+               (-> st
+                   (update :preexisting run/mark-preexisting running
+                           (into {} (map (fn [[k e]] [k (:plan e)])) (:stacks st)) rid held)
+                   (assoc-in [:stacks rid] {:stack/id stack-id :run rid :started-at t :last-touch t
+                                            :plan sp :networks (:stack/networks sp)
+                                            :consumers {} :status :partial}))))
+      (persist! ctx)
       (let [res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
                                         (:stack/networks sp))
                            instances (all-ok (fn [{:step/keys [id]}]
                                                (up-instance! ctx engine (get-in sp [:stack/instances id]) wait?))
                                              (filter #(= :instance (:step/kind %)) (:stack/start-order sp)))
                            cs (all-ok (fn [c]
+                                        ;; recorded BEFORE its up: a failed up leaves
+                                        ;; containers that stack-down must still remove
+                                        (record! ctx rid #(assoc-in % [:consumers c]
+                                                                    {:compose-project (run/consumer-compose-project
+                                                                                       (:settings ctx) c rid)}))
                                         (r/map-ok (up-consumer! ctx engine sp ws c wait?)
                                                   (fn [row] (record! ctx rid #(assoc-in % [:consumers c]
                                                                                         (select-keys row [:compose-project :services])))
@@ -307,7 +330,7 @@
 (defn- down-run! [ctx engine rid]
   (let [e (get (stacks ctx) rid)
         sp (:plan e)
-        steps (mapv #(run/sparing-preexisting % (get-in e [:preexisting (:instance %)]))
+        steps (mapv #(run/sparing-preexisting % (run/preexisting-of (:preexisting @(:state ctx)) %))
                     (stack/stack-releases (live-plans ctx) rid (:active @(:state ctx))))
         consumers (mapv #(down-consumer! ctx engine %) (sort-by key (:consumers e)))
         nets (mapv #(port/-network-rm! engine %) (:networks e))

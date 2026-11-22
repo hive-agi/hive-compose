@@ -80,8 +80,16 @@
     (is (not (orphans/enabled? c)))
     (is (= {:started "db"} (:ok (up-guarded c "db" false))))))
 
+(defn- temp-dir
+  "A fresh java.nio temp dir, so the test addon never reads or writes the
+   host's real state file, log dir or profiles file."
+  []
+  (str (java.nio.file.Files/createTempDirectory "hive-compose-orphans-test"
+                                                (make-array java.nio.file.attribute.FileAttribute 0))))
+
 (defn- tool-call [snap params]
-  (let [e (stub/engine {"db" ["postgres"]} {})
+  (let [dir (temp-dir)
+        e (stub/engine {"db" ["postgres"]} {})
         _ (stub/holds! e "dc" {"postgres" {:volumes #{"dc_postgres_data"}}})
         a (addon/make-addon {:compose/engine e
                              :compose/process-table (->FixedTable snap)
@@ -92,7 +100,9 @@
                                                        "orphans-test" (make-array java.nio.file.attribute.FileAttribute 0))
                                                       "/state.edn")
                              :compose/config-source (constantly {})
-                             :compose/profiles-file "/nonexistent/profiles.edn"
+                             :compose/state-file (str dir "/state.edn")
+                             :compose/log-dir (str dir "/logs")
+                             :compose/profiles-file (str dir "/absent-profiles.edn")
                              :compose/profiles {"db" {:profile/id "db" :profile/dir "/w/dc"
                                                       :profile/services ["postgres"]}}
                              :compose/swarm? false :compose/notify? false :compose/adopt? false
