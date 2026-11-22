@@ -23,8 +23,13 @@
    consumer's listen alias) and TOXIPROXY_PROXIES (the proxy names they may
    drive, comma-separated; a suite may drive all of them).
 
-   `plan` answers the interposition; `interpose` rewrites the hc-5 Wirings
-   with it: a consumer's attach keeps exactly the aliases it had, only the
+   Toxiproxy is NOT an instance of the hc-4 StackPlan: `interpose-plan`
+   names it in consumers' attach lists only, so the stack ops must bring it
+   up (`project-spec`, --wait) and run `joins` and `install!` BEFORE any
+   consumer starts; the hc-6 readiness gate does not see it.
+
+   `plan` answers the interposition; `interpose-plan` rewrites the hc-4
+   StackPlan and `interpose` the hc-5 Wirings with it: a consumer's attach keeps exactly the aliases it had, only the
    instance answering them changes. `project-spec` and `joins` are what the
    stack ops (hc-6, IStackEngine) run; `hive-compose.pipeline.faults`
    creates the proxies through IToxiproxyClient."
@@ -457,7 +462,7 @@
       (r/err :compose/faults-invalid-toxic {:toxicity toxicity :hint "toxicity is a number in [0, 1]"})
 
       :else
-      (r/ok (cond-> {"name" (or (some-> (:name spec) str) (str type "_" stream))
+      (r/ok (cond-> {"name" (or (word (:name spec)) (str type "_" stream))
                      "type" type
                      "stream" stream
                      "attributes" attrs}

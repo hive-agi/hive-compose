@@ -243,7 +243,6 @@
     (if (and (some? toxic) (not (map? toxic)))
       (r/err :compose/invalid-param {:param "toxic" :hint "an object {type, attributes, stream, toxicity, name}"})
       (r/ok {:run (some-> (param params "run") str)
-             :url (some-> (param params "url") str)
              :op (some-> (param params "op") str)
              :proxy (some-> (param params "proxy") str)
              :toxic (when toxic

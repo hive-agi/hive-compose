@@ -175,6 +175,7 @@
                 {:type "latency" :attributes {5 1}} {:type {:x 1}} {:name 3}]]
     (is (r/err? (sut/toxic spec)) (pr-str spec)))
   (is (nil? (sut/toxic-name {:type 5})))
+  (is (= "latency_downstream" (get (:ok (sut/toxic {:type "latency" :name 3})) "name")))
   (is (= "latency_upstream" (sut/toxic-name {:type :latency :stream "upstream"}))))
 
 ;; ---------------------------------------------------------------------------
