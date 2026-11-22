@@ -39,7 +39,7 @@ python3 assemble.py        # writes ../../../resources/hive_compose/openapi.yaml
 - A throw, in dispatch or around it, is answered as the envelope (`compose/dispatch-threw` or `compose/internal`) with only the class and message, never ex-data, which could carry env values.
 - Bad `:compose/api` values never fail the addon. That covers a non-loopback host, a port outside 0..65535, threads below 1, and a bind error. `status` then answers `api {error detail}`. A changed `:compose/api` is listed under `reload`'s `:not-reloaded`, because it is rebound at the next initialize!.
 - **Trust model**: there is no auth. Every local process is the operator. `agent`/`agent_id` are taken as sent, so any local caller can claim or release for any agent. That is the same as MCP today, where the host stamps agent_id. A token file is the next step if a non-operator process ever shares the host.
-- Status: 400 missing/invalid-param; 403 forbidden-origin; 415 unsupported-media-type; 404 unknown-command/route/profile/target/project, no-projects; 405 non-POST on a command; 409 not-active, not-claimed, orphans-hold-resources, held-by-another-section; 413; 501 planned; 502 command-failed, secret-unresolved, secrets/unknown-backend; 503 not-initialized, invalid-config; 500 anything else. NB: unknown-command moved from the draft's 400 to 404 (card decision).
+- Status: 400 missing/invalid-param; 403 forbidden-origin; 415 unsupported-media-type; 404 unknown-command/route/profile/target/project, no-projects; 405 non-POST on a command; 409 not-active, not-claimed, orphans-hold-resources, held-by-another-section; 413; 501 planned; 502 command-failed, secret-unresolved, secrets/unknown-backend; 503 not-initialized, invalid-config; 500 anything else. Since the stack, faults and why merges, `status-by-category` maps every category the source answers: 400 invalid, unknown-reference, clash and collision; 404 a named run, stack, test or proxy not there; 409 conflict or exists; 502 a backend (docker, toxiproxy, the trace store) failed or is unreachable; 503 not ready or not configured; 500 a fault of the addon. NB: unknown-command moved from the draft's 400 to 404 (card decision).
 
 ## Source baseline: origin/staging, not the main checkout
 
@@ -59,7 +59,8 @@ Every schema carries `x-source: generated|hand`.
 
 **Hand-written** from the pipeline code:
 - All response payloads: StatusResult/StatusRow, UpResult (also switch, with `released`), DownResult/StepReport, RestartResult, TouchResult, PsResult, LogsResult, ClaimResult, ReleaseResult, WhoResult, NreplResult/Route, ProjectsResult, ReloadResult, ReaperPass/ObserveReport, ProgramReport/ProgramRow, TargetsResult, ProgramsResult, HelpResult, AdoptResult. These are functions building maps with `cond->`, not malli schemas, so nothing could be generated.
-- The envelope (`Ok`, `ErrorEnvelope`), `ErrorCategory` (from the structural-grep), and the HTTP status mapping.
+- The envelope (`Ok`, `ErrorEnvelope`) and the HTTP status mapping (`api/status-by-category`).
+- `ErrorCategory` is generated: assemble.py collects every `(r/err :ns/name ..)` literal under `src/`. `openapi_contract_test` checks the enum against the same scan, and `api_test` checks that `status-by-category` maps every category in it, so neither can drift from the code.
 - The planned paths and the `Report` schema.
 
 ## Design
@@ -100,14 +101,10 @@ hc-lane-edge suggested "without the ns or with a/b style". I chose without the n
 
 | path | op | plan step | params |
 |---|---|---|---|
-| `/v1/stack/plan` | `stack.plan` | hc-4 | `{stack}` |
-| `/v1/stack/up` | `stack.up` | hc-6 | `{stack, run?, wait?}` |
-| `/v1/stack/down` | `stack.down` | hc-6 | `{stack, run}` |
-| `/v1/stack/status` | `stack.status` | hc-6 | `{stack?, run?}` |
 | `/v1/test` | `test` | hc-8 | `{suites, projects, run?}`, a matrix of `Report` |
-| `/v1/why` | `why` | hc-10 | `{test, run?}`, a bundle: spans, logs, plan, memory id |
 | `/v1/flaky` | `flaky` | hc-13 | `{suite?, limit?, since?}`, ranking by flips |
-| `/v1/faults` | `faults` | hc-12 | `{run, consumer, capability, action list/add/remove, toxic}` (Toxiproxy toxic types) |
+
+`/v1/stack-up`, `/v1/stack-down`, `/v1/stack-status`, `/v1/plan`, `/v1/why` and `/v1/faults` were placeholders here. They are live since staging merged hc-4/6/10/12. Their `Req_` schemas are generated from the tool's params like every other command (faults: `run, op, proxy, toxic`). Their results are typed open (`FaultsResult`, `StackUpResult`, ...) until those maps get malli schemas.
 
 The stack params are hc-lane-core's provisional hc-6 params (hivemind, via hc-lane-edge). The response shapes of the planned paths are my guesses from the plan text, apart from Report (from hc-8, relayed). hc-10, hc-12 and hc-13 shapes are unverified against their branches (hc10-trace, hc-13-flaky worktrees have uncommitted or empty work).
 
