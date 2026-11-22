@@ -139,6 +139,13 @@
   (-health [q]
     "Result<{:ready? true}>: the trace store answers, or why it does not."))
 
+(defprotocol IHostMemory
+  "The host's memory, so a stack plan can be admitted against what is free
+   and the reaper can relieve pressure (hc-16a). Stubbed in tests."
+  (-mem-available [m]
+    "Result<long>: MemAvailable in bytes (Linux /proc/meminfo), or why it
+     cannot be read. Never a throw."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
@@ -161,6 +168,21 @@
     "Result<[row]>: every row recorded, in append order, narrowed by `query`
      {:suite s :project p} (a nil or absent key matches any). An absent
      history is []."))
+
+(defprotocol ISuiteRunner
+  "Runs one suite runner to its end under its resource caps (hc-16b): a host
+   command inside a memory-capped systemd user scope (ulimit -v when no user
+   manager answers), a container with docker's memory and cpu flags. See
+   `hive-compose.promote.oom` for the data."
+  (-run! [r spec]
+    "Result<{:exit n-or-nil :started-at ms :finished-at ms :output [line]
+     :timed-out? bool :cap {:mode :systemd|:ulimit|:docker|:none :mem bytes?
+     :cpus n? :note s?} :oom Finding?}>: run `spec` (a runner spec, see
+     `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
+     :command, :dir, :env, :timeout-ms, :test-id, :image, :name, :mounts,
+     :network, :labels, plus :resources {:mem bytes :cpus n}) and wait for its
+     end. A runner that exits non-zero, is OOM-killed or times out is an ok
+     answer; an error only when it could not be started at all."))
 
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
@@ -203,6 +225,27 @@
      :unhealthy :starting :none.")
   (-networks-labelled [e labels]
     "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
+
+(defprotocol IDataExec
+  "Optional engine capability: run a data command (migrate, seed, reset)
+   inside a running container of a stack instance (hc-9). Never removes a
+   container or a volume."
+  (-exec! [e target argv opts]
+    "Result<{:exit 0 :out}>: `docker exec` of `argv` in the running container of
+     `target` ({:project compose-project :service svc}), with `opts` {:env
+     {VAR EnvValue} :timeout-ms n}; secret references in :env are read only
+     now. A non-zero exit is :compose/command-failed carrying :exit and
+     :stderr; no running container is :compose/no-container."))
+
+(defprotocol ICommandRunner
+  "Optional runner capability: run a host command to completion (hc-9 data
+   commands declared as `:command`), unlike `IProgramRunner/-start!`, which
+   detaches a long-lived program."
+  (-run-command! [r argv opts]
+    "Result<{:exit 0 :out}>: run `argv` with `opts` {:dir path :env {VAR
+     EnvValue} :timeout-ms n} and wait for it; secret references in :env are
+     read only now. A non-zero exit is :compose/command-failed carrying :exit
+     and :stderr."))
 
 (defprotocol IToxiproxyClient
   "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is
