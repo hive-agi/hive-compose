@@ -203,7 +203,9 @@
     (testing "long lines (ReDoS)"
       (doseq [s [(str "ok 1 - a" pad "x") (str "ok 1 - a" pad "# x")
                  (str "not ok" pad "#" pad) (str "ok 1 - " (apply str (repeat 200000 "#")))]]
-        (is (r/ok? (bounded #(report/parse-tap s))))))
+        ;; 50 lines, as below: one line alone may slip under the bound when quadratic
+        (let [s (str/join "\n" (repeat 50 s))]
+          (is (r/ok? (bounded #(report/parse-tap s))) (pr-str (subs s 0 10))))))
     (testing "a whitespace run followed by a line terminator split-lines keeps"
       (doseq [nl ["\u2028" "\u2029" "\u0085"]
               s [(str "ok 1 -" pad nl "x") (str "not ok" pad nl "x") (str "ok 1 - a #" pad nl "x")
@@ -265,8 +267,46 @@
     (is (= {"p/a" :passed "p/test 2" :error}
            (by-status (:ok (report/parse-tap "    1..2\n\n    ok 1 - a\nok 1 - p\n1..1"))))
         "and its shortfall still counts, once"))
-  (testing "a subtest no point closes adds no shortfall: the parent's plan counts it"
-    (is (= [["a" :passed] ["test 2" :error]] (tap-cases "1..2\n    1..3\n    ok 1 - a\n"))))
+  (testing "a subtest no point closes is an error taking the closing point's number"
+    (is (= [["test 1/a" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..3\n    ok 1 - a\n")))
+    (is (= [["test 1/a" :passed] ["test 1" :error]]
+           (tap-cases "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\n")))
+    (is (not (report/passed? (:ok (report/parse-tap "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\n"))))
+        "a stream cut mid-subtest never passes")
+    (is (= [["test 1/a" :passed] ["test 1" :error]]
+           (tap-cases "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\nBail out! db")))
+    (is (= [["test 1/a" :passed] ["test 1/b" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..5\n    ok 1 - a\n    ok 2 - b\n")))
+    (is (= [["test 1/a" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..3\n    ok 1 - a\nBail out! db"))
+        "a bail-out inside a subtest: ids never collide")
+    (is (= [["a" :passed]] (tap-cases "ok 1 - a\n    stray indented\n1..1"))
+        "deeper stray output with no point or plan is no subtest"))
+  (testing "a split never breaks a subtest, at any depth (review 2, MAJOR 1)"
+    (doseq [gap ["" "stray" "# note"]]
+      (is (= {"p/a" :passed "p/q/b" :passed "p/q/c" :passed}
+             (by-status (:ok (report/parse-tap (str "    ok 1 - a\n        ok 1 - b\n" gap "\n        ok 2 - c\n"
+                                                    "        1..2\n    ok 2 - q\n    1..2\nok 1 - p\n1..1")))))
+          (pr-str gap))
+      (is (= {"p/q/a" :passed "p/q/b" :passed}
+             (by-status (:ok (report/parse-tap (str "        ok 1 - a\n" gap "\n        ok 2 - b\n        1..2\n"
+                                                    "    ok 1 - q\n    1..1\nok 1 - p\n1..1")))))
+          (str "depth 2 " (pr-str gap)))
+      (is (= {"p/q/r/a" :passed "p/q/r/b" :passed}
+             (by-status (:ok (report/parse-tap (str "            ok 1 - a\n" gap "\n            ok 2 - b\n            1..2\n"
+                                                    "        ok 1 - r\n        1..1\n    ok 1 - q\n    1..1\nok 1 - p\n1..1")))))
+          (str "depth 3 " (pr-str gap)))
+      (is (= {"p/a" :passed "p/b" :passed}
+             (by-status (:ok (report/parse-tap (str "    ok - a\n" gap "\n    ok - b\n    1..2\nok 1 - p\n1..1")))))
+          (str "unnumbered " (pr-str gap))))
+    (is (= {"p/q/a" :passed "p/q/b" :passed}
+           (by-status (:ok (report/parse-tap "        1..2\n\n        ok 1 - a\n        ok 2 - b\n    ok 1 - q\nok 1 - p\n1..1"))))
+        "a plan two deep belongs to the subtest two deep")
+    (is (= {"p/q/a" :passed "p/q/b" :passed "p/q/test 3" :error}
+           (by-status (:ok (report/parse-tap (str "        1..3\n\n        ok 1 - a\n        ok 2 - b\n    ok 1 - q\n"
+                                                  "    1..1\nok 1 - p\n1..1")))))
+        "and its shortfall is reported there, not lost"))
   (testing "a subtest plan promising far more than ran reads as broken"
     (is (= :tap/implausible-plan
            (:reason (bounded #(report/parse-tap "    1..99999999\n    ok 1 - c\nok 1 - p\n1..1")))))
@@ -463,3 +503,76 @@
       (and (not (:thrown res))
            (or (and (r/ok? res) (report/valid-report? (:ok res)) (all-counted? (:ok res)))
                (= :report/malformed (:error res)))))))
+
+;; Well-formed nested TAP: a level is {:first? plan-before-points :nodes [..]},
+;; each node nil (a leaf point) or a deeper level (the subtest its point closes).
+(defn- gen-level [depth]
+  (gen/let [first? gen/boolean
+            nodes (gen/vector (if (< depth 3)
+                                (gen/frequency [[2 (gen/return nil)] [1 (gen-level (inc depth))]])
+                                (gen/return nil))
+                              1 3)]
+    {:first? first? :nodes nodes}))
+
+(defn- render-level
+  "Lines of `level`, `d` deep, its points `ok i - t<i>`; the level whose id
+   prefix is `short` plans one test more than it has."
+  [{:keys [first? nodes]} d prefix short]
+  (let [pad (apply str (repeat (* 4 d) " "))
+        plan [(str pad "1.." (cond-> (count nodes) (= prefix short) inc))]
+        body (mapcat (fn [i kid]
+                       (concat (when kid (render-level kid (inc d) (str prefix "t" (inc i) "/") short))
+                               [(str pad "ok " (inc i) " - t" (inc i))]))
+                     (range) nodes)]
+    (if first? (concat plan body) (concat body plan))))
+
+(defn- leaf-ids [{:keys [nodes]} prefix]
+  (mapcat (fn [i kid]
+            (let [id (str prefix "t" (inc i))]
+              (if kid (leaf-ids kid (str id "/")) [id])))
+          (range) nodes))
+
+(defn- level-prefixes
+  "[prefix level] of `level` and of every subtest under it."
+  [level prefix]
+  (cons [prefix level]
+        (mapcat (fn [i kid] (when kid (level-prefixes kid (str prefix "t" (inc i) "/"))))
+                (range) (:nodes level))))
+
+(def ^:private gen-noise-lines
+  "Blank lines and stray output, at any depth, to insert anywhere."
+  (gen/vector (gen/tuple gen/nat (gen/elements ["" "  " "stray" "# note" "    stray" "    # note"
+                                                "        stray" "            x" "        # deep"]))
+              0 6))
+
+(defn- with-noise [lines noise]
+  (reduce (fn [v [pos line]]
+            (let [i (mod pos (inc (count v)))]
+              (into (conj (subvec v 0 i) line) (subvec v i))))
+          (vec lines) noise))
+
+(defspec noise-never-breaks-a-subtest 300
+  (prop/for-all [top (gen-level 0)
+                 noise gen-noise-lines]
+    (let [res (report/parse-tap (str/join "\n" (with-noise (render-level top 0 "" nil) noise)))
+          cases (:report/cases (:ok res))
+          ids (map :case/id cases)]
+      (and (r/ok? res)
+           (report/passed? (:ok res))
+           (every? #(= :passed (:case/status %)) cases)
+           (apply distinct? ids)
+           (= (leaf-ids top "") ids)))))
+
+(defspec a-short-plan-fails-at-its-own-path 300
+  (prop/for-all [[top [prefix level]] (gen/bind (gen-level 0)
+                                                (fn [top] (gen/tuple (gen/return top)
+                                                                     (gen/elements (level-prefixes top "")))))
+                 noise gen-noise-lines]
+    (let [res (report/parse-tap (str/join "\n" (with-noise (render-level top 0 "" prefix) noise)))
+          cases (:report/cases (:ok res))
+          bad (filter #(not= :passed (:case/status %)) cases)]
+      (and (r/ok? res)
+           (= [[(str prefix "test " (inc (count (:nodes level)))) :error]]
+              (map (juxt :case/id :case/status) bad))
+           (= (leaf-ids top "") (map :case/id (remove (set bad) cases)))
+           (apply distinct? (map :case/id cases))))))

@@ -344,41 +344,67 @@
     (vswap! budget - (count short))
     (into pending (map (fn [c] {:num nil :case c :children []})) short)))
 
+(defn- fold-subtest
+  "{:points :plan} of the subtest whose tokens are `pending`, folded at the
+   depth of its shallowest test point or plan (stray output, a comment or a
+   YAML block indented less never sets it). Tokens holding neither are
+   stray output: no points, no plan."
+  [pending budget]
+  (if-let [ds (seq (keep #(when (#{:test :plan} (:kind %)) (:depth %)) pending))]
+    (fold-level pending (apply min ds) budget)
+    {:points [] :plan nil}))
+
+(defn- unclosed
+  "What a subtest no point closed leaves at its parent's level, when the
+   stream ends inside it (truncated, or bailed out): an :error point taking
+   the number the closing point would have had, its points as children (so
+   their ids are prefixed and never collide with the parent's), no
+   shortfall of its own (the error stands for the whole subtest). A run of
+   deeper lines holding no point and no plan is stray output and leaves
+   nothing."
+  [pending n budget]
+  (when (seq pending)
+    (let [{:keys [points plan]} (fold-subtest pending budget)]
+      (when (or (seq points) plan)
+        [{:num (inc n)
+          :case (tap-case (str "test " (inc n)) :error "not run: subtest never closed by a test point")
+          :children points}]))))
+
 (defn- fold-level
   "Fold the tokens of one level, `d` deep, into {:points [..] :plan n}.
    Deeper tokens are a subtest; TAP 14 prints it before the point that closes
    it, which takes the subtest's points as :children, plus its plan's
-   shortfall (see `with-shortfall`). A subtest may come in several runs of
-   deeper tokens (a blank line or stray output at this depth splits it): the
-   shortfall is reckoned once, when the closing point takes them all, against
-   the last plan any of them carried. A subtest no point closes (a truncated
-   or bailed run) adds no shortfall: its parent's own plan already counts the
-   parent as missing."
+   shortfall (see `with-shortfall`). The deeper tokens are gathered until
+   that point and folded once, then, at every depth below this one: a blank
+   line, stray output or a comment at this depth (or shallower) inside a
+   subtest is dropped, never splitting it, so its numbering and its plan
+   stay whole. A subtest no point closes is `unclosed`."
   [tokens d budget]
-  (loop [tokens tokens points [] plan nil pending [] sub-plan nil n 0 open? false]
+  (loop [tokens tokens points [] plan nil pending [] n 0 open? false]
     (if-let [{:keys [kind] :as t} (first tokens)]
       (cond
-        (and (> (:depth t) d) (not (#{:yaml :comment} kind)))
-        (let [[deeper more] (split-with #(> (:depth %) d) tokens)
-              deeper (vec deeper)
-              sub (fold-level deeper (apply min (map :depth deeper)) budget)]
-          (recur more points plan (into pending (:points sub)) (or (:plan sub) sub-plan) n false))
+        (and (> (:depth t) d) (or (seq pending) (not (#{:yaml :comment} kind))))
+        (recur (rest tokens) points plan (conj pending t) n false)
 
         (= :test kind)
-        (let [p (assoc (test-point (:body t) (inc n)) :children (with-shortfall pending sub-plan budget))]
-          (recur (rest tokens) (conj points p) plan [] nil (:num p) true))
+        (let [children (if (seq pending)
+                         (let [sub (fold-subtest pending budget)]
+                           (with-shortfall (:points sub) (:plan sub) budget))
+                         [])
+              p (assoc (test-point (:body t) (inc n)) :children children)]
+          (recur (rest tokens) (conj points p) plan [] (:num p) true))
 
-        (= :plan kind) (recur (rest tokens) points (:n t) pending sub-plan n false)
+        (= :plan kind) (recur (rest tokens) points (:n t) pending n false)
 
         (and open? (= :yaml kind))
-        (recur (rest tokens) (attach points t) plan pending sub-plan n true)
+        (recur (rest tokens) (attach points t) plan pending n true)
 
         (and open? (= :comment kind) (<= (:depth t) d)
              (not (re-find #"(?i)^#\s*subtest\b" (:text t))))
-        (recur (rest tokens) (attach points t) plan pending sub-plan n true)
+        (recur (rest tokens) (attach points t) plan pending n true)
 
-        :else (recur (rest tokens) points plan pending sub-plan n false))
-      {:points (into points pending) :plan plan})))
+        :else (recur (rest tokens) points plan pending n false))
+      {:points (into points (unclosed pending n budget)) :plan plan})))
 
 (defn- prefix-id [parent child]
   (update child :case assoc :case/id (str (get-in parent [:case :case/id]) "/" (get-in child [:case :case/id]))))
@@ -402,7 +428,8 @@
    diagnostic block kept raw as its point's message, trailing `#` comments as
    its output, subtests flattened into `parent/child` ids. A test the plan
    promised and that never ran counts as :error, a subtest's plan included
-   (`parent/test N`); so does `Bail out!` without a plan. Text with no plan, no test point and no bail-out, or a plan promising
+   (`parent/test N`); so does a subtest no test point closes (`test N`,
+   the number that point would have had), and `Bail out!` without a plan. Text with no plan, no test point and no bail-out, or a plan promising
    more than `max-missing` tests beyond those that ran, is
    `:report/malformed`."
   [text]
