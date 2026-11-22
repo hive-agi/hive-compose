@@ -35,12 +35,18 @@
           "claims of a run from both sides survive")
       (is (= {} (:stacks (sync/merge-state b (assoc b :stacks {}) b))) "mine took the run down"))))
 
-(deftest preexistence-marks-only-grow
+(deftest preexistence-marks-merge-by-service
   (let [b {:active {} :current nil :preexisting {"infra/kafka" #{"kafka"}}}]
     (is (= {"infra/kafka" #{"kafka"} "infra/pg" #{"db"}}
            (:preexisting (sync/merge-state b (dissoc b :preexisting)
                                            (assoc-in b [:preexisting "infra/pg"] #{"db"}))))
-        "a side without the key never removes a mark")))
+        "a side without the key never removes a mark")
+    (is (= {"infra/pg" #{"db"}}
+           (:preexisting (sync/merge-state b (assoc b :preexisting {})
+                                           (assoc-in b [:preexisting "infra/pg"] #{"db"}))))
+        "a reconciled removal sticks, an addition from the other side lands")
+    (is (= {"infra/kafka" #{"kafka" "zookeeper"}}
+           (:preexisting (sync/merge-state b (update-in b [:preexisting "infra/kafka"] conj "zookeeper") b))))))
 
 (deftest both-sides-changed-an-entry
   (let [base {:active {"a" (entry 1 "x" 1)}}

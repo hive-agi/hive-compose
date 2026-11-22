@@ -128,6 +128,45 @@
     (let [c (ctx {:compose/host-reserve "4g"} nil)]
       (is (r/ok? (stacks/stack-up! c {:stack "shop"}))))))
 
+(defrecord HookedMemory [available on-read]
+  port/IHostMemory
+  (-mem-available [_] (on-read) (r/ok available)))
+
+(defn- blocked? [^Thread t]
+  ;; waiting on the stack lock's monitor: BLOCKED, three polls in a row
+  (every? (fn [_] (Thread/sleep 5) (= Thread$State/BLOCKED (.getState t))) (range 3)))
+
+(deftest two-concurrent-ups-over-the-budget-admit-one
+  ;; audit is 1.25g (private kafka + zookeeper), :compose/budget 2g: two runs
+  ;; together exceed it. Each up reads MemAvailable inside its admission; the
+  ;; first clock read after it (before the run is recorded) waits until the
+  ;; other up has admitted too, or is blocked on the stack lock. Unserialized,
+  ;; both admit against a state holding neither; serialized, the second
+  ;; admits against the first's recorded budget and is refused.
+  (let [admitted (atom #{}) threads (atom []) waited (atom #{})
+        c (assoc (ctx {:compose/budget "2g"} nil)
+                 :host-memory (->HookedMemory (* 64 gi) #(swap! admitted conj (Thread/currentThread))))
+        clock (:now c)
+        c (assoc c :now (fn []
+                          (let [me (Thread/currentThread)]
+                            (when (and (contains? @admitted me) (not (contains? @waited me)))
+                              (swap! waited conj me)
+                              (let [end (+ (System/currentTimeMillis) 10000)]
+                                (loop []
+                                  (when-not (or (= 2 (count @admitted))
+                                                (some #(and (not= % me) (blocked? %)) @threads))
+                                    (when (> (System/currentTimeMillis) end)
+                                      (throw (ex-info "timed out waiting for the other up" {})))
+                                    (Thread/sleep 2)
+                                    (recur))))))
+                          (clock)))
+        up! #(future (swap! threads conj (Thread/currentThread)) (stacks/stack-up! c {:stack "audit"}))
+        f1 (up!) f2 (up!)
+        rs [(deref f1 10000 ::timeout) (deref f2 10000 ::timeout)]]
+    (is (= 1 (count (filter r/ok? rs))) (pr-str rs))
+    (is (= [:compose/over-budget] (keep :error rs)))
+    (is (= 1 (count (:stacks @(:state c)))) "only the admitted run is recorded")))
+
 (deftest a-running-shared-instance-takes-no-new-host-memory
   (let [c (ctx {:compose/host-reserve "1g"} (* 4 gi))]
     (is (r/ok? (stacks/stack-up! c {:stack "shop"})) "kafka 2g + pg 256m fit 3g")

@@ -91,6 +91,26 @@
       (is (= [] (:why/span-path b)))
       (is (str/includes? (why/render-markdown b) "No error span found")))))
 
+(deftest an-oom-cell-names-its-service-and-cap
+  (let [f {:oom/service "orders-suite/orders" :oom/source :container :oom/cap 268435456
+           :oom/exit 137 :oom/line "orders-suite/orders OOM-killed at 256m"}
+        oom-cell (assoc cell :exit 137 :status :error :oom f)
+        b (why/bundle {:case kase :cell-result oom-cell :traces [] :logs {}})
+        md (why/render-markdown b)]
+    (is (= {:suite/id "orders-suite" :project "orders" :status :error :exit 137
+            :oom/service "orders-suite/orders" :oom/cap 268435456
+            :oom/line "orders-suite/orders OOM-killed at 256m"}
+           (:why/cell b)))
+    (is (str/includes? (:why/summary b) "orders-suite/orders OOM-killed at 256m"))
+    (is (str/includes? md "OOM-killed at 256m"))
+    (testing "the line is printed once when the case message already is it"
+      (let [b (why/bundle {:case (assoc kase :case/message (:oom/line f)) :cell-result oom-cell
+                           :traces [] :logs {}})]
+        (is (= 1 (count (re-seq #"OOM-killed" (:why/summary b)))))))
+    (testing "a cell with no :oom keeps the old cell row"
+      (is (= #{:suite/id :project :status :exit}
+             (set (keys (:why/cell (why/bundle {:case kase :cell-result cell :traces [] :logs {}})))))))))
+
 ;; ---------------------------------------------------------------- properties
 
 (def gen-trace

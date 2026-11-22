@@ -460,6 +460,22 @@
       (is (every? #(and (string? (:case/id %)) (keyword? (:case/status %)))
                   (get-in res [:report :report/cases]))))))
 
+(deftest an-oom-finding-reaches-the-cell-result
+  (let [f {:oom/service "smoke/shop" :oom/source :container :oom/cap 268435456 :oom/exit 137
+           :oom/line "smoke/shop OOM-killed at 256m"}
+        out (suite/runner-outcome {:exit 137 :started-at 10 :finished-at 30 :timed-out? false :oom f}
+                                  (r/err :report/none {:dir "/x"}))
+        res (suite/cell-result "r01" cell out)]
+    (is (= f (:oom res)))
+    (is (= :error (:status res)))
+    (is (= 20 (:duration-ms res)))
+    (is (= "smoke/shop OOM-killed at 256m" (get-in (suite/matrix-summary [res]) [:failures 0 :oom/line]))))
+  (testing "no finding, no :oom; a timed-out runner has no exit"
+    (let [res (suite/cell-result "r01" cell (suite/runner-outcome {:exit 1 :timed-out? true} (r/err :report/none {})))]
+      (is (not (contains? res :oom)))
+      (is (nil? (:exit res)))
+      (is (not (contains? (first (:failures (suite/matrix-summary [res]))) :oom/line))))))
+
 (def gen-status (gen/elements [:passed :failed :error :skipped]))
 (def gen-exit (gen/one-of [(gen/return 0) (gen/return nil) (gen/choose -1 255)]))
 (def gen-report-res

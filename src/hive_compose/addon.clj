@@ -334,6 +334,8 @@
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
                     (on-subject #(swarm/release-claim! ctx % (agent-param params)
                                                        {:stop? (flag params "stop")})))
+        ;; stack-up/stack-down/claim/release and the reaper's stacks/reap! take
+        ;; the one stack lock of ctx's state (stacks/serialized): never concurrent
         "stack-up" (stacks/stack-up! ctx (stack-opts params))
         "stack-down" (stacks/stack-down! ctx (stack-opts params))
         "stack-status" (stacks/stack-status ctx (stack-opts params))

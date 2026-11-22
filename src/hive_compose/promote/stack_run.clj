@@ -229,9 +229,10 @@
    section holds it (`section-held`, {compose-project #{service}}, which
    keeps and releases it). Shared instances run under their provider's
    compose project, so `running` keys are both provider and compose project.
-   Marks only grow: a mark is never cleared, so whichever run leaves last
-   never removes what ran before the runs. Pure; computed against the state
-   current inside the swap, so concurrent runs cannot race it."
+   A mark of a running service is never cleared, so whichever run leaves
+   last never removes what ran before the runs; only `reconcile-preexisting`
+   drops the mark of one that no longer runs. Pure; computed against the
+   state current inside the swap, under the stack lock."
   [marks running runs run section-held]
   (let [others (held-by-others runs run)]
     (reduce-kv (fn [m provider svcs]
@@ -241,6 +242,28 @@
                    (cond-> m (seq fresh) (update provider (fnil into (sorted-set)) fresh))))
                (or marks {})
                running)))
+
+(defn reconcile-preexisting
+  "Preexistence marks with those a run's probe disproves dropped. `probed`
+   is #{[provider-project service]}: the footprints of the run's shared
+   instances, which the probe read. `running` is {provider-project
+   #{service}}: what of them ran. A mark of a probed service that does not
+   run, and that no other live run's instance holds (`runs` {run StackPlan},
+   `run` excluded), is the world's no longer: whoever removed it took it
+   back, so this run starts it and owns it, and its down releases it. A
+   mark of a running service, or of one outside the probe, stays. Pure;
+   computed inside the swap, under the stack lock."
+  [marks probed running runs run]
+  (let [others (held-by-others runs run)
+        gone (fn [provider svc]
+               (and (contains? probed [provider svc])
+                    (not (contains? (get running provider #{}) svc))
+                    (not (others [provider svc]))))]
+    (reduce-kv (fn [m provider svcs]
+                 (let [kept (into (sorted-set) (remove #(gone provider %)) svcs)]
+                   (if (seq kept) (assoc m provider kept) (dissoc m provider))))
+               (or marks {})
+               (or marks {}))))
 
 (defn preexisting-of
   "[service] marked preexisting for the provider project of release `step`

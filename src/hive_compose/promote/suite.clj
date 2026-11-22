@@ -465,11 +465,14 @@
   "The run result of `cell` in `run`, in the shape hc-13 `record-run!` takes:
      {:run/id :suite/id :project :exit :status :passed|:failed|:error
       :report Report?  :report-error {:error :message ..}?
-      :started-at :finished-at :duration-ms}
+      :started-at :finished-at :duration-ms  :oom Finding?}
    `outcome` is {:exit n-or-nil :report Result<Report> :started-at ms
-   :finished-at ms}. A report error such as :report/none (nothing written)
-   counts as no report; the error is kept under :report-error."
-  [run cell {:keys [exit report started-at finished-at]}]
+   :finished-at ms :oom Finding?}. A report error such as :report/none
+   (nothing written) counts as no report; the error is kept under
+   :report-error. `:oom` is the runner's OOM finding (hc-16b
+   `hive-compose.promote.oom`), kept as is: `why` prints its line and the
+   flake history classes the run :oom."
+  [run cell {:keys [exit report started-at finished-at oom]}]
   (let [rep (when (r/ok? report) (:ok report))]
     (cond-> {:run/id run
              :suite/id (:suite/id cell)
@@ -481,7 +484,19 @@
       started-at (assoc :started-at started-at)
       finished-at (assoc :finished-at finished-at)
       (and (number? started-at) (number? finished-at))
-      (assoc :duration-ms (max 0 (- finished-at started-at))))))
+      (assoc :duration-ms (max 0 (- finished-at started-at)))
+      (map? oom) (assoc :oom oom))))
+
+(defn runner-outcome
+  "The `cell-result` outcome of an ISuiteRunner answer `answer` (hc-16b
+   `hive-compose.port/-run!`: {:exit :started-at :finished-at :oom ..}) and
+   the cell's `report` (Result<Report>). A timed-out runner has exit nil."
+  [answer report]
+  (cond-> {:exit (when-not (:timed-out? answer) (:exit answer))
+           :report report}
+    (:started-at answer) (assoc :started-at (:started-at answer))
+    (:finished-at answer) (assoc :finished-at (:finished-at answer))
+    (map? (:oom answer)) (assoc :oom (:oom answer))))
 
 ;; ---------------------------------------------------------------------------
 ;; (e) Summary
@@ -524,8 +539,9 @@
             :by-project (by :project)
             :failures (->> results
                            (remove #(= :passed (:status %)))
-                           (map #(assoc (select-keys % [:suite/id :project :status :exit])
-                                        :cases (failed-cases %)))
+                           (map #(cond-> (assoc (select-keys % [:suite/id :project :status :exit])
+                                                :cases (failed-cases %))
+                                   (get-in % [:oom :oom/line]) (assoc :oom/line (get-in % [:oom :oom/line]))))
                            (sort-by (juxt :suite/id :project))
                            vec)
             :duration-ms (reduce + 0 (keep :duration-ms results))}
