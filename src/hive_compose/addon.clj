@@ -19,6 +19,7 @@
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
+            [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
             [hive-compose.promote.env :as env]
@@ -116,6 +117,8 @@
                   (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
      :settings settings
      :state state
+     :faults (atom {})
+     :toxiproxy (:compose/toxiproxy cfg)
      :now (or (:compose/now cfg) now-ms)
      :save! (or (:compose/save! cfg) (fn [_] (sync!)))
      :sync! (when-not (:compose/save! cfg) sync!)}))
@@ -183,6 +186,7 @@
    "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
+   "faults" "fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer, attributes {name number}, stream upstream|downstream, toxicity 0..1, name}"
    "reload" "re-read the config"))
 
 (def commands
@@ -230,6 +234,22 @@
     (let [n (swarm/announce-up! ctx (get-in res [:ok :profile]))]
       (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
     res))
+
+(defn- faults-request
+  "Result<request> of the `faults` command's params: run, op, proxy and toxic
+   ({type attributes stream toxicity name}, keys as JSON gives them)."
+  [params]
+  (let [toxic (param params "toxic")]
+    (if (and (some? toxic) (not (map? toxic)))
+      (r/err :compose/invalid-param {:param "toxic" :hint "an object {type, attributes, stream, toxicity, name}"})
+      (r/ok {:run (some-> (param params "run") str)
+             :url (some-> (param params "url") str)
+             :op (some-> (param params "op") str)
+             :proxy (some-> (param params "proxy") str)
+             :toxic (when toxic
+                      (let [t (into {} (map (fn [[k v]] [(keyword (name k)) v])) toxic)]
+                        (cond-> t
+                          (map? (:attributes t)) (update :attributes #(into {} (map (fn [[k v]] [(name k) v])) %)))))}))))
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
@@ -279,6 +299,7 @@
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
+        "faults" (r/bind (faults-request params) #(faults/faults! ctx %))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
                                          :hint "command=help lists what each does"})))))
@@ -320,7 +341,11 @@
                               "note" {:type "string" :description "[claim] what the agent works on"}
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
-                              "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
+                              "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
+                              "run" {:type "string" :description "[faults] the stack run id"}
+                              "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
+                              "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
+                              "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}
                  :required ["command"]}
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
