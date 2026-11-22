@@ -67,7 +67,7 @@
         steps (atom [])]
     (sut/install! x p "http://x")
     (is (= {:run "run1" :steps [:down-project :network-rm]}
-           (:ok (sut/teardown! x p (fn [s] (swap! steps conj s) (r/ok {}))))))
+           (:ok (sut/teardown! x p "/tmp/tp" (fn [s] (swap! steps conj s) (r/ok {}))))))
     (is (= [{:step :down-project :project "hive-toxiproxy-faults-run1" :all? true}
             {:step :network-rm :network "hive-run1-faults"}]
            (mapv #(cond-> (select-keys % [:step :network])
@@ -76,11 +76,11 @@
     (is (= :compose/faults-no-toxiproxy (:error (sut/faults! x {:run "run1"}))) "the run is forgotten")
     (testing "a failing step stops the teardown and names it"
       (sut/install! x p "http://x")
-      (is (= :network-rm (:step (sut/teardown! x p (fn [s] (if (= :network-rm (:step s))
+      (is (= :network-rm (:step (sut/teardown! x p "/tmp/tp" (fn [s] (if (= :network-rm (:step s))
                                                                (r/err :stub/fault)
                                                                (r/ok {}))))))))
     (testing "nothing interposed, nothing to undo"
-      (is (= [] (:steps (:ok (sut/teardown! x none (fn [_] (throw (ex-info "must not run" {})))))))))))
+      (is (= [] (:steps (:ok (sut/teardown! x none "/tmp/tp" (fn [_] (throw (ex-info "must not run" {})))))))))))
 
 (deftest install-of-nothing-is-a-no-op
   (let [c (stub/client)

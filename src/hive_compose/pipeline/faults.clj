@@ -49,19 +49,20 @@
   (r/ok {:run run}))
 
 (defn teardown!
-  "Result<{:run :steps [step]}>: undo plan `p` at stack-down. Runs each of
+  "Result<{:run :steps [step]}>: undo plan `p` at stack-down, `dir` holding
+   the compose fragment it came up from. Runs each of
    `promote.faults/teardown` through `exec-step!` ((fn [step] Result), the
    hc-6 stack ops map :down-project to `-down-project!` and :network-rm to
    `-network-rm!`), stopping at the first error, then forgets the run. A
    plan that interposes nothing runs no step."
-  [ctx p exec-step!]
+  [ctx p dir exec-step!]
   (r/let-ok [done (reduce (fn [acc step]
                             (let [res (exec-step! step)]
                               (if (r/err? res)
                                 (reduced (assoc res :step (:step step)))
                                 (r/map-ok acc #(conj % (:step step))))))
                           (r/ok [])
-                          (faults/teardown p))]
+                          (faults/teardown p dir))]
     (forget! ctx (:faults/run p))
     (r/ok {:run (:faults/run p) :steps done})))
 
@@ -104,9 +105,7 @@
                            body (faults/toxic (or toxic {}))]
                   (port/-add-toxic! client pname body))
           "remove" (r/let-ok [pname (proxy-param proxy proxies)]
-                     (let [tname (or (:name toxic)
-                                     (when (:type toxic)
-                                       (str (name (:type toxic)) "_" (name (or (:stream toxic) "downstream")))))]
+                     (let [tname (faults/toxic-name toxic)]
                        (if tname
                          (port/-remove-toxic! client pname tname)
                          (r/err :compose/invalid-param {:param "toxic"

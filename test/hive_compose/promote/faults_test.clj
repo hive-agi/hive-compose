@@ -129,6 +129,54 @@
     (is (= {"hive.run" "run1" "hive.instance" "faults/toxiproxy"} (:labels spec)))
     (is (:wait? spec))))
 
+(defn- stack-plan
+  "A StackPlan in the hc-4 shape (only the keys interpose-plan reads), as
+   promote.stack/stack-plan builds it from `resolution`."
+  [resolution]
+  (let [bindings (:resolution/bindings resolution)
+        binders (fn [iid] (sort (keep (fn [[c caps]] (when (some #{iid} (vals caps)) c)) bindings)))]
+    {:stack/run run
+     :stack/instances (into (sorted-map)
+                            (map (fn [[iid i]]
+                                   [iid (assoc i :instance/networks
+                                               (mapv #(schema/view-network run %) (binders iid)))]))
+                            (:resolution/instances resolution))
+     :stack/consumers (into (sorted-map)
+                            (map (fn [[c caps]]
+                                   [c {:consumer/id c
+                                       :consumer/network (schema/view-network run c)
+                                       :consumer/attach (vec (for [iid (sort (distinct (vals caps)))]
+                                                               {:instance iid
+                                                                :aliases (get-in resolution [:resolution/instances iid :instance/aliases])}))}]))
+                            bindings)
+     :stack/networks (vec (sort (map #(schema/view-network run %) (keys bindings))))}))
+
+(deftest the-stack-plan-follows-the-interposition
+  (let [p (:ok (sut/plan (settings {"pg" {:via :toxiproxy}} {}) resolution run))
+        sp (sut/interpose-plan p (stack-plan resolution))]
+    (is (= ["hive-run1-b"] (get-in sp [:stack/instances "db/pg" :instance/networks]))
+        "pg leaves a's view net and stays on b's, which is not interposed")
+    (is (= [{:instance "db/redis" :aliases ["redis"]} {:instance "faults/toxiproxy" :aliases ["pg"]}]
+           (get-in sp [:stack/consumers "a" :consumer/attach])))
+    (is (= [{:instance "db/pg" :aliases ["pg"]}] (get-in sp [:stack/consumers "b" :consumer/attach])))
+    (is (some #{"hive-run1-faults"} (:stack/networks sp)) "the faults network is created with the stack's")
+    (is (= (stack-plan resolution)
+           (sut/interpose-plan (:ok (sut/plan (settings {} {}) resolution run)) (stack-plan resolution))))))
+
+(deftest teardown-reuses-the-project-spec
+  (let [p (:ok (sut/plan (settings {"pg" {:via :toxiproxy}} {}) resolution run))
+        [down rm] (sut/teardown p "/tmp/tp")]
+    (is (= (assoc (sut/project-spec p "/tmp/tp") :all? true) (:spec down)))
+    (is (= ["/tmp/tp/compose.yml"] (get-in down [:spec :files])))
+    (is (= {:step :network-rm :network "hive-run1-faults"} rm))))
+
+(deftest toxic-never-throws-on-json
+  (doseq [spec [nil 5 "latency" {:type 5} {:type "latency" :stream 7} {:type "latency" :attributes [1 2]}
+                {:type "latency" :attributes {5 1}} {:type {:x 1}} {:name 3}]]
+    (is (r/err? (sut/toxic spec)) (pr-str spec)))
+  (is (nil? (sut/toxic-name {:type 5})))
+  (is (= "latency_upstream" (sut/toxic-name {:type :latency :stream "upstream"}))))
+
 ;; ---------------------------------------------------------------------------
 ;; Properties
 
@@ -178,6 +226,19 @@
       (and (r/ok? ws)
            (= (set (keys wirings)) (set (keys (:ok ws))))
            (every? (fn [[c w]] (= (alias-set w) (alias-set (get (:ok ws) c)))) wirings)))))
+
+(defspec an-interposed-instance-never-joins-its-consumers-view-network 100
+  (prop/for-all [{:keys [settings resolution]} gen-world]
+    (let [p (:ok (sut/plan settings resolution run))
+          sp (sut/interpose-plan p (stack-plan resolution))]
+      (and (every? (fn [{:proxy/keys [consumer instance]}]
+                     (not (some #{(schema/view-network run consumer)}
+                                (get-in sp [:stack/instances instance :instance/networks]))))
+                   (:faults/proxies p))
+           (every? (fn [[c cp]]
+                     (= (set (mapcat :aliases (get-in (stack-plan resolution) [:stack/consumers c :consumer/attach])))
+                        (set (mapcat :aliases (:consumer/attach cp)))))
+                   (:stack/consumers sp))))))
 
 (defspec a-need-without-via-yields-no-proxy 100
   (prop/for-all [{:keys [settings resolution needs]} gen-world]

@@ -297,6 +297,50 @@
             (sort-by key wirings))))
 
 ;; ---------------------------------------------------------------------------
+;; The hc-4 StackPlan
+
+(defn interpose-plan
+  "StackPlan `sp` (hive-compose.promote.stack/stack-plan, as the hc-6 stack
+   ops consume it) rewritten by faults plan `p`, so that what the ops connect
+   matches the interposition:
+   - each interposed instance leaves the view network of every consumer it
+     is interposed for (`:instance/networks`), so Docker DNS answers the
+     original alias on that network with toxiproxy alone;
+   - each such consumer's `:consumer/attach` names toxiproxy, not the
+     instance, for the interposed aliases (aliases unchanged);
+   - `:stack/networks` gains the faults network, so the ops create it
+     (labelled like every stack network) before anything joins it.
+   The instance reaches the faults network, and toxiproxy every view network,
+   through `joins`. `sp` is returned as it is when `p` interposes nothing."
+  [p sp]
+  (if-not (active? p)
+    sp
+    (let [run (:faults/run p)
+          drop-nets (reduce (fn [acc {:proxy/keys [instance consumer]}]
+                              (update acc instance (fnil conj #{}) (schema/view-network run consumer)))
+                            {} (:faults/proxies p))
+          gone (into {} (map (fn [[c {:keys [instances]}]] [c (set instances)])) (:faults/consumers p))]
+      (-> sp
+          (update :stack/instances
+                  (fn [is] (into (empty is)
+                                 (map (fn [[iid ip]]
+                                        [iid (if-let [nets (get drop-nets iid)]
+                                               (update ip :instance/networks #(vec (remove nets %)))
+                                               ip)]))
+                                 is)))
+          (update :stack/consumers
+                  (fn [cs] (into (empty cs)
+                                 (map (fn [[c cp]]
+                                        (let [g (get gone c #{})
+                                              [moved kept] ((juxt filter remove) #(g (:instance %)) (:consumer/attach cp))
+                                              aliases (vec (distinct (mapcat :aliases moved)))]
+                                          [c (cond-> cp
+                                               (seq moved) (assoc :consumer/attach
+                                                                  (vec (sort-by :instance (conj (vec kept) {:instance instance-id :aliases aliases})))))])))
+                                 cs)))
+          (update :stack/networks #(vec (sort (distinct (conj (vec %) (:faults/network p))))))))))
+
+;; ---------------------------------------------------------------------------
 ;; What the stack ops run
 
 (defn joins
@@ -338,10 +382,10 @@
    network). 2. `-network-rm!` of the faults network (which disconnects the
    interposed instances still attached, shared ones included). [] when `p`
    interposes nothing."
-  [p]
+  [p dir]
   (if-not (active? p)
     []
-    [{:step :down-project :spec (assoc (project-spec p nil) :all? true :dir nil :files [])}
+    [{:step :down-project :spec (assoc (project-spec p dir) :all? true)}
      {:step :network-rm :network (:faults/network p)}]))
 
 (defn proxy-config
@@ -363,16 +407,39 @@
    "limit_data" #{"bytes"}
    "slicer" #{"average_size" "size_variation" "delay"}})
 
+(defn word
+  "A keyword, symbol or string as its name; anything else (a number, a map,
+   nil) as nil. Total: never throws on what JSON can send."
+  [x]
+  (cond (string? x) x
+        (ident? x) (name x)
+        :else nil))
+
+(defn toxic-name
+  "The name of the toxic a remove names: its :name, else `<type>_<stream>`
+   (stream downstream by default), nil when neither is usable."
+  [spec]
+  (when (map? spec)
+    (or (word (:name spec))
+        (when-let [t (word (:type spec))]
+          (str t "_" (or (word (:stream spec)) "downstream"))))))
+
 (defn toxic
   "Result<toxic body> of a toxic spec as the `faults` command takes it:
    {:type :attributes {name number} :stream upstream|downstream
     :toxicity 0..1 :name}. The name defaults to `<type>_<stream>`."
-  [{:keys [type attributes stream toxicity] :as spec}]
-  (let [type (some-> type name)
-        stream (or (some-> stream name) "downstream")
-        attrs (into {} (map (fn [[k v]] [(name k) v])) attributes)
+  [spec]
+  (let [spec (if (map? spec) spec {})
+        {:keys [type attributes stream toxicity]} spec
+        type (word type)
+        stream (if (nil? stream) "downstream" (word stream))
+        attrs (when (or (nil? attributes) (map? attributes))
+                (into {} (map (fn [[k v]] [(word k) v])) attributes))
         known (get toxic-types type)]
     (cond
+      (nil? attrs)
+      (r/err :compose/faults-invalid-toxic {:hint "attributes is an object {name number}"})
+
       (nil? known)
       (r/err :compose/faults-unknown-toxic {:type type :known (vec (sort (keys toxic-types)))})
 
