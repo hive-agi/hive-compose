@@ -91,6 +91,8 @@
   (-> (base-argv p)
       (into ["logs" "--no-color" "--tail" (str tail)])
       (cond-> (:profile/timestamps? p) (conj "--timestamps"))
+      (cond-> (:profile/since p) (into ["--since" (str (:profile/since p))]))
+      (cond-> (:profile/until p) (into ["--until" (str (:profile/until p))]))
       (into services)))
 
 (defn containers-argv

@@ -128,7 +128,9 @@
             {:traces (vec (keep #(when (r/ok? %) (:ok %)) got))
              :query q
              :errors (into errors (filter r/err? got))})
-          (recur (rest qs) (cond-> errors (r/err? found) (conj found)))))
+          (if (#{:trace/unreachable :trace/not-ready} (:error found))
+            {:traces [] :query nil :errors (conj errors found)}
+            (recur (rest qs) (cond-> errors (r/err? found) (conj found))))))
       {:traces [] :query nil :errors errors})))
 
 ;; ---------------------------------------------------------------- logs
@@ -142,7 +144,9 @@
   (let [e (get-in @(:state ctx) [:stacks run])
         projects (get-in ctx [:settings :compose/projects])
         of (fn [pid] (let [p (get projects pid)]
-                       (cond-> {:dir (:project/dir p)} (seq (:project/files p)) (assoc :files (:project/files p)))))]
+                       (cond-> {:dir (:project/dir p)}
+                         (seq (:project/files p)) (assoc :files (:project/files p))
+                         (seq (:project/env p)) (assoc :env (:project/env p)))))]
     (vec (distinct
           (concat
            (for [[c {:keys [compose-project]}] (sort-by key (:consumers e))]
@@ -150,24 +154,44 @@
            (for [[_ ip] (sort-by key (get-in e [:plan :stack/instances]))]
              (assoc (of (:instance/provider ip)) :project (:instance/compose-project ip))))))))
 
-(defn- logs-profile [{:keys [project dir files]}]
-  (cond-> {:profile/id project :profile/project project :profile/dir dir :profile/timestamps? true}
-    (seq files) (assoc :profile/files files)))
+(def clip-chars
+  "What the CLI engine keeps of a command's output (its last chars): logs that
+   long were probably cut, and the bundle says so."
+  20000)
+
+(defn- rfc3339 [ms] (str (java.time.Instant/ofEpochMilli (long ms))))
+
+(defn logs-profile
+  "The profile `compose logs` of project row `p` runs with: timestamps on,
+   and bounded to `window` widened by `slack-ms` (`--since`/`--until`), so
+   the engine's output clip never drops the case's own lines."
+  [{:keys [project dir files env]} [start end] slack-ms]
+  (cond-> {:profile/id project :profile/project project :profile/timestamps? true}
+    dir (assoc :profile/dir dir)
+    (seq files) (assoc :profile/files files)
+    (seq env) (assoc :profile/env env)
+    start (assoc :profile/since (rfc3339 (- start slack-ms)))
+    end (assoc :profile/until (rfc3339 (+ end slack-ms)))))
 
 (defn fetch-logs
-  "{:logs {service text} :errors [..]}: the last `tail` log lines of every
-   project of `run`, split by service; a service name is prefixed with its
-   compose project when two projects of the run hold it."
-  [ctx run tail]
+  "{:logs {service text} :errors [..] :clipped [project]}: the log lines of
+   every project of `run` inside `window` +- `slack-ms` (at most `tail` per
+   service), split by service; a service name is prefixed with its compose
+   project when two projects of the run hold it. A project whose output
+   reached `clip-chars` is listed under :clipped."
+  [ctx run tail window slack-ms]
   (let [rows (for [p (run-projects ctx run)]
-               [p (port/-logs (:engine ctx) (logs-profile p) [] tail)])
+               [p (port/-logs (:engine ctx) (logs-profile p window slack-ms) [] tail)])
         split (for [[p res] rows :when (r/ok? res)
                     [svc text] (why/split-compose-logs (get-in res [:ok :out]))]
                 [(:project p) svc text])
         clash (set (for [[svc n] (frequencies (map second split)) :when (> n 1)] svc))]
     {:logs (into (sorted-map) (for [[cp svc text] split]
                                 [(if (clash svc) (str cp "/" svc) svc) text]))
-     :errors (vec (for [[p res] rows :when (r/err? res)] (assoc res :project (:project p))))}))
+     :errors (vec (for [[p res] rows :when (r/err? res)] (assoc res :project (:project p))))
+     :clipped (vec (for [[p res] rows
+                         :when (and (r/ok? res) (>= (count (str (get-in res [:ok :out]))) clip-chars))]
+                     (:project p)))}))
 
 ;; ---------------------------------------------------------------- why!
 
@@ -203,7 +227,8 @@
           {:keys [traces query] terr :errors} (if tq
                                                 (fetch-traces tq (trace-queries result case window))
                                                 {:traces [] :errors [(r/err :compose/no-trace-query {})]})
-          {:keys [logs] lerr :errors} (fetch-logs ctx rid (or (:why/tail ctx) default-tail))
+          slack (or (:why/slack-ms ctx) why/default-slack-ms)
+          {:keys [logs clipped] lerr :errors} (fetch-logs ctx rid (or (:why/tail ctx) default-tail) window slack)
           b (why/bundle {:case case
                          :test-id (leaf (:case/id case))
                          :cell-result result
@@ -219,6 +244,7 @@
               gaps (cond-> {}
                      (seq terr) (assoc :traces (mapv #(select-keys % [:error :url :message :status]) terr))
                      (seq lerr) (assoc :logs (mapv #(select-keys % [:error :project :stderr]) lerr))
+                     (seq clipped) (assoc :logs-clipped clipped)
                      (seq skipped) (assoc :results skipped)
                      nerr (assoc :note (select-keys nerr [:error :message])))]
           (r/ok (cond-> (assoc b :why/files files :why/markdown md)
