@@ -169,7 +169,7 @@
             (fn [cp]
               (assoc i
                      :instance/compose-project cp
-                     :instance/services (vec (distinct (cons (:instance/service i) (:instance/aliases i))))
+                     :instance/services [(:instance/service i)]
                      :instance/labels (instance-labels run stack-id iid i)
                      ;; every binder's view network, and its provider's own when the
                      ;; provider binds instances itself, so it reaches them there
@@ -206,6 +206,7 @@
   [settings resolution run opts]
   (let [stack-id (or (:stack opts) default-stack-id)
         projects (:compose/projects settings)
+        input resolution
         resolution (if (map? (:resolution/instances resolution))
                      (fill-private-projects projects run resolution)
                      resolution)
@@ -216,6 +217,11 @@
 
       (not (m/validate schema/StackId stack-id))
       (r/err :compose/invalid-stack {:stack stack-id :problems (schema/explain schema/StackId stack-id)})
+
+      ;; input: run-free (the resolver leaves private compose projects out);
+      ;; after fill-private-projects every instance must be a strict Instance
+      (not (m/validate schema/ResolvedResolution input))
+      (r/err :compose/invalid-resolution {:problems (schema/explain schema/ResolvedResolution input)})
 
       (not (m/validate schema/Resolution resolution))
       (r/err :compose/invalid-resolution {:problems (schema/explain schema/Resolution resolution)})
@@ -282,7 +288,7 @@
                         :when (= :instance kind)
                         :let [ip (get-in sp [:stack/instances id])
                               cp (:instance/compose-project ip)
-                              svcs (:instance/services ip)
+                              svcs (vec (distinct (concat (:instance/services ip) (:instance/needs ip))))
                               up (filterv #(running (service-key cp %)) svcs)
                               start (filterv #(not (running (service-key cp %))) svcs)]]
                     {:instance id
@@ -423,3 +429,26 @@
                  (update-in live [run :stack/instances] dissoc iid)])
               [[] active-stacks]
               order)))))
+
+(defn with-needs
+  "`sp` with each instance's `:instance/needs` filled from `closures`
+   ({[compose-project service] [service]}, the engine's depends_on closure of
+   the instance's service), so plan-diff and the refcount cover dependencies
+   too. hc-6 calls it before it persists the plan."
+  [sp closures]
+  (update sp :stack/instances
+          (fn [is]
+            (into (sorted-map)
+                  (map (fn [[iid ip]]
+                         [iid (if-let [c (get closures [(:instance/compose-project ip) (:instance/service ip)])]
+                                (assoc ip :instance/needs (vec (sort (distinct c))))
+                                ip)]))
+                  is))))
+
+(defn stack-held
+  "{compose-project #{service}} every live stack instance keeps alive: what a
+   section release (promote.plan, which cannot see stacks) must also spare."
+  [active-stacks]
+  (reduce (fn [acc [cp s]] (update acc cp (fnil conj #{}) s))
+          {}
+          (for [[_ sp] active-stacks ip (vals (:stack/instances sp)) k (instance-footprint ip)] k)))

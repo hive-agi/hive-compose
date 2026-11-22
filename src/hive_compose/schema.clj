@@ -283,6 +283,28 @@
    [:resolution/instances [:map-of :string Instance]]
    [:resolution/bindings [:map-of ConsumerId [:map-of CapabilityId :string]]]])
 
+(def ResolvedInstance
+  "An Instance as the run-independent resolver answers it: a private one may
+   lack `:instance/compose-project`, which the stack plan (knowing the run)
+   fills with `private-project` before validating against Instance."
+  [:map
+   [:instance/id [:string {:min 1}]]
+   [:instance/capability CapabilityId]
+   [:instance/provider [:string {:min 1}]]
+   [:instance/service [:string {:min 1}]]
+   [:instance/version {:optional true} Version]
+   [:instance/share? :boolean]
+   [:instance/consumers [:vector {:min 1} ConsumerId]]
+   [:instance/aliases [:vector {:min 1} [:string {:min 1}]]]
+   [:instance/compose-project {:optional true} ComposeProjectName]])
+
+(def ResolvedResolution
+  "The input of hive-compose.promote.stack/stack-plan: a Resolution of
+   ResolvedInstances (run-free)."
+  [:map
+   [:resolution/instances [:map-of :string ResolvedInstance]]
+   [:resolution/bindings [:map-of ConsumerId [:map-of CapabilityId :string]]]])
+
 (def Wiring
   "How one consumer is connected in a run. Its view network
    `view-network` is the only network outside its own compose project it

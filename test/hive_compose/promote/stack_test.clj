@@ -54,18 +54,23 @@
       (is (= "pgsql" (get-in sp [:stack/instances "pg/postgres" :instance/compose-project])))
       (is (= "infrastack-legacy-r01" (get-in sp [:stack/instances "infra/kafka@legacy" :instance/compose-project]))))
     (testing "services and labels"
-      (is (= ["kafka" "broker"] (get-in sp [:stack/instances "infra/kafka" :instance/services])))
-      (is (= {"hive.run" "r01" "hive.stack" "checkout" "hive.instance" "infra/kafka"}
-             (get-in sp [:stack/instances "infra/kafka" :instance/labels]))))
-    (testing "the shared kafka joins every consumer's view network, the private one only legacy's"
-      (is (= ["hive-r01-billing" "hive-r01-shop"] (get-in sp [:stack/instances "infra/kafka" :instance/networks])))
-      (is (= ["hive-r01-legacy"] (get-in sp [:stack/instances "infra/kafka@legacy" :instance/networks]))))
+      (is (= ["kafka"] (get-in sp [:stack/instances "infra/kafka" :instance/services])))
+      (is (= {"hive.instance" "infra/kafka"} (get-in sp [:stack/instances "infra/kafka" :instance/labels]))
+          "a shared instance carries no per-run label (its config hash must not change per run)")
+      (is (= {"hive.run" "r01" "hive.stack" "checkout" "hive.instance" "infra/kafka@legacy" "hive.consumer" "legacy"}
+             (get-in sp [:stack/instances "infra/kafka@legacy" :instance/labels]))))
+    (testing "the shared kafka joins every consumer's view network, the private one only legacy's; both join infra's own, where infra's postgres answers"
+      (is (= ["hive-r01-billing" "hive-r01-infra" "hive-r01-shop"] (get-in sp [:stack/instances "infra/kafka" :instance/networks])))
+      (is (= ["hive-r01-infra" "hive-r01-legacy"] (get-in sp [:stack/instances "infra/kafka@legacy" :instance/networks])))
+      (is (some #{"hive-r01-infra"} (get-in sp [:stack/instances "pg/postgres" :instance/networks])))
+      (is (= ["infra/kafka" "infra/kafka@legacy"] (get-in sp [:stack/consumers "infra" :consumer/provider-of]))))
     (testing "a consumer attaches to its own view network, instances join under their service names"
       (is (= {:consumer/id "shop" :consumer/network "hive-r01-shop"
               :consumer/labels {"hive.run" "r01" "hive.stack" "checkout"}
               :consumer/attach [{:instance "infra/kafka" :aliases ["kafka" "broker"]}
                                 {:instance "pg/postgres" :aliases ["postgres"]}]
-              :consumer/bindings {"kafka" "infra/kafka" "postgres" "pg/postgres"}}
+              :consumer/bindings {"kafka" "infra/kafka" "postgres" "pg/postgres"}
+              :consumer/provider-of []}
              (get-in sp [:stack/consumers "shop"]))))
     (testing "start order: postgres before the kafka of infra, which binds it; consumers last"
       (is (= [[:instance "pg/postgres"] [:instance "infra/kafka"] [:instance "infra/kafka@legacy"]
@@ -119,6 +124,19 @@
                                                     "infra-legacy-old")
                                           "r01" {}))
                    [:stack/instances "infra/kafka@legacy" :instance/compose-project]))))
+  (testing "an instance nobody binds"
+    (is (= [{:instance "infra/kafka@legacy" :problem :unbound-instance}]
+           (:problems (stack/stack-plan settings (update res :resolution/bindings dissoc "legacy") "r01" {})))))
+  (testing "a run-free private instance (as the resolver answers it) is planned, its project filled"
+    (let [sp (:ok (stack/stack-plan settings res "r01" {}))]
+      (is (nil? (:instance/compose-project kafka-legacy)) "the fixture carries no compose project")
+      (is (= "infrastack-legacy-r01" (get-in sp [:stack/instances "infra/kafka@legacy" :instance/compose-project])))
+      (is (m/validate schema/Instance (get-in res [:resolution/instances "pg/postgres"])))))
+  (testing "one consumer's two private instances of one provider share its private project"
+    (let [r (resolution [(inst "infra" "kafka" ["shop"] false) (inst "infra" "registry" ["shop"] false)]
+                        {"shop" {"kafka" "infra/kafka@shop" "registry" "infra/registry@shop"}})
+          sp (:ok (stack/stack-plan settings r "r01" {}))]
+      (is (= #{"infrastack-shop-r01"} (set (map :instance/compose-project (vals (:stack/instances sp))))))))
   (testing "providers binding each other"
     (let [e (stack/stack-plan settings
                               (resolution [(inst "infra" "kafka" ["pg"] true) (inst "pg" "postgres" ["infra"] true)]
@@ -128,13 +146,14 @@
       (is (= ["infra/kafka" "pg/postgres"] (:instances e))))))
 
 (deftest plan-diff-and-its-rendering
-  (let [sp (:ok (stack/stack-plan settings res "r01" {:stack "checkout"}))
+  (let [sp (stack/with-needs (:ok (stack/stack-plan settings res "r01" {:stack "checkout"}))
+                             {["infrastack" "kafka"] ["kafka" "zookeeper"]})
         d (stack/plan-diff sp #{{:project "pgsql" :service "postgres"}
                                 {:project "infrastack" :service "kafka"}})]
     (is (= {:instances 3 :shared 2 :private 1 :running 1 :partial 1 :to-start 1} (:summary d)))
     (is (= [["pg/postgres" :shared :running] ["infra/kafka" :shared :partial] ["infra/kafka@legacy" :private :to-start]]
            (mapv (juxt :instance :mode :state) (:instances d))))
-    (is (= ["broker"] (:to-start (second (:instances d)))))
+    (is (= ["zookeeper"] (:to-start (second (:instances d)))))
     (let [text (stack/render-diff d)]
       (is (str/starts-with? text "Stack checkout, run r01: 3 instances (2 shared, 1 private), 1 running, 1 partial, 1 to start."))
       (is (str/includes? text "= pg/postgres"))
@@ -162,24 +181,27 @@
         (is (= l (:ok (files/read-lock path))))))))
 
 (deftest release-spares-what-another-stack-binds
-  (let [a (:ok (stack/stack-plan settings res "r01" {:stack "checkout"}))
+  (let [a (stack/with-needs (:ok (stack/stack-plan settings res "r01" {:stack "checkout"}))
+                            {["infrastack" "kafka"] ["kafka" "zookeeper"]})
         b (:ok (stack/stack-plan settings (resolution [(inst "infra" "kafka" ["billing"] true)]
                                                       {"billing" {"kafka" "infra/kafka"}})
                                  "r02" {:stack "billing"}))
         live {"r01" a "r02" b}]
-    (testing "r02 still binds the shared kafka: only the broker alias goes"
-      (is (= {:run "r01" :instance "infra/kafka" :project "infrastack" :services ["broker"]
+    (is (= {"infrastack" #{"kafka" "zookeeper"} "infrastack-legacy-r01" #{"kafka"} "pgsql" #{"postgres"}}
+           (stack/stack-held {"r01" a})))
+    (testing "r02 still binds the shared kafka: only its zookeeper, which r02 does not hold, goes"
+      (is (= {:run "r01" :instance "infra/kafka" :project "infrastack" :services ["zookeeper"]
               :kept {"kafka" [["r02" "infra/kafka"]]}}
              (stack/instance-release live "r01" "infra/kafka"))))
     (testing "an active section of the provider project keeps its services too"
-      (is (= {"broker" [[:section "infra/broker"]] "kafka" [["r02" "infra/kafka"]]}
+      (is (= {"zookeeper" [[:section "infra/broker"]] "kafka" [["r02" "infra/kafka"]]}
              (:kept (stack/instance-release live "r01" "infra/kafka"
                                             {"infra/broker" {:profile/id "infra/broker" :project "infrastack"
-                                                             :services ["broker"] :started-at 0 :last-touch 0}})))))
+                                                             :services ["zookeeper"] :started-at 0 :last-touch 0}})))))
     (testing "the private kafka is released whole"
       (is (= ["kafka"] (:services (stack/instance-release live "r01" "infra/kafka@legacy")))))
     (testing "once r02 is gone, r01 releases the kafka"
-      (is (= ["broker" "kafka"] (:services (stack/instance-release {"r01" a} "r01" "infra/kafka")))))
+      (is (= ["kafka" "zookeeper"] (:services (stack/instance-release {"r01" a} "r01" "infra/kafka")))))
     (testing "stack-releases goes in reverse start order"
       (is (= ["infra/kafka@legacy" "infra/kafka" "pg/postgres"] (mapv :instance (stack/stack-releases live "r01")))))
     (is (nil? (stack/instance-release live "r01" "nope")))))
@@ -272,7 +294,7 @@
                 (let [binders (sort (for [[c caps] bindings :when (some #{iid} (vals caps))] c))
                       nets (mapv #(get-in sp [:stack/consumers % :consumer/network]) binders)]
                   (and (= 1 (count (filter #(= iid (:step/id %)) (:stack/start-order sp))))
-                       (= (sort (distinct nets)) (:instance/networks ip))
+                       (every? (set (:instance/networks ip)) nets)
                        (every? (fn [c] (some #(= iid (:instance %)) (get-in sp [:stack/consumers c :consumer/attach])))
                                binders))))
               (:stack/instances sp)))))
