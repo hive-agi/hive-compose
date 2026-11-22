@@ -62,6 +62,14 @@
 
 ;; ---------------------------------------------------------------- config
 
+(defn- free-port
+  "A host port free right now, as a string. Rootless docker's own ephemeral
+   choice (`0:8080`) raced another container on a busy host (bind: address
+   already in use), so the test picks the ports and passes them through the
+   consumers' own env (ORDERS_PORT, BILLING_PORT), which the fixtures read."
+  []
+  (with-open [s (java.net.ServerSocket. 0)] (str (.getLocalPort s))))
+
 (def otlp-http
   "Both fixtures export with an OTLP/HTTP SDK, so each consumer declares the
    protocol it speaks in its own env, the layer that replaces the injected
@@ -91,13 +99,13 @@
                                 "HIVE_OTEL_TEMPO_PORT" "HIVE_OTEL_LOKI_PORT" "HIVE_OTEL_PROMETHEUS_PORT"])
             :project/provides {"otel" {:service "otel" :version "0.41.1"}}}
     "orders" {:project/id "orders" :project/dir (fixture "orders") :project/name (str tag "orders")
-              :project/env otlp-http
+              :project/env (assoc otlp-http "ORDERS_PORT" (free-port))
               :project/needs {"kafka" {:version "^3"} "otel" {}}}
     "billing" {:project/id "billing" :project/dir (fixture "billing") :project/name (str tag "billing")
-               :project/env otlp-http
+               :project/env (assoc otlp-http "BILLING_PORT" (free-port))
                :project/needs {"kafka" {:version "^3"} "otel" {}}}
     "billing-c" {:project/id "billing-c" :project/dir (fixture "billing") :project/name (str tag "billingc")
-                 :project/env otlp-http
+                 :project/env (assoc otlp-http "BILLING_PORT" (free-port))
                  :project/needs {"kafka" {:version "^3" :share? false} "otel" {}}}}
    :compose/stacks {"e2e" {:stack/id "e2e" :stack/consumers ["orders" "billing" "billing-c"]}}})
 
