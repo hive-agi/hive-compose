@@ -89,6 +89,8 @@
                              :compose/save! (constantly (r/ok nil))
                              :compose/config-source (constantly {})
                              :compose/profiles-file "/nonexistent/profiles.edn"
+                             ;; never the operator's real state file: a live section there would hold "db"
+                             :compose/state-file (str (java.io.File/createTempFile "orphans-state" ".edn"))
                              :compose/profiles {"db" {:profile/id "db" :profile/dir "/w/dc"
                                                       :profile/services ["postgres"]}}
                              :compose/swarm? false :compose/notify? false :compose/adopt? false
