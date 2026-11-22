@@ -127,7 +127,35 @@
   (is (= {"mem_limit" gi "cpus" 1
           "environment" {"JAVA_TOOL_OPTIONS" "-XX:MaxRAMPercentage=75 -Xmx1g"}}
          (res/service-override {:mem gi :cpus 1} true "-Xmx1g")))
-  (is (= {} (res/service-override {:unbounded? true} false nil))))
+  (is (= {} (res/service-override {:unbounded? true} false nil)))
+  (testing "no mem_limit, no heap flag: the JVM keeps its 25% default"
+    (is (= {} (res/service-override {:unbounded? false :source :none} true nil)))
+    (is (= {"cpus" 2} (res/service-override {:cpus 2 :unbounded? false} true nil)))
+    (is (= {} (res/service-override {:unbounded? true} true nil))))
+  (is (= (* 2 gi) (res/parse-xmx "-Xms1g -Xmx2g")))
+  (is (nil? (res/parse-xmx "-Dfoo=1"))))
+
+(deftest closure-is-counted
+  (let [sp {:stack/instances {"k/kafka@audit" {:instance/id "k/kafka@audit" :instance/share? false
+                                               :instance/services ["kafka"]
+                                               :instance/needs ["kafka" "zookeeper" "init"]}
+                              "k/kafka" {:instance/id "k/kafka" :instance/share? true
+                                         :instance/services ["kafka"] :instance/needs ["zookeeper"]}}}
+        b {:budget/instances {"k/kafka@audit" {:mem gi :unbounded? false :source :provide}
+                              "k/kafka" {:mem gi :unbounded? false :source :provide}}
+           :budget/total-mem (* 2 gi) :budget/unshared-mem (* 2 gi) :budget/saved-mem 0 :budget/uncapped []}
+        b2 (res/with-closure b {:compose/default-resources {:mem "256m"}} sp
+                             {"k/kafka@audit" {"init" {:mem-limit "64m"}}})]
+    (is (= {"init" (* 64 mi) "zookeeper" (* 256 mi)} (get-in b2 [:budget/instances "k/kafka@audit" :closure]))
+        "own mem_limit, else the default")
+    (is (nil? (get-in b2 [:budget/instances "k/kafka" :closure])) "a shared closure is its provider's")
+    (is (= (+ (* 2 gi) (* 320 mi)) (:budget/total-mem b2)))
+    (is (= (+ gi (* 320 mi)) (res/inst-mem (get-in b2 [:budget/instances "k/kafka@audit"]))))
+    (is (= b (res/with-closure b {} sp {})) "no default and no own limit: uncounted")
+    (is (re-find #"closure init=64m zookeeper=256m" (res/summary b2)))
+    (is (= ["WARN k/kafka@audit zookeeper: its own -Xmx 1g exceeds its mem_limit 256m (it will be OOM-killed under load)"]
+           (res/xmx-warnings b2 {"k/kafka@audit" {"zookeeper" {:java-tool-options "-Xmx1g"}
+                                                   "kafka" {:java-tool-options "-Xmx512m"}}})))))
 
 (deftest meminfo-and-pressure
   (is (= (* 20202944 1024)
@@ -149,10 +177,23 @@
     (is (not (res/under-pressure? s nil)) "unknown is never pressure")
     (is (not (res/under-pressure? {} 1)) "no reserve, no guard")
     (testing "claimed low is spared; lowest priority idle, longest idle first"
-      (is (= "mid2" (res/pressure-victim s runs now ttl))))
+      (is (= "mid2" (res/pressure-victim s runs now {:claim-ttl-ms ttl :idle-ms ttl}))))
     (testing "a stale claim no longer protects"
-      (is (= "low1" (res/pressure-victim s runs (+ now ttl) ttl))))
-    (is (nil? (res/pressure-victim s {"keep" (get runs "keep")} now ttl)))))
+      (is (= "low1" (res/pressure-victim s runs (+ now ttl) {:claim-ttl-ms ttl :idle-ms ttl}))))
+    (is (nil? (res/pressure-victim s {"keep" (get runs "keep")} now {:claim-ttl-ms ttl :idle-ms ttl})))
+    (testing "a run touched within the idle threshold is not idle"
+      (is (nil? (res/pressure-victim s {"mid1" {:stack/id "mid" :last-touch (- now 10)}}
+                                     now {:claim-ttl-ms ttl :idle-ms ttl}))))
+    (testing "a run whose release frees nothing is skipped"
+      (let [kafka {:instance/id "k/kafka" :instance/share? true}
+            plan-of (fn [& ids] {:stack/instances (into {} (map (fn [i] [i (assoc kafka :instance/id i)])) ids)})
+            caps {:budget/instances {"k/kafka" {:mem gi :unbounded? false :source :provide}}}
+            rs {"shop1" {:stack/id "mid" :last-touch 0 :plan (plan-of "k/kafka") :budget caps}
+                "bill1" {:stack/id "high" :last-touch 5 :plan (plan-of "k/kafka") :budget caps
+                         :claims {"ag" {:seen now}}}}]
+        (is (= {:bytes 0 :unknown? false} (res/freed-mem rs "shop1")) "kafka stays up for bill1")
+        (is (nil? (res/pressure-victim s rs now {:claim-ttl-ms ttl :idle-ms ttl})))
+        (is (= {:bytes gi :unknown? false} (res/freed-mem (dissoc rs "bill1") "shop1")))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Properties

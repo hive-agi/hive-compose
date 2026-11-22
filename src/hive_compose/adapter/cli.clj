@@ -251,9 +251,11 @@
   ["docker" "ps" "-q" "--no-trunc"])
 
 (defn service-facts
-  "{service {:image :java-tool-options}} of `services` in a `config --format
-   json` document: the image each runs and the JAVA_TOOL_OPTIONS its file
-   sets (environment as a map or a list of VAR=value). Pure."
+  "{service {:image :java-tool-options :mem-limit}} of `services` in a
+   `config --format json` document: the image each runs, the
+   JAVA_TOOL_OPTIONS its file sets (environment as a map or a list of
+   VAR=value) and its own memory limit (mem_limit or
+   deploy.resources.limits.memory), when set. Pure."
   [s services]
   (let [svcs (get (json/read-str s) "services")
         jto (fn [envm] (cond
@@ -265,8 +267,10 @@
           (for [sv services
                 :let [m (get svcs sv)]
                 :when m]
-            [sv (cond-> {:image (str (get m "image" ""))}
-                  (string? (jto (get m "environment"))) (assoc :java-tool-options (jto (get m "environment"))))]))))
+            [sv (let [lim (or (get m "mem_limit") (get-in m ["deploy" "resources" "limits" "memory"]))]
+                  (cond-> {:image (str (get m "image" ""))}
+                    (string? (jto (get m "environment"))) (assoc :java-tool-options (jto (get m "environment")))
+                    (some? lim) (assoc :mem-limit (if (number? lim) (long lim) (str lim)))))]))))
 
 (defn service-resources
   "{:volumes #{name} :ports #{port}} of `services` in a `config --format json`

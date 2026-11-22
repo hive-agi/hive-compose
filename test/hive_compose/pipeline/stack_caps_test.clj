@@ -72,11 +72,14 @@
     (let [b (get-in p [:ok :budget])]
       (is (= (* 2 gi) (get-in b [:budget/instances "kafka/kafka" :mem])) "shared: the largest consumer cap")
       (is (= gi (get-in b [:budget/instances "kafka/kafka@audit" :mem])))
-      (is (= (+ (* 3 gi) (* 256 mi)) (:budget/total-mem b)))
+      (is (= {"zookeeper" (* 256 mi)} (get-in b [:budget/instances "kafka/kafka@audit" :closure]))
+          "private kafka's zookeeper is counted at the default")
+      (is (= (+ (* 3 gi) (* 512 mi)) (:budget/total-mem b)))
       (is (= gi (:budget/saved-mem b)) "billing's 1g kafka is shared into shop's 2g one"))
     (let [text (get-in p [:ok :text])]
       (is (re-find #"kafka/kafka  mem 2g \(need\), cpus 2" text))
-      (is (re-find #"total capped memory 3.3g \(sharing saves 1g" text)))))
+      (is (re-find #"closure zookeeper=256m" text))
+      (is (re-find #"total capped memory 3.5g \(sharing saves 1g" text)))))
 
 (deftest over-budget-is-refused-before-anything-starts
   (testing ":compose/budget"
@@ -84,11 +87,22 @@
           res (stacks/stack-up! c {:stack "all"})]
       (is (= :compose/over-budget (:error res)))
       (is (= :budget (:basis res)))
-      (is (= (* 256 mi) (:over res)))
+      (is (= (* 512 mi) (:over res)) "kafka 2g + kafka@audit 1g + its zookeeper 256m + pg 256m")
       (is (empty? (ups c)) "nothing was started")
       (is (empty? (:stacks @(:state c))) "nothing was recorded")
       (is (= :compose/over-budget (get-in (stacks/plan c {:stack "all"}) [:ok :admission :error])))
       (is (re-find #"REFUSED: .*exceeds :compose/budget 3g" (get-in (stacks/plan c {:stack "all"}) [:ok :text])))))
+  (testing ":compose/budget is host-wide: live runs count"
+    (let [c (ctx {:compose/budget "3g"} nil)]
+      (is (r/ok? (stacks/stack-up! c {:stack "shop"})) "shop 2.25g fits 3g alone")
+      (let [res (stacks/stack-up! c {:stack "audit"})]
+        (is (= :compose/over-budget (:error res)) "audit 1.25g on top of shop's live 2.25g")
+        (is (= :budget (:basis res)))
+        (is (= (+ (* 2 gi) (* 256 mi)) (:others-mem res)))
+        (is (= (+ (* 3 gi) (* 512 mi)) (:total-mem res)))
+        (is (= 1 (count (:stacks @(:state c)))) "audit was not recorded"))
+      (testing "billing binds shop's kafka: only what it adds counts"
+        (is (r/ok? (stacks/stack-up! c {:stack "billing"}))))))
   (testing ":stack/budget"
     (let [c (ctx {:compose/stacks (assoc-in all-stacks ["shop" :stack/budget] "1g")} nil)]
       (is (= :stack (:basis (stacks/stack-up! c {:stack "shop"}))))))
@@ -114,9 +128,10 @@
         _ (is (r/ok? (stacks/stack-up! c {:stack "audit"})))
         by-project (into {} (map (fn [[_ p _ opts]] [p opts])) (ups c))]
     (is (= {"kafka" {"mem_limit" gi "cpus" 2
-                     "environment" {"JAVA_TOOL_OPTIONS" "-XX:MaxRAMPercentage=75"}}}
+                     "environment" {"JAVA_TOOL_OPTIONS" "-XX:MaxRAMPercentage=75"}}
+            "zookeeper" {"mem_limit" (* 256 mi)}}
            (get-in by-project ["kafka-audit-audit000001" :service-overrides]))
-        "private kafka: provide caps, the need's :jvm? true")
+        "private kafka: provide caps, the need's :jvm? true; its zookeeper capped at the default")
     (is (nil? (get-in by-project ["audit-audit000001" :service-overrides])) "consumers are not capped"))
   (let [c (ctx {} nil)]
     (is (r/ok? (stacks/stack-up! c {:stack "shop"})))
@@ -139,19 +154,41 @@
             {} {:instance/id "kafka/kafka@audit" :instance/provider "kafka" :instance/services ["kafka"]}
             {:mem gi :cpus 2 :jvm? true :unbounded? false :source :provide}
             {"kafka" {:image "confluentinc/cp-kafka:7.6.0" :java-tool-options "-XX:MaxRAMPercentage=50"}}))))
-  (testing "a detected java image without :jvm?"
+  (testing "a detected java image gets the flag only with a mem_limit"
+    (is (= {} (hive-compose.promote.stack-run/instance-overrides
+               {} {:instance/provider "kafka" :instance/services ["kafka"]}
+               {:unbounded? false :source :none}
+               {"kafka" {:image "eclipse-temurin:21-jre"}}))
+        "uncapped: the JVM keeps its 25% default, never 75% of the host")
     (is (= "-XX:MaxRAMPercentage=75"
            (get-in (hive-compose.promote.stack-run/instance-overrides
                     {} {:instance/provider "kafka" :instance/services ["kafka"]}
-                    {:unbounded? false :source :none}
+                    {:mem gi :unbounded? false :source :provide}
                     {"kafka" {:image "eclipse-temurin:21-jre"}})
-                   ["kafka" "environment" "JAVA_TOOL_OPTIONS"])))))
+                   ["kafka" "environment" "JAVA_TOOL_OPTIONS"]))))
+  (testing "a closure service with its own mem_limit keeps it"
+    (is (= {} (hive-compose.promote.stack-run/instance-overrides
+               {} {:instance/provider "kafka" :instance/services []}
+               {:closure {"zookeeper" (* 256 mi)} :unbounded? false :source :none}
+               {"zookeeper" {:image "zookeeper:3.9" :mem-limit "512m"}})))))
+
+(deftest pressure-guard-skips-a-run-that-frees-nothing
+  (let [c (ctx {:compose/host-reserve "4g"} (* 64 gi))
+        shop (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])
+        billing (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
+    (stacks/claim! c shop "ling-1" {})
+    (swap! (:clock c) + (* 6 minute))
+    (stacks/claim! c shop "ling-1" {})
+    (reset! (:available (:host-memory c)) (* 3 gi))
+    (is (= [] (:reaped (stacks/reap! c)))
+        "billing only binds shop's kafka, which stays up: stopping it frees nothing")
+    (is (contains? (:stacks @(:state c)) billing))))
 
 (deftest service-facts-parse
-  (is (= {"a" {:image "eclipse-temurin:21" :java-tool-options "-Xmx1g"}
-          "b" {:image "postgres:16"}}
+  (is (= {"a" {:image "eclipse-temurin:21" :java-tool-options "-Xmx1g" :mem-limit 1073741824}
+          "b" {:image "postgres:16" :mem-limit "512m"}}
          (cli/service-facts
-          "{\"services\":{\"a\":{\"image\":\"eclipse-temurin:21\",\"environment\":{\"JAVA_TOOL_OPTIONS\":\"-Xmx1g\"}},\"b\":{\"image\":\"postgres:16\",\"environment\":[\"X=1\"]}}}"
+          "{\"services\":{\"a\":{\"image\":\"eclipse-temurin:21\",\"mem_limit\":1073741824,\"environment\":{\"JAVA_TOOL_OPTIONS\":\"-Xmx1g\"}},\"b\":{\"image\":\"postgres:16\",\"deploy\":{\"resources\":{\"limits\":{\"memory\":\"512m\"}}},\"environment\":[\"X=1\"]}}}"
           ["a" "b" "c"]))))
 
 (deftest pressure-guard-stops-the-lowest-priority-idle-unclaimed-run
@@ -164,6 +201,10 @@
     (testing "no pressure, nothing reaped"
       (is (= [] (:reaped (stacks/reap! c)))))
     (reset! (:available (:host-memory c)) (* 3 gi))
+    (testing "under pressure, a run touched just now is not idle"
+      (is (= [] (:reaped (stacks/reap! c)))))
+    (swap! (:clock c) + (* 6 minute))
+    (stacks/claim! c audit "ling-1" {})
     (testing "audit (-1) is claimed, shop (0) goes before billing (5)"
       (let [rows (:reaped (stacks/reap! c))]
         (is (= [shop] (mapv :run rows)))

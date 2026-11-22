@@ -162,8 +162,9 @@
    can tell a JVM image and keep its own JVM flags (hc-16a). An engine
    without it is treated as knowing nothing: only `:jvm? true` injects."
   (-service-facts [e profile services]
-    "Result<{service {:image string :java-tool-options string?}}>: the image
-     each of `services` runs and the JAVA_TOOL_OPTIONS its compose file sets."))
+    "Result<{service {:image string :java-tool-options string? :mem-limit
+     MemSize?}}>: the image each of `services` runs, the JAVA_TOOL_OPTIONS
+     and the memory limit its compose file sets."))
 
 (defprotocol ISuiteRunner
   "Runs one suite runner to its end under its resource caps (hc-16b): a host

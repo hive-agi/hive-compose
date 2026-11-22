@@ -89,18 +89,24 @@
    run a JVM (`:jvm?`, else detected from the image in `facts` {service
    {:image :java-tool-options}}), JAVA_TOOL_OPTIONS with the heap flag merged
    under the service's own options (the compose file's, else the provider
-   project's env). Services that need nothing are left out."
+   project's env). The JVM flag goes only where a mem_limit is written. The
+   closure services (`:closure` of `caps`, {service bytes}, see
+   resources/with-closure) get a mem_limit too, unless their own compose file
+   sets one (`:mem-limit` in `facts`), and the flag when their image is a JVM.
+   Services that need nothing are left out."
   [settings ip caps facts]
   (let [proj-opts (let [v (get-in settings [:compose/projects (:instance/provider ip) :project/env
                                             res/java-tool-options])]
-                    (when (string? v) v))]
-    (into (sorted-map)
-          (for [s (:instance/services ip)
-                :let [{:keys [image java-tool-options]} (get facts s)
-                      o (res/service-override caps (res/jvm? caps image)
-                                              (or java-tool-options proj-opts))]
-                :when (seq o)]
-            [s o]))))
+                    (when (string? v) v))
+        own (for [s (:instance/services ip)
+                  :let [{:keys [image java-tool-options]} (get facts s)]]
+              [s (res/service-override caps (res/jvm? caps image) (or java-tool-options proj-opts))])
+        closure (for [[s m] (:closure caps)
+                      :let [{:keys [image java-tool-options mem-limit]} (get facts s)]
+                      :when (nil? mem-limit)]
+                  [s (res/service-override {:mem m :unbounded? false} (res/java-image? image)
+                                           (or java-tool-options proj-opts))])]
+    (into (sorted-map) (filter (comp seq second)) (concat own closure))))
 
 (defn with-overrides
   "ProjectSpec `spec` carrying `overrides` (from `instance-overrides`) as
