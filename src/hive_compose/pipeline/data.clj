@@ -100,9 +100,17 @@
                            (if (:ok? x) (conj acc x) (reduced (conj acc x)))))
                        [] (:steps p))]
       (if (every? :ok? rows)
-        (do (swap! (:state ctx) assoc-in [:stacks run :data] (:state p))
-            (persist! ctx)
-            (r/ok {:run run :phase phase :steps rows :state (:state p)}))
+        ;; only a run still recorded: one taken down meanwhile is never revived
+        ;; as a bare {:data ..} entry
+        (let [[old _] (swap-vals! (:state ctx)
+                                  #(if (contains? (:stacks %) run)
+                                     (assoc-in % [:stacks run :data] (:state p))
+                                     %))]
+          (if (contains? (:stacks old) run)
+            (do (persist! ctx)
+                (r/ok {:run run :phase phase :steps rows :state (:state p)}))
+            (r/err :compose/unknown-run {:run run :phase phase :steps rows
+                                         :hint "the run was taken down while its data phase ran"})))
         (r/err :compose/data-step-failed {:run run :phase phase :steps rows
                                           :failed (:step (last rows))
                                           :hint "the data state is unchanged; fix and run the phase again"})))))
