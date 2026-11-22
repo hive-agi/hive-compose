@@ -340,7 +340,7 @@
         (evidence! :s13b-suite {:runner (select-keys ans [:exit :cap :timed-out?]) :oom finding
                                 :output-tail (take-last 3 (:output ans))
                                 :written written :why (if (r/ok? w) (get-in w [:ok :why/summary]) (select-keys w [:error :hint]))
-                                :flaky (mapv #(select-keys % [:case/id :class]) ranked)})
+                                :flaky (mapv #(select-keys % [:case :class :ooms :last-oom]) ranked)})
         (testing "the runner was OOM-killed at its cap"
           (is (r/ok? res) (pr-str res))
           (is (= 137 (:exit ans)))
