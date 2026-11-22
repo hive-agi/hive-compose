@@ -202,6 +202,7 @@
     (is (= [{:host "/var/hc/runs/r01/smoke/billing/reports" :container "/reports"}] (:mounts spec)))
     (is (= "/var/hc/runs/r01/smoke/billing/reports" (:reports-dir spec)))
     (is (= {"hive.run" "r01" "hive.consumer" "suite:smoke"} (:labels spec)))
+    (is (= ["hive-r01-suite-smoke"] (:extra-networks spec)) "the suite's own instances answer on its view network")
     (is (= :junit (:report-format spec)))
     (let [env (:env spec)]
       (is (= "r01" (env "HIVE_RUN_ID")) "a suite cannot override the correlation vars")
@@ -213,7 +214,7 @@
       (is (= (format "%032x" 1) (:trace-id spec)))
       (is (= "debug" (env "LOG_LEVEL")) ":suite/env layered in")
       (is (= "http://otel:4317" (env "OTEL_EXPORTER_OTLP_ENDPOINT")))
-      (is (str/includes? (env "OTEL_RESOURCE_ATTRIBUTES") "hive.test.id=smoke/billing")))))
+      (is (= "smoke/billing" (get (otel/parse-resource-attributes (env "OTEL_RESOURCE_ATTRIBUTES")) "hive.test.id"))))))
 
 (deftest command-runner
   (let [spec (:ok (suite/runner-spec (ctx) {:suite/id "api" :project "shop"}))]
@@ -222,8 +223,9 @@
     (is (= ["npm" "test"] (:command spec)))
     (is (= "/w/tests/api" (:dir spec)))
     (is (= 60000 (:timeout-ms spec)))
-    (is (= "/w/tests/api/out/reports" (:reports-dir spec)) "relative to :suite/dir")
-    (is (= "/w/tests/api/out/reports" (get-in spec [:env "HIVE_REPORTS_DIR"])))
+    (is (= "/var/hc/runs/r01/api/shop/reports" (:reports-dir spec)) "every cell has its own reports dir")
+    (is (= "/var/hc/runs/r01/api/shop/reports" (get-in spec [:env "HIVE_REPORTS_DIR"])))
+    (is (= "/w/tests/api/out/reports" (:collect-from spec)) "the declared dir, relative to :suite/dir, is collected from")
     (is (= "http://127.0.0.1:4317" (get-in spec [:env "OTEL_EXPORTER_OTLP_ENDPOINT"])) "a host command sees the host side")
     (is (not (contains? spec :network)))
     (is (= :auto (:report-format spec))))
@@ -250,11 +252,29 @@
       (is (= "qa" (attrs "team")))
       (is (= "r01" (attrs "hive.run.id")))
       (is (= "smoke/shop" (attrs "hive.test.id")))))
-  (testing "a suite naming the OTLP endpoint owns the pair"
-    (let [s (assoc-in suites ["smoke" :suite/env] {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://collector:4318"})
+  (testing "a suite naming only the OTLP endpoint breaks the pair: refused, as wiring refuses it"
+    (let [s (assoc-in suites ["smoke" :suite/env] {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://collector:4318"})]
+      (is (= :compose/otlp-pair-broken (:error (suite/runner-spec (ctx :suites s) {:suite/id "smoke" :project "shop"}))))))
+  (testing "a suite naming the whole pair owns it"
+    (let [s (assoc-in suites ["smoke" :suite/env] {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://collector:4318"
+                                                     "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"})
           env (:env (:ok (suite/runner-spec (ctx :suites s) {:suite/id "smoke" :project "shop"})))]
-      (is (= "http://collector:4318" (env "OTEL_EXPORTER_OTLP_ENDPOINT")))
-      (is (not (contains? env "OTEL_EXPORTER_OTLP_PROTOCOL")) "the injected protocol goes with the injected endpoint")))
+      (is (= ["http://collector:4318" "http/protobuf"]
+             [(env "OTEL_EXPORTER_OTLP_ENDPOINT") (env "OTEL_EXPORTER_OTLP_PROTOCOL")]))))
+  (testing "wiring attributes survive; without otlp the run id is still forced"
+    (let [s (assoc-in suites ["load" :suite/env] {"OTEL_RESOURCE_ATTRIBUTES" "hive.run.id=evil,service.name=k6"})
+          env (:env (:ok (suite/runner-spec (ctx :suites s :otlp-env nil
+                                                 :wiring-env {"OTEL_RESOURCE_ATTRIBUTES" "team=core"})
+                                            {:suite/id "load" :project "web"})))
+          attrs (otel/parse-resource-attributes (env "OTEL_RESOURCE_ATTRIBUTES"))]
+      (is (= {"team" "core" "hive.run.id" "r01" "service.name" "k6"} attrs))))
+  (testing "a suite may name its own service.name; hive.* stays ours"
+    (let [s (assoc-in suites ["smoke" :suite/env "OTEL_RESOURCE_ATTRIBUTES"] "service.name=mine,hive.test.id=x")
+          attrs (otel/parse-resource-attributes
+                 (get-in (:ok (suite/runner-spec (ctx :suites s) {:suite/id "smoke" :project "shop"}))
+                         [:env "OTEL_RESOURCE_ATTRIBUTES"]))]
+      (is (= "mine" (attrs "service.name")))
+      (is (= "smoke/shop" (attrs "hive.test.id")))))
   (testing "an otlp-env that throws is a Result error"
     (is (= :compose/otlp-env-failed
            (:error (suite/runner-spec (ctx :otlp-env (fn [_] (throw (ex-info "no :service" {}))))
