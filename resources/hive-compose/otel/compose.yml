@@ -1,0 +1,79 @@
+# hive-compose built-in otel capability: grafana/otel-lgtm (OTel collector,
+# Tempo, Loki, Prometheus, Pyroscope, Grafana in one container).
+#
+# Consumers export OTLP to it through the standard OTEL_* variables
+# (hive-compose.promote.otel/otlp-env); nothing hive-specific runs inside a
+# service. In a stack run the `otel` service joins each consumer's view
+# network hive-<run>-<consumer> under the alias `otel`, so a container
+# exports to http://otel:4317 (grpc) or http://otel:4318 (http/protobuf); a
+# host process uses the published ports on localhost.
+#
+# Ports bind to 127.0.0.1 by default: otel-lgtm ships Grafana with anonymous
+# admin and an unauthenticated OTLP ingest. Set HIVE_OTEL_BIND=0.0.0.0 only on
+# a trusted network. Every host port is overridable through the environment.
+#
+# The image tags are pinned and match hive-compose.promote.otel/provider.
+#
+# The optional `beyla` service (native compose profile `beyla`) instruments
+# services without an OTel SDK through eBPF and exports to the same instance:
+#   docker compose -f compose.yml --profile beyla up -d
+#
+# Volumes are never removed by hive-compose; `otel-data` keeps telemetry
+# across restarts.
+
+name: ${HIVE_OTEL_PROJECT:-hive-otel}
+
+services:
+  otel:
+    image: grafana/otel-lgtm:0.41.1
+    labels:
+      hive.capability: otel
+      hive.capability.service: otel
+    ports:
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_OTLP_GRPC_PORT:-4317}:4317"
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_OTLP_HTTP_PORT:-4318}:4318"
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_GRAFANA_PORT:-3000}:3000"
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_TEMPO_PORT:-3200}:3200"
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_LOKI_PORT:-3100}:3100"
+      - "${HIVE_OTEL_BIND:-127.0.0.1}:${HIVE_OTEL_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - otel-data:/data
+    healthcheck:
+      # The live probes run-all.sh waits on (a /tmp/ready marker would survive
+      # a container restart and report healthy too early).
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -fsS -o /dev/null http://127.0.0.1:13133/ready &&
+          curl -fsS -o /dev/null http://127.0.0.1:3000/api/health &&
+          curl -fsS -o /dev/null http://127.0.0.1:3200/ready &&
+          curl -fsS -o /dev/null http://127.0.0.1:3100/ready &&
+          curl -fsS -o /dev/null http://127.0.0.1:9090/api/v1/status/runtimeinfo
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 15s
+    restart: unless-stopped
+
+  beyla:
+    profiles: ["beyla"]
+    image: grafana/beyla:3.43.0
+    labels:
+      hive.capability: otel
+      hive.capability.service: beyla
+    privileged: true
+    pid: host
+    environment:
+      # Ports of the processes to instrument; set it to the consumer's ports.
+      BEYLA_OPEN_PORT: ${BEYLA_OPEN_PORT:-8080}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    depends_on:
+      otel:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  otel-data:
+    labels:
+      hive.capability: otel
