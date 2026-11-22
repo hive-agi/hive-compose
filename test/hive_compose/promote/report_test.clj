@@ -282,7 +282,15 @@
            (tap-cases "1..2\n    1..3\n    ok 1 - a\nBail out! db"))
         "a bail-out inside a subtest: ids never collide")
     (is (= [["a" :passed]] (tap-cases "ok 1 - a\n    stray indented\n1..1"))
-        "deeper stray output with no point or plan is no subtest"))
+        "deeper stray output with no point or plan is no subtest")
+    (is (= [["test 2" :passed] ["test 1" :passed] ["test 3/a" :passed] ["test 3" :error]]
+           (tap-cases "1..2\nok 2\nok 1\n    ok 1 - a\n"))
+        "points out of order: the unclosed subtest takes a number none of them holds (review 3, F2)"))
+  (testing "ids repeating a long parent description over many leaves read as hostile (review 3, F1)"
+    (let [s (str (apply str (repeat 3000 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1")]
+      (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))))
+    (is (= 300 (count (tap-cases (str (apply str (repeat 300 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1"))))
+        "18 M id characters are still a report"))
   (testing "a split never breaks a subtest, at any depth (review 2, MAJOR 1)"
     (doseq [gap ["" "stray" "# note"]]
       (is (= {"p/a" :passed "p/q/b" :passed "p/q/c" :passed}

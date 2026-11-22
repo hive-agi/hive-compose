@@ -357,17 +357,20 @@
 (defn- unclosed
   "What a subtest no point closed leaves at its parent's level, when the
    stream ends inside it (truncated, or bailed out): an :error point taking
-   the number the closing point would have had, its points as children (so
+   a number past every one its `siblings` hold, its points as children (so
    their ids are prefixed and never collide with the parent's), no
    shortfall of its own (the error stands for the whole subtest). A run of
    deeper lines holding no point and no plan is stray output and leaves
    nothing."
-  [pending n budget]
+  [pending siblings budget]
   (when (seq pending)
-    (let [{:keys [points plan]} (fold-subtest pending budget)]
+    (let [{:keys [points plan]} (fold-subtest pending budget)
+          ;; past the highest number any sibling holds, not the last one:
+          ;; points may come out of order, and an id must never repeat
+          num (inc (reduce max 0 (keep :num siblings)))]
       (when (or (seq points) plan)
-        [{:num (inc n)
-          :case (tap-case (str "test " (inc n)) :error "not run: subtest never closed by a test point")
+        [{:num num
+          :case (tap-case (str "test " num) :error "not run: subtest never closed by a test point")
           :children points}]))))
 
 (defn- fold-level
@@ -404,7 +407,26 @@
         (recur (rest tokens) (attach points t) plan pending n true)
 
         :else (recur (rest tokens) points plan pending n false))
-      {:points (into points (unclosed pending n budget)) :plan plan})))
+      {:points (into points (unclosed pending points budget)) :plan plan})))
+
+(def max-id-chars
+  "Characters the case ids of one TAP parse may hold together. A subtest's
+   ids repeat its parent's description, so a long description over many
+   leaves would grow the Report far past its input: past this it reads as
+   a hostile report, `:tap/implausible-ids`."
+  (* 32 1024 1024))
+
+(defn- charge-ids
+  "`cases` as a vector, throwing ::implausible-ids once their ids together
+   pass `max-id-chars`. Realizes them one at a time, so no more than the
+   budget (plus one id, itself bounded by the input) is ever held."
+  [cases]
+  (let [total (volatile! 0)]
+    (mapv (fn [c]
+            (when (> (vswap! total + (count (:case/id c))) max-id-chars)
+              (throw (ex-info "case ids implausible" {::implausible-ids true})))
+            c)
+          cases)))
 
 (defn- prefix-id [parent child]
   (update child :case assoc :case/id (str (get-in parent [:case :case/id]) "/" (get-in child [:case :case/id]))))
@@ -429,9 +451,10 @@
    its output, subtests flattened into `parent/child` ids. A test the plan
    promised and that never ran counts as :error, a subtest's plan included
    (`parent/test N`); so does a subtest no test point closes (`test N`,
-   the number that point would have had), and `Bail out!` without a plan. Text with no plan, no test point and no bail-out, or a plan promising
-   more than `max-missing` tests beyond those that ran, is
-   `:report/malformed`."
+   N past every number its level used), and `Bail out!` without a plan.
+   Text with no plan, no test point and no bail-out, a plan promising more
+   than `max-missing` tests beyond those that ran, or case ids holding more
+   than `max-id-chars` characters together, is `:report/malformed`."
   [text]
   (if-not (string? text)
     (malformed :tap/not-text)
@@ -445,16 +468,19 @@
           (and (nil? plan) (empty? points) (nil? bail)) (malformed :tap/no-tests)
           (implausible-plan? plan points) (malformed :tap/implausible-plan :plan plan)
           :else
-          (let [cases (concat (map :case (leaves points))
-                              (missing plan points bail)
-                              (when (and bail (nil? plan))
-                                [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))]))]
+          (let [cases (charge-ids
+                       (concat (map :case (leaves points))
+                               (missing plan points bail)
+                               (when (and bail (nil? plan))
+                                 [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))])))]
             (r/ok (cond-> (->report :tap cases)
                     bail (assoc :report/bail-out bail))))))
       (catch clojure.lang.ExceptionInfo e
-        (if-let [plan (::implausible-plan (ex-data e))]
-          (malformed :tap/implausible-plan :plan plan)
-          (throw e)))
+        (let [data (ex-data e)]
+          (cond
+            (::implausible-plan data) (malformed :tap/implausible-plan :plan (::implausible-plan data))
+            (::implausible-ids data) (malformed :tap/implausible-ids :max-id-chars max-id-chars)
+            :else (throw e))))
       (catch StackOverflowError _
         (malformed :tap/too-deep)))))
 
