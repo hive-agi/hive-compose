@@ -8,7 +8,9 @@
 ;; SPDX-License-Identifier: MIT
 
 (defn- record! [world call]
-  (swap! world update :calls conj call))
+  (swap! world update :calls conj call)
+  ;; the call hook (`on-call!`) runs on the calling thread, before the call acts
+  (when-let [f (:on-call @world)] (f call)))
 
 (defn- fault [world method]
   (when (contains? (:fail @world) method)
@@ -325,6 +327,13 @@
    (->StubEngine (atom {:closures closures :running running :projects projects :calls [] :fail #{}}))))
 
 (defn calls [e] (:calls @(:world e)))
+
+(defn on-call!
+  "Run `f` with every recorded call `[method ..]`, on the calling thread,
+   before the call acts on the world: a test blocks a thread there to force
+   an interleaving. nil removes the hook."
+  [e f]
+  (swap! (:world e) assoc :on-call f))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
 
