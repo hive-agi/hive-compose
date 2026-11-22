@@ -37,6 +37,7 @@
       "{ resource.hive.run.id = \"run-42\" && span.test.id = \"checkout \\\"pays\\\"\" }" [200 (resource "search-checkout.json")]
       "{ resource.hive.run.id = \"run-42\" }" [200 (resource "search-run.json")]
       "{ span.test.id = \"garbage\" }" [200 "{\"traces\": ["]
+      "{ span.test.id = \"shape\" }" [200 "{\"traces\": 5}"]
       [200 (resource "search-empty.json")])
     (= (str "/api/traces/" checkout-id) path) [200 (resource "trace-checkout.json")]
     (= (str "/api/traces/" cart-id) path) [200 (resource "trace-cart.json")]
@@ -130,6 +131,8 @@
         (finally (.stop server 0)))))
   (testing "an answer that is not JSON"
     (is (= :trace/bad-json (:error (port/-find-traces (q) {:attrs {"test.id" "garbage"}})))))
+  (testing "JSON of a shape the reader cannot take"
+    (is (= :trace/bad-json (:error (port/-find-traces (q) {:attrs {"test.id" "shape"}})))))
   (testing "nobody listening"
     (let [port (with-open [s (ServerSocket. 0)] (.getLocalPort s))
           dead (tempo/make-query {:base-url (str "http://127.0.0.1:" port) :connect-timeout-ms 500})]

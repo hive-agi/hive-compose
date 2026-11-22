@@ -7,8 +7,12 @@
    Every failure is a Result, never a throw: :trace/unreachable (connect
    failed, timed out), :trace/http-error (a non-2xx status, with :status and
    the start of the :body), :trace/not-found (404 on a trace),
-   :trace/bad-json (an answer that does not parse), :trace/bad-id (a trace
-   id that is not hex)."
+   :trace/bad-json (an answer that does not parse or has a shape it cannot
+   read), :trace/bad-id (a trace id that is not hex), :trace/not-ready (a
+   non-2xx /ready).
+
+   The request timeout bounds the wait for the response headers; Tempo's
+   answers are small JSON, read whole."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [hive-compose.port :as port]
@@ -72,6 +76,14 @@
            (r/err :trace/bad-json {:url u :message (ex-message e) :body (snippet body)})))
     (r/err :trace/http-error {:url u :status status :body (snippet body)})))
 
+(defn- read-answer
+  "Result of `read` (0-arity, reads a parsed answer into data): a shape it
+   cannot read is :trace/bad-json, never a throw."
+  [u read]
+  (try (r/ok (read))
+       (catch Exception e
+         (r/err :trace/bad-json {:url u :message (or (ex-message e) (str (type e)))}))))
+
 (defrecord TempoQuery [client base-url request-timeout-ms limit]
   port/ITraceQuery
   (-find-traces [_ query]
@@ -79,7 +91,7 @@
                  (trace/search-params (update query :limit #(or % limit))))]
       (r/let-ok [resp (fetch client request-timeout-ms u)
                  body (json-body u resp)]
-        (r/ok (trace/search-result body)))))
+        (read-answer u #(trace/search-result body)))))
   (-trace [_ trace-id]
     (if-not (trace/hex-id? trace-id)
       (r/err :trace/bad-id {:trace-id trace-id})
@@ -89,7 +101,7 @@
                    body (if (= 404 (:status resp))
                           (r/err :trace/not-found {:trace-id id :url u})
                           (json-body u resp))]
-          (r/ok (trace/trace-result id body))))))
+          (read-answer u #(trace/trace-result id body))))))
   (-health [_]
     (let [u (url base-url "/ready" {})]
       (r/let-ok [{:keys [status body]} (fetch client request-timeout-ms u)]

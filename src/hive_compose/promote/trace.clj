@@ -140,21 +140,28 @@
   "The lower-case hex of OTLP id `s` of `width` hex digits (32 for a trace,
    16 for a span): hex as is (padded), else base64 decoded. Base64 of a
    trace or span id always ends in `=` (16 and 8 bytes), never a hex digit,
-   so the two never read alike. Nil for a blank or unreadable id."
+   so the two never read alike. Nil for a blank or unreadable id, or one
+   longer than `width`."
   [s width]
   (when (and (string? s) (not (str/blank? s)))
-    (if (and (re-matches #"[0-9a-fA-F]+" s) (<= (count s) width))
-      (pad-hex s width)
+    (if (re-matches #"[0-9a-fA-F]+" s)
+      (when (<= (count s) width) (pad-hex s width))
       (try (let [bs (.decode (Base64/getDecoder) ^String s)]
-             (when (pos? (alength bs))
+             (when (<= 1 (alength bs) (quot width 2))
                (pad-hex (bytes->hex bs) width)))
            (catch IllegalArgumentException _not-base64 nil)))))
 
 ;; ---------------------------------------------------------------- values
 
-(defn- ->long [v]
+(defn- ->long
+  "The long of `v` (a number or a decimal string), nil when it is none or
+   lies outside the long range."
+  [v]
   (cond
-    (number? v) (long v)
+    (instance? Long v) v
+    (integer? v) (when (<= Long/MIN_VALUE v Long/MAX_VALUE) (long v))
+    (number? v) (let [d (double v)]
+                  (when (and (Double/isFinite d) (<= -9.2e18 d 9.2e18)) (long d)))
     (string? v) (try (Long/parseLong (str/trim v)) (catch NumberFormatException _malformed nil))
     :else nil))
 
@@ -219,20 +226,23 @@
           :trace/duration-ms (or (->long (get t "durationMs")) 0)})))
 
 (defn- span
-  "A Span of OTLP span map `s` exported by a resource of `resource-attrs`."
+  "A Span of OTLP span map `s` exported by a resource of `resource-attrs`.
+   :span/start-ns keeps the exact start, so spans starting within one ms
+   still order."
   [resource-attrs s]
   (let [start (->long (get s "startTimeUnixNano"))
         end (->long (get s "endTimeUnixNano"))
-        st (get s "status")
+        st (let [st (get s "status")] (if (map? st) st {}))
         msg (get st "message")]
     {:span/id (normalize-id (get s "spanId") 16)
      :span/parent-id (normalize-id (get s "parentSpanId") 16)
-     :span/name (get s "name")
-     :span/service (get resource-attrs "service.name")
+     :span/name (some-> (get s "name") str)
+     :span/service (some-> (get resource-attrs "service.name") str)
      :span/start-ms (some-> start (quot 1000000))
+     :span/start-ns start
      :span/duration-ms (if (and start end) (/ (double (- end start)) 1e6) 0.0)
      :span/status (status (get st "code"))
-     :span/status-message (when-not (str/blank? msg) msg)
+     :span/status-message (when (and (string? msg) (not (str/blank? msg))) msg)
      :span/attrs (merge resource-attrs (attributes (get s "attributes")))}))
 
 (defn- resource-spans
@@ -291,6 +301,12 @@
   [index s]
   (some-> (ancestry index s) count dec))
 
+(defn- start-key
+  "The exact start of span `s` for ordering: its ns when read from OTLP,
+   else its ms."
+  [s]
+  (or (:span/start-ns s) (some-> (:span/start-ms s) (* 1000000)) 0))
+
 (defn failing-span
   "The span that explains `trace`'s failure: the deepest error span (the
    error furthest from its root is closest to the cause), the earliest of
@@ -300,7 +316,7 @@
   (let [index (by-id trace)]
     (->> (error-spans trace)
          (keep (fn [s] (when-let [d (depth index s)] [d s])))
-         (sort-by (fn [[d s]] [(- d) (or (:span/start-ms s) 0) (:span/id s)]))
+         (sort-by (fn [[d s]] [(- d) (start-key s) (:span/id s)]))
          first
          second)))
 

@@ -108,7 +108,23 @@
   (is (= cart-id (trace/normalize-id "4BF92F3577B34DA6A3CE929D0E0E4736" 32)))
   (is (nil? (trace/normalize-id "" 16)))
   (is (nil? (trace/normalize-id nil 16)))
-  (is (nil? (trace/normalize-id "not base64!!" 16))))
+  (is (nil? (trace/normalize-id "not base64!!" 16)))
+  (testing "an id longer than its width is refused, never misread"
+    (is (nil? (trace/normalize-id (apply str (repeat 33 "a")) 32)))
+    (is (nil? (trace/normalize-id checkout-id 16)))
+    (is (nil? (trace/normalize-id "APBnqgupArehssPU5fYHGA==" 16)))))
+
+(deftest odd-shapes-read-or-are-left-out-never-throw
+  (is (= 0 (:trace/duration-ms (first (trace/search-result {"traces" [{"traceID" "ab" "durationMs" 1e30}]}))))
+      "a duration outside the long range")
+  (is (nil? (:trace/start-ms (first (trace/search-result {"traces" [{"traceID" "ab" "startTimeUnixNano" 99999999999999999999N}]})))))
+  (let [s (first (:trace/spans (trace/trace-result "ab" {"batches" [{"scopeSpans" [{"spans" [{"spanId" "01" "status" {"message" 5 "code" 2}}]}]}]})))]
+    (is (= :error (:span/status s)))
+    (is (nil? (:span/status-message s)) "a message that is not a string")))
+
+(deftest ties-within-one-ms-go-to-the-earlier-ns
+  (is (= "b" (:span/id (trace/failing-span {:trace/spans [{:span/id "a" :span/start-ms 10 :span/start-ns 10000900 :span/status :error}
+                                                          {:span/id "b" :span/start-ms 10 :span/start-ns 10000100 :span/status :error}]})))))
 
 (defspec hex-and-base64-agree 200
   (prop/for-all [bs (gen/vector (gen/choose 0 255) 16)]
@@ -147,7 +163,8 @@
             :span/duration-ms 570.0
             :span/status :error
             :span/status-message "duplicate key value violates unique constraint"}
-           (dissoc insert :span/attrs)))
+           (dissoc insert :span/attrs :span/start-ns)))
+    (is (= 1795367923690529920 (:span/start-ns insert)) "the exact start kept for ordering")
     (is (= {"service.name" "orders-api" "hive.run.id" "run-42" "test.id" "checkout \"pays\""
             "db.system" "postgresql" "retry" false "cost" 0.5}
            (:span/attrs insert))
