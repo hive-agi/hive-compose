@@ -208,7 +208,7 @@
                                  run)]
           (let [w {:wiring/consumer consumer
                    :wiring/run run
-                   :wiring/network (names/view-network run consumer)
+                   :wiring/network (schema/view-network run consumer)
                    :wiring/attach (attach (map second binding))
                    :wiring/env e
                    :wiring/prefix prefix}]

@@ -35,7 +35,7 @@
 (def pg
   {:instance/id "infra/postgres@shop" :instance/capability "postgres" :instance/provider "infra"
    :instance/service "pg" :instance/share? false :instance/consumers ["shop"]
-   :instance/aliases ["pg"] :instance/compose-project "infra-shop-r-01"})
+   :instance/aliases ["pg"] :instance/compose-project "infra-shop-r01"})
 
 (def resolution
   {:resolution/instances {"infra/kafka" kafka "infra/postgres@shop" pg}
@@ -43,55 +43,55 @@
                          "billing" {"kafka" "infra/kafka"}}})
 
 (deftest wiring-of-one-consumer
-  (let [w (wiring/wiring settings resolution "r-01" "shop")]
+  (let [w (wiring/wiring settings resolution "r01" "shop")]
     (is (r/ok? w))
     (is (nil? (schema/explain schema/Wiring (:ok w))))
-    (is (= {:wiring/consumer "shop" :wiring/run "r-01"
-            :wiring/network "hive-r-01-shop"
+    (is (= {:wiring/consumer "shop" :wiring/run "r01"
+            :wiring/network "hive-r01-shop"
             :wiring/attach [{:instance "infra/kafka" :aliases ["kafka"]}
                             {:instance "infra/postgres@shop" :aliases ["pg"]}]
-            :wiring/env {"KAFKA_BROKERS" "kafka:9092" "KAFKA_TOPIC_PREFIX" "r-01.shop."
+            :wiring/env {"KAFKA_BROKERS" "kafka:9092" "KAFKA_TOPIC_PREFIX" "r01.shop."
                          "PG_HOST" "pg" "PG_PASSWORD" {:pass "infra/pg"}
-                         "HIVE_RUN_ID" "r-01" "OTEL_RESOURCE_ATTRIBUTES" "hive.run.id=r-01"}
-            :wiring/prefix "r-01.shop."}
+                         "HIVE_RUN_ID" "r01" "OTEL_RESOURCE_ATTRIBUTES" "hive.run.id=r01"}
+            :wiring/prefix "r01.shop."}
            (:ok w))
         "provider hostnames stay as written: the network aliases make them right")))
 
 (deftest secret-refs-stay-references
-  (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r-01" "shop")))]
+  (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r01" "shop")))]
     (is (= {:pass "infra/pg"} (get e "PG_PASSWORD")))
     (is (= "pass:infra/pg" (get (env/rendered e) "PG_PASSWORD")))))
 
 (deftest a-section-consumer-reads-its-project-needs
   (let [res (assoc-in resolution [:resolution/bindings "billing/api"] {"kafka" "infra/kafka"})
-        w (:ok (wiring/wiring settings res "r-01" "billing/api"))]
-    (is (= "hive-r-01-billing-api" (:wiring/network w)))
-    (is (= "r-01.billing-api." (get-in w [:wiring/env "KAFKA_TOPIC_PREFIX"])))))
+        w (:ok (wiring/wiring settings res "r01" "billing/api"))]
+    (is (= "hive-r01-billing-api" (:wiring/network w)))
+    (is (= "r01.billing-api." (get-in w [:wiring/env "KAFKA_TOPIC_PREFIX"])))))
 
 (deftest per-service-restriction
   (testing "postgres is needed by shop's api only"
-    (is (= "pg" (get (:ok (wiring/service-env settings resolution "r-01" "shop" "api")) "PG_HOST")))
-    (let [worker (:ok (wiring/service-env settings resolution "r-01" "shop" "worker"))]
+    (is (= "pg" (get (:ok (wiring/service-env settings resolution "r01" "shop" "api")) "PG_HOST")))
+    (let [worker (:ok (wiring/service-env settings resolution "r01" "shop" "worker"))]
       (is (not (contains? worker "PG_HOST")))
       (is (= "kafka:9092" (get worker "KAFKA_BROKERS")) "kafka names no :services: every service")
-      (is (= "r-01" (get worker "HIVE_RUN_ID"))))))
+      (is (= "r01" (get worker "HIVE_RUN_ID"))))))
 
 (deftest env-collision-names-both-instances-and-the-key
   (let [s (assoc-in settings [:compose/projects "infra" :project/provides "postgres" :env "KAFKA_BROKERS"]
                     "elsewhere:9092")
-        w (wiring/wiring s resolution "r-01" "shop")]
+        w (wiring/wiring s resolution "r01" "shop")]
     (is (= :compose/env-collision (:error w)))
     (is (= "KAFKA_BROKERS" (:key w)))
     (is (= #{"infra/kafka" "infra/postgres@shop"} (set (:instances w)))))
   (testing "the same value from two instances is no collision"
     (let [s (assoc-in settings [:compose/projects "infra" :project/provides "postgres" :env "KAFKA_BROKERS"]
                       "kafka:9092")]
-      (is (r/ok? (wiring/wiring s resolution "r-01" "shop"))))))
+      (is (r/ok? (wiring/wiring s resolution "r01" "shop"))))))
 
 (deftest unknown-instance-and-bad-run
   (is (= :compose/unknown-instance
          (:error (wiring/wiring settings (assoc-in resolution [:resolution/bindings "x"] {"kafka" "nope"})
-                                "r-01" "x"))))
+                                "r01" "x"))))
   (is (= :compose/invalid-run (:error (wiring/wiring settings resolution "R 01" "shop")))))
 
 (def otlp
@@ -99,23 +99,23 @@
    "OTEL_RESOURCE_ATTRIBUTES" "service.name=shop,hive.run.id=wrong"})
 
 (deftest extra-envs-hook
-  (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r-01" "shop" [otlp {"EXTRA" "1"}])))]
+  (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r01" "shop" [otlp {"EXTRA" "1"}])))]
     (is (= "http://otel:4317" (get e "OTEL_EXPORTER_OTLP_ENDPOINT")))
     (is (= "grpc" (get e "OTEL_EXPORTER_OTLP_PROTOCOL")))
-    (is (= "service.name=shop,hive.run.id=r-01" (get e "OTEL_RESOURCE_ATTRIBUTES"))
+    (is (= "service.name=shop,hive.run.id=r01" (get e "OTEL_RESOURCE_ATTRIBUTES"))
         "hive.run.id is forced to the run")
     (is (= "1" (get e "EXTRA"))))
   (testing "a later map naming either pair key replaces the pair"
-    (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r-01" "shop"
+    (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r01" "shop"
                                              [otlp {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://otel:4318"
                                                     "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"}])))]
       (is (= ["http://otel:4318" "http/protobuf"]
              [(get e "OTEL_EXPORTER_OTLP_ENDPOINT") (get e "OTEL_EXPORTER_OTLP_PROTOCOL")]))))
   (testing "an endpoint without its protocol is refused"
-    (let [w (wiring/wiring settings resolution "r-01" "shop" [otlp {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://x:4317"}])]
+    (let [w (wiring/wiring settings resolution "r01" "shop" [otlp {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://x:4317"}])]
       (is (= :compose/otlp-pair-broken (:error w)))))
   (testing "HIVE_RUN_ID cannot be overridden"
-    (is (= "r-01" (get-in (:ok (wiring/wiring settings resolution "r-01" "shop" [{"HIVE_RUN_ID" "other"}]))
+    (is (= "r01" (get-in (:ok (wiring/wiring settings resolution "r01" "shop" [{"HIVE_RUN_ID" "other"}]))
                           [:wiring/env "HIVE_RUN_ID"])))))
 
 (deftest consumer-env-overlays-the-injected-env
@@ -125,21 +125,21 @@
                      "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"
                      "OTEL_RESOURCE_ATTRIBUTES" "service.name=shop-api,hive.run.id=mine"
                      "HIVE_RUN_ID" "mine"})
-        e (:wiring/env (:ok (wiring/wiring s resolution "r-01" "shop" [otlp])))]
+        e (:wiring/env (:ok (wiring/wiring s resolution "r01" "shop" [otlp])))]
     (is (= "mine:9092" (get e "KAFKA_BROKERS")) "the consumer wins per key")
     (is (= ["http://collector:4318" "http/protobuf"]
            [(get e "OTEL_EXPORTER_OTLP_ENDPOINT") (get e "OTEL_EXPORTER_OTLP_PROTOCOL")])
         "and per pair")
-    (is (= "service.name=shop-api,hive.run.id=r-01" (get e "OTEL_RESOURCE_ATTRIBUTES")))
-    (is (= "r-01" (get e "HIVE_RUN_ID")) "forced keys stay forced"))
+    (is (= "service.name=shop-api,hive.run.id=r01" (get e "OTEL_RESOURCE_ATTRIBUTES")))
+    (is (= "r01" (get e "HIVE_RUN_ID")) "forced keys stay forced"))
   (testing "a consumer naming only the endpoint owns the pair: the protocol goes with it"
     (let [s (assoc-in settings [:compose/projects "shop" :project/env]
                       {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://collector:4317"})]
-      (is (= :compose/otlp-pair-broken (:error (wiring/wiring s resolution "r-01" "shop" [otlp]))))))
+      (is (= :compose/otlp-pair-broken (:error (wiring/wiring s resolution "r01" "shop" [otlp]))))))
   (testing "a suite consumer reads :suite/env"
     (let [s (assoc settings :compose/suites {"smoke" {:suite/id "smoke" :suite/image "x" :suite/env {"S" "1"}}})
           res (assoc-in resolution [:resolution/bindings "suite:smoke"] {"kafka" "infra/kafka"})]
-      (is (= "1" (get-in (:ok (wiring/wiring s res "r-01" "suite:smoke")) [:wiring/env "S"]))))))
+      (is (= "1" (get-in (:ok (wiring/wiring s res "r01" "suite:smoke")) [:wiring/env "S"]))))))
 
 (deftest attributes-merge
   (is (= "a=1,b=3,c=4" (wiring/merge-attributes ["a=1,b=2" "b=3,c=4"])))
@@ -148,7 +148,7 @@
   (is (= "a=1" (wiring/merge-attributes [" a = 1 ,, =bad,nokey"]))))
 
 (deftest all-consumers
-  (let [ws (wiring/wirings settings resolution "r-01" (fn [c] [{"WHO" c}]))]
+  (let [ws (wiring/wirings settings resolution "r01" (fn [c] [{"WHO" c}]))]
     (is (r/ok? ws))
     (is (= #{"shop" "billing"} (set (keys (:ok ws)))))
     (is (= "billing" (get-in (:ok ws) ["billing" :wiring/env "WHO"])))
@@ -160,7 +160,7 @@
 (def gen-run
   (gen/fmap (fn [[c cs]] (apply str c cs))
             (gen/tuple (gen/elements (seq "abcdefghijklmnopqrstuvwxyz0123456789"))
-                       (gen/vector (gen/elements (seq "abcdefghijklmnopqrstuvwxyz0123456789-")) 2 20))))
+                       (gen/vector (gen/elements (seq "abcdefghijklmnopqrstuvwxyz0123456789")) 2 20))))
 
 (def caps ["kafka" "postgres" "redis" "s3" "otel"])
 
@@ -263,6 +263,6 @@
                                                  {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://otel:4318"
                                                   "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"}])
                                   0 5)]
-    (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r-01" "shop" maps)))
+    (let [e (:wiring/env (:ok (wiring/wiring settings resolution "r01" "shop" maps)))
           last-pair (last (filter #(contains? % "OTEL_EXPORTER_OTLP_ENDPOINT") maps))]
       (= (select-keys last-pair wiring/otlp-pair) (select-keys e wiring/otlp-pair)))))
