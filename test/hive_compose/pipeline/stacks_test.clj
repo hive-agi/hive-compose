@@ -8,6 +8,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.port :as port]
             [hive-compose.stub :as stub]
@@ -96,7 +97,7 @@
              (update-vals (stub/networks (e c)) :members)))
       (is (= {"hive.run" run "hive.stack" "shop"} (get-in (stub/networks (e c)) ["hive-shop000001-shop" :labels]))))
     (testing "persisted additively"
-      (is (= #{:active :current :stacks} (set (keys @(:saved c)))))
+      (is (= #{:active :current :stacks :preexisting} (set (keys @(:saved c)))))
       (is (= :up (get-in @(:saved c) [:stacks run :status]))))))
 
 (deftest a-consumer-waits-for-a-healthy-instance
@@ -126,7 +127,8 @@
     (is (r/ok? res) (pr-str res))
     (let [[_ _ svcs opts] (first (filter #(= private (second %)) (ups c)))]
       (is (= ["kafka" "zookeeper"] svcs) "its whole closure, so every container is labelled")
-      (is (= {"hive.run" run "hive.stack" "all" "hive.instance" "kafka/kafka@audit"} (:labels opts))))
+      (is (= {"hive.run" run "hive.stack" "all" "hive.instance" "kafka/kafka@audit"}
+             (select-keys (:labels opts) ["hive.run" "hive.stack" "hive.instance"]))))
     (is (every? #(= run (get-in % [:labels "hive.run"]))
                 (filter #(= private (:project %)) (vals (stub/containers (e c))))))
     (is (r/ok? (stacks/stack-down! c {:stack "all"})))
@@ -157,6 +159,20 @@
     (is (= {"kafka" [[:preexisting]] "zookeeper" [[:preexisting]]}
            (get-in down [:ok :runs 0 :kept 0 :kept])))))
 
+(deftest preexistence-is-global-and-never-cleared
+  (let [c (ctx {"kafka" #{"kafka" "zookeeper"}})
+        a (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])
+        b (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]
+    (is (= {"kafka/kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))))
+    (is (not (contains? (get-in @(:state c) [:stacks a]) :preexisting)) "never carried in a run entry")
+    (stacks/stack-down! c {:run a})
+    (stacks/stack-down! c {:run b})
+    (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "the last run to leave spares it too")
+    (is (= {"kafka/kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))) "the mark stays")
+    (let [r3 (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
+      (stacks/stack-down! c {:run r3})
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka"))))))
+
 (deftest down-spares-what-an-active-section-needs
   (let [c (ctx)
         run (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
@@ -165,6 +181,58 @@
             :started-at 0 :last-touch 0})
     (is (r/ok? (stacks/stack-down! c {:run run})))
     (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")))))
+
+(deftest a-section-down-spares-a-stack-instance
+  (let [c (ctx)
+        _ (stacks/stack-up! c {:stack "billing"})
+        sec (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/up-profile! c %))]
+    (is (r/ok? sec) (pr-str sec))
+    (let [down (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/down-profile! c % :down))]
+      (is (r/ok? down) (pr-str down))
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "the billing run still binds kafka")
+      (is (= {"kafka" [[:stack]] "zookeeper" [[:stack]]}
+             (select-keys (:kept (:ok down)) ["kafka" "zookeeper"])))
+      (is (empty? (:services (:ok down)))))
+    (testing "the reaper too"
+      (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/up-profile! c %))
+      (swap! (:clock c) + (* 61 minute))
+      (ops/reap! c)
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka"))))))
+
+(deftest down-disconnects-and-removes-the-view-networks
+  (let [c (ctx)
+        run (get-in (stacks/stack-up! c {:stack "all"}) [:ok :run])
+        nets (set (get-in @(:state c) [:stacks run :networks]))
+        down (stacks/stack-down! c {:run run})]
+    (is (= #{(str "hive-" run "-audit") (str "hive-" run "-billing") (str "hive-" run "-shop")} nets))
+    (is (= nets (set (get-in down [:ok :runs 0 :networks-removed]))))
+    (is (= (count nets) (count (filter #(= :network-rm (first %)) (stub/calls (e c))))))
+    (is (empty? (stub/networks (e c))))
+    (is (every? #(empty? (:networks %)) (vals (stub/containers (e c))))
+        "a shared instance that stays up is detached from every view network of the run")))
+
+(deftest a-consumer-never-re-ups-what-it-provides
+  (let [c (assoc-in (ctx) [:settings :compose/stacks "self"]
+                    {:stack/id "self" :stack/consumers ["kafka" "billing"]})
+        res (stacks/stack-up! c {:stack "self"})]
+    (is (r/ok? res) (pr-str res))
+    (is (= 1 (count (filter #(and (= :up-project (first %)) (= "kafka" (second %))) (stub/calls (e c))))))
+    (is (empty? (get-in res [:ok :consumers 1 :services])) "kafka's own consumer step starts nothing")))
+
+(deftest adopt-never-takes-a-stack-instance
+  (let [c (ctx)]
+    (stacks/stack-up! c {:stack "billing"})
+    (is (not-any? #(= "kafka/adopted" %) (ops/adopt! c)))
+    (is (not (contains? (:active @(:state c)) "kafka/adopted")))))
+
+(deftest a-consumer-whose-up-fails-is-still-taken-down
+  (let [c (ctx)]
+    (stub/health! (e c) "billing-billing000001" "billing" :unhealthy)
+    (let [res (stacks/stack-up! c {:stack "billing"})]
+      (is (r/err? res))
+      (is (seq (stub/running (e c) "billing-billing000001")) "compose left the container behind")
+      (is (r/ok? (stacks/stack-down! c {:run (:run res)})))
+      (is (= #{} (stub/running (e c) "billing-billing000001"))))))
 
 (deftest errors-are-results
   (let [c (ctx)]

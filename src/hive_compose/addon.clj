@@ -103,7 +103,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]

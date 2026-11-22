@@ -585,11 +585,37 @@
   [exec argv timeout-ms]
   (run exec nil argv timeout-ms nil identity))
 
+(def compose-default-files
+  "The files compose reads when given no -f, in its own order."
+  ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
+
+(defn default-file
+  "The first of `compose-default-files` for which `exists?` is true, in
+   compose's own order; nil when none. Pure over the probe."
+  [exists?]
+  (first (filter exists? compose-default-files)))
+
+(defn- with-default-files
+  "Result<spec>: `spec` naming its project's default compose file when it
+   names none. An override passed as `-f` replaces compose's default lookup,
+   so the base file must be named before it; a project dir holding none of
+   `compose-default-files` is :compose/no-compose-file. The file probe is
+   here, at the boundary; `project-argv` stays pure."
+  [spec]
+  (if (or (seq (:files spec)) (nil? (:dir spec)))
+    (r/ok spec)
+    (if-let [f (default-file #(.exists (io/file (:dir spec) %)))]
+      (r/ok (assoc spec :files [f]))
+      (r/err :compose/no-compose-file
+             {:project (:project spec) :dir (:dir spec) :looked-for compose-default-files
+              :hint "set :project/files, or add a compose file to the project dir"}))))
+
 (defn- stack-up!
   [{:keys [exec resolver up-timeout-ms override-dir]} spec]
   (if (empty? (:services spec))
     (r/ok {:out "" :skipped :no-services})
-    (r/let-ok [override (write-override! override-dir spec)
+    (r/let-ok [spec (if (override? spec) (with-default-files spec) (r/ok spec))
+               override (write-override! override-dir spec)
                resolved (secrets/resolve-env resolver (:env spec))]
       (let [declared (:env spec)
             argv (up-project-argv spec override)]
@@ -602,7 +628,9 @@
   (if (and (not (:all? spec)) (empty? (:services spec)))
     (r/ok {:out "" :skipped :no-services})
     (let [override (let [p (override-path override-dir (:project spec))]
-                     (when (.exists (io/file p)) p))]
+                     (when (.exists (io/file p)) p))
+          ;; a base file that has since gone still lets the down run on the override
+          spec (if override (let [x (with-default-files spec)] (if (r/ok? x) (:ok x) spec)) spec)]
       (r/map-ok (run exec {:profile/dir (:dir spec)} (down-project-argv spec override) timeout-ms
                      (env/rendered (:env spec)) identity)
                 (fn [out] {:out (clip out)})))))

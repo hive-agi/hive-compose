@@ -81,12 +81,25 @@
    and hive.run.id, so its telemetry is correlated without any env of its
    own (plan hc-7: every consumer gets OTEL_EXPORTER_OTLP_ENDPOINT and
    OTEL_RESOURCE_ATTRIBUTES with hive.run.id)."
-  (let [c (w/ctx)
+  (let [p (assoc-in w/projects ["infra" :project/provides "otel"] {:service "otel" :version "0.41.1"})
+        c (-> (w/ctx {:projects p})
+              (assoc-in [:settings :compose/stacks "abo"]
+                        {:stack/id "abo" :stack/consumers ["a" "b"] :stack/needs {"otel" {}}}))
         rid "s6otel"
-        ws (get-in (stacks/resolve-plan c "ab" rid) [:ok :wirings])]
-    (is (= (str "hive.run.id=" rid) (get-in ws ["b" :wiring/env "OTEL_RESOURCE_ATTRIBUTES"])))
-    (is (contains? (get-in ws ["b" :wiring/env]) "OTEL_EXPORTER_OTLP_ENDPOINT")
-        "FINDING hc-6: resolve-plan calls wiring/wirings without the otel extra-envs hook")))
+        ws (get-in (stacks/resolve-plan c "abo" rid) [:ok :wirings])]
+    (is (= ["http://otel:4317" "grpc"]
+           [(get-in ws ["b" :wiring/env "OTEL_EXPORTER_OTLP_ENDPOINT"])
+            (get-in ws ["b" :wiring/env "OTEL_EXPORTER_OTLP_PROTOCOL"])])
+        "a stack that needs otel wires every consumer to it on its view network")
+    (is (= "b" (get-in ws ["b" :wiring/env "OTEL_SERVICE_NAME"])))
+    (is (= rid (get (otel/parse-resource-attributes (get-in ws ["b" :wiring/env "OTEL_RESOURCE_ATTRIBUTES"])) "hive.run.id")))
+    (testing "the otel instance joins each consumer's view network under its alias"
+      (is (some #(= ["otel"] (:aliases %)) (get-in ws ["a" :wiring/attach]))))
+    (testing "without otel in the stack nothing points at an unreachable collector"
+      (let [ws0 (get-in (stacks/resolve-plan (w/ctx) "ab" rid) [:ok :wirings])]
+        (is (not (contains? (get-in ws0 ["b" :wiring/env]) "OTEL_EXPORTER_OTLP_ENDPOINT")))
+        (is (= (str "hive.run.id=" rid) (get-in ws0 ["b" :wiring/env "OTEL_RESOURCE_ATTRIBUTES"])))
+        (is (= rid (get-in ws0 ["b" :wiring/env "HIVE_RUN_ID"])))))))
 
 (defn- stub-resolver [fetches]
   {:pass (reify proto/ISecretBackend
@@ -121,8 +134,11 @@
             e (cli/make-engine {:exec (fn [argv opts] (swap! calls conj [argv opts]) (r/ok {:exit 0 :stdout "" :stderr ""}))
                                 :compose/resolver (stub-resolver fetches)
                                 :compose/stack-dir dir})
-            spec (run/consumer-spec (settings) rid "ab" "a" ["app"] wa
-                                    (keys (:wiring/env wa)) false)]
+            proj (tmp-dir)
+            _ (spit (io/file proj "compose.yaml") "services: {app: {image: busybox}}\n")
+            spec (assoc (run/consumer-spec (settings) rid "ab" "a" ["app"] wa
+                                           (keys (:wiring/env wa)) false)
+                        :dir proj)]
         (is (= [] @fetches))
         (is (r/ok? (port/-up-project! e spec)))
         (is (= [secret-path] @fetches))

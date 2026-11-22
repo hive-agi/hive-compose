@@ -40,7 +40,7 @@
 (def claim-prefix "stack:")
 
 (defn- persist! [{:keys [state save!]}]
-  (when save! (save! (select-keys @state [:active :current :stacks]))))
+  (when save! (save! (select-keys @state [:active :current :stacks :preexisting]))))
 
 (defn- now [ctx] ((:now ctx)))
 
@@ -107,16 +107,17 @@
 
 (defn- with-needs
   "Result<StackPlan> with every instance's depends_on closure
-   (`:instance/needs`), read from its provider project's files."
+   (`:instance/needs`, hc-4 `stack/with-needs`), read from its provider
+   project's own files, whatever -p the instance runs under."
   [engine settings sp]
   (r/map-ok
-   (all-ok (fn [[iid ip]]
+   (all-ok (fn [[_ ip]]
              (let [proj (get-in settings [:compose/projects (:instance/provider ip)])
-                   ;; the provider's own files define the closure, whatever -p it runs under
-                   p (assoc (target/project-profile proj) :profile/services (vec (:instance/services ip)))]
-               (r/map-ok (port/-closure engine p) (fn [c] [iid (assoc ip :instance/needs (vec c))]))))
+                   p (assoc (target/project-profile proj) :profile/services [(:instance/service ip)])]
+               (r/map-ok (port/-closure engine p)
+                         (fn [c] [[(:instance/compose-project ip) (:instance/service ip)] (vec c)]))))
            (:stack/instances sp))
-   (fn [rows] (assoc sp :stack/instances (into (sorted-map) rows)))))
+   (fn [rows] (stack/with-needs sp (into {} rows)))))
 
 (defn- preexisting
   "Result<{instance-id [service]}>: what of each shared instance's closure ran
@@ -144,10 +145,12 @@
   [ctx stack-id run-id]
   (let [settings (:settings ctx)]
     (r/let-ok [s (stack-config ctx stack-id)
-               res (r/map-ok (capability/resolve-stack (:compose/projects settings) s)
-                             #(run/with-private-projects settings % run-id))
+               ;; a stack's own needs (otel, ...) are needs of every container
+               ;; consumer in it, shared: one instance joins each view network
+               res (capability/resolve-stack (:compose/projects settings) s
+                                             {:extra (run/stack-needs-per-consumer s)})
                sp (stack/stack-plan settings res run-id {:stack stack-id})
-               ws (wiring/wirings settings res run-id)]
+               ws (wiring/wirings settings res run-id (run/otlp-envs res run-id))]
       (r/ok {:resolution res :plan sp :wirings ws}))))
 
 (defn- consumer-services
@@ -213,7 +216,11 @@
     (r/let-ok [_ (if wait?
                    (all-ok #(gate engine (get-in sp [:stack/instances (:instance %)]) c) (:consumer/attach cp))
                    (r/ok nil))
-               services (consumer-services engine proj c)
+               all (consumer-services engine proj c)
+               ;; hc-4 :consumer/provider-of: what this consumer provides runs
+               ;; as its instance (shared or private), never again as the consumer
+               services (r/ok (run/without-provided all (map #(get-in sp [:stack/instances %])
+                                                            (:consumer/provider-of cp))))
                _ (port/-up-project! engine (run/consumer-spec settings (:stack/run sp) (:stack/id sp) c services w
                                                               (injected-vars settings c w) wait?))]
       (r/ok {:consumer c :network (:wiring/network w)
@@ -242,8 +249,12 @@
              pre (preexisting engine (:settings ctx) sp (live-plans ctx))]
     (let [t (now ctx)
           consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))]
+      ;; preexistence is global and permanent: set by the first run that finds
+      ;; an instance's services running outside every run, never cleared
+      (swap! (:state ctx) update :preexisting
+             #(run/mark-preexisting % (:stack/instances sp) pre))
       (record! ctx rid (constantly {:stack/id stack-id :run rid :started-at t :last-touch t
-                                    :plan sp :preexisting pre :networks (:stack/networks sp)
+                                    :plan sp :networks (:stack/networks sp)
                                     :consumers {} :status :partial}))
       (let [res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
                                         (:stack/networks sp))
@@ -251,6 +262,11 @@
                                                (up-instance! ctx engine (get-in sp [:stack/instances id]) wait?))
                                              (filter #(= :instance (:step/kind %)) (:stack/start-order sp)))
                            cs (all-ok (fn [c]
+                                        ;; recorded BEFORE its up: a failed up leaves
+                                        ;; containers that stack-down must still remove
+                                        (record! ctx rid #(assoc-in % [:consumers c]
+                                                                    {:compose-project (run/consumer-compose-project
+                                                                                       (:settings ctx) c rid)}))
                                         (r/map-ok (up-consumer! ctx engine sp ws c wait?)
                                                   (fn [row] (record! ctx rid #(assoc-in % [:consumers c]
                                                                                         (select-keys row [:compose-project :services])))
@@ -297,7 +313,9 @@
 (defn- down-run! [ctx engine rid]
   (let [e (get (stacks ctx) rid)
         sp (:plan e)
-        steps (mapv #(run/sparing-preexisting % (get-in e [:preexisting (:instance %)]))
+        steps (mapv #(run/sparing-preexisting
+                      % (run/preexisting-of (:preexisting @(:state ctx))
+                                            (get-in sp [:stack/instances (:instance %)])))
                     (stack/stack-releases (live-plans ctx) rid (:active @(:state ctx))))
         consumers (mapv #(down-consumer! ctx engine %) (sort-by key (:consumers e)))
         nets (mapv #(port/-network-rm! engine %) (:networks e))
