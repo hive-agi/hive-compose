@@ -1,0 +1,25 @@
+# hog: the S13b fixture (hc-16c). One service that allocates past its cap.
+#
+# Under hive-compose the cap comes from the provider's :resources (hc-16a),
+# which writes mem_limit into the stack override; S13b checks that the cap it
+# planned is the cap the kernel enforced. HOG_MEM is only the by-hand
+# default, and memswap_limit equals it, so the cap cannot be dodged through
+# swap:
+#
+#   HOG_MEM=256m docker compose -p hog -f compose.yml up hog   # exit 137
+#   docker inspect -f '{{.State.OOMKilled}}' hog-hog-1          # true
+#   docker compose -p hog -f compose.yml down
+#
+# busybox:1.36 is pinned and the script is bind-mounted, so nothing is built.
+services:
+  hog:
+    image: busybox:1.36
+    mem_limit: ${HOG_MEM:-256m}
+    memswap_limit: ${HOG_MEM:-256m}
+    entrypoint: ["sh", "/hog/hog.sh"]
+    environment:
+      HOG_TARGET_MB: ${HOG_TARGET_MB:-512}
+      HOG_STEP_MB: ${HOG_STEP_MB:-16}
+      HOG_EXIT: ${HOG_EXIT:-1}
+    volumes:
+      - ./hog.sh:/hog/hog.sh:ro
