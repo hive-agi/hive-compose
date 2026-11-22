@@ -136,25 +136,6 @@
     (cond-> (update step :services #(vec (remove pre %)))
       (seq spared) (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:preexisting]]])) spared))))
 
-(defn with-private-projects
-  "`resolution` with `:instance/compose-project` filled on every private
-   instance that lacks it (`schema/private-project` over its provider's
-   compose name, its one consumer and `run`), as schema/Instance requires of
-   a private instance. The resolver (hc-3) knows no run, so it leaves the
-   name to the run; the stack plan (hc-4) checks the resolution against the
-   schema before naming anything. Shared instances are left as they are."
-  [settings resolution run]
-  (update resolution :resolution/instances
-          (fn [is]
-            (into (sorted-map)
-                  (for [[iid i] is]
-                    [iid (if (or (:instance/share? i) (:instance/compose-project i))
-                           i
-                           (let [proj (get-in settings [:compose/projects (:instance/provider i)])
-                                 pname (if proj (stack/project-compose-name proj) (:instance/provider i))]
-                             (assoc i :instance/compose-project
-                                    (schema/private-project pname (first (:instance/consumers i)) run))))])))))
-
 (defn whole-project?
   "True when release `step` of a private instance takes its whole compose
    project down: it is private and nothing of it is kept."

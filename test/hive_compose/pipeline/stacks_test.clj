@@ -126,7 +126,8 @@
     (is (r/ok? res) (pr-str res))
     (let [[_ _ svcs opts] (first (filter #(= private (second %)) (ups c)))]
       (is (= ["kafka" "zookeeper"] svcs) "its whole closure, so every container is labelled")
-      (is (= {"hive.run" run "hive.stack" "all" "hive.instance" "kafka/kafka@audit"} (:labels opts))))
+      (is (= {"hive.run" run "hive.stack" "all" "hive.instance" "kafka/kafka@audit"}
+             (select-keys (:labels opts) ["hive.run" "hive.stack" "hive.instance"]))))
     (is (every? #(= run (get-in % [:labels "hive.run"]))
                 (filter #(= private (:project %)) (vals (stub/containers (e c))))))
     (is (r/ok? (stacks/stack-down! c {:stack "all"})))

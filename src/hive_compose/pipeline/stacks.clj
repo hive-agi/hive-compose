@@ -107,16 +107,17 @@
 
 (defn- with-needs
   "Result<StackPlan> with every instance's depends_on closure
-   (`:instance/needs`), read from its provider project's files."
+   (`:instance/needs`, hc-4 `stack/with-needs`), read from its provider
+   project's own files, whatever -p the instance runs under."
   [engine settings sp]
   (r/map-ok
-   (all-ok (fn [[iid ip]]
+   (all-ok (fn [[_ ip]]
              (let [proj (get-in settings [:compose/projects (:instance/provider ip)])
-                   ;; the provider's own files define the closure, whatever -p it runs under
-                   p (assoc (target/project-profile proj) :profile/services (vec (:instance/services ip)))]
-               (r/map-ok (port/-closure engine p) (fn [c] [iid (assoc ip :instance/needs (vec c))]))))
+                   p (assoc (target/project-profile proj) :profile/services [(:instance/service ip)])]
+               (r/map-ok (port/-closure engine p)
+                         (fn [c] [[(:instance/compose-project ip) (:instance/service ip)] (vec c)]))))
            (:stack/instances sp))
-   (fn [rows] (assoc sp :stack/instances (into (sorted-map) rows)))))
+   (fn [rows] (stack/with-needs sp (into {} rows)))))
 
 (defn- preexisting
   "Result<{instance-id [service]}>: what of each shared instance's closure ran
@@ -144,8 +145,7 @@
   [ctx stack-id run-id]
   (let [settings (:settings ctx)]
     (r/let-ok [s (stack-config ctx stack-id)
-               res (r/map-ok (capability/resolve-stack (:compose/projects settings) s)
-                             #(run/with-private-projects settings % run-id))
+               res (capability/resolve-stack (:compose/projects settings) s)
                sp (stack/stack-plan settings res run-id {:stack stack-id})
                ws (wiring/wirings settings res run-id)]
       (r/ok {:resolution res :plan sp :wirings ws}))))
