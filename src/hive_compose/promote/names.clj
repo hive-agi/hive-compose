@@ -1,35 +1,34 @@
 (ns hive-compose.promote.names
-  "Pure naming of what a stack run creates: compose project names of private
-   instances, view network names, tenancy prefixes. One place, so the stack
-   plan (hc-4), the wiring (hc-5) and the ops (hc-6) always agree."
-  (:require [clojure.string :as str]))
+  "Naming of what a stack run creates, in one place so the stack plan (hc-4),
+   the wiring (hc-5) and the ops (hc-6) always agree. The Docker name builders
+   live in hive-compose.schema (slug, view-network, private-project); this ns
+   delegates to them, so there is one implementation, and adds the tenancy
+   prefix."
+  (:require [hive-compose.schema :as schema]))
 
 ;; SPDX-License-Identifier: MIT
 
 (defn slug
-  "`s` as a compose/docker name fragment: lowercase, every run of characters
-   outside [a-z0-9] turned into one '-', no leading or trailing '-'.
-   \"billing/API\" -> \"billing-api\", \"suite:smoke\" -> \"suite-smoke\"."
+  "`s` as a Docker name part (schema/slug)."
   [s]
-  (-> (str/lower-case (str s))
-      (str/replace #"[^a-z0-9]+" "-")
-      (str/replace #"^-+|-+$" "")))
+  (schema/slug s))
 
 (defn private-project
-  "Compose project name of a private instance of `provider` for `consumer` in
-   `run`: `<provider>-<consumer>-<run>`, slugged."
-  [provider consumer run]
-  (str (slug provider) "-" (slug consumer) "-" (slug run)))
+  "Compose project of a private instance of the provider whose compose project
+   name is `provider-project`, for `consumer` in `run` (schema/private-project):
+   `<provider-project>-<slug consumer>-<run>`."
+  [provider-project consumer run]
+  (schema/private-project provider-project consumer run))
 
 (defn view-network
-  "The view network of `consumer` in `run`: `hive-<run>-<consumer>`. The only
-   network the consumer attaches to; every instance it resolved joins it under
-   its original service names."
+  "The view network of `consumer` in `run` (schema/view-network):
+   `hive-<run>-<slug consumer>`. The only network outside its own compose
+   project the consumer attaches to."
   [run consumer]
-  (str "hive-" (slug run) "-" (slug consumer)))
+  (schema/view-network run consumer))
 
 (defn tenancy-prefix
   "Namespace prefix of `consumer` in `run` for topics, schemas and buckets on a
-   shared instance: `<run>.<consumer>.`."
+   shared instance: `<run>.<slug consumer>.`."
   [run consumer]
   (str (slug run) "." (slug consumer) "."))
