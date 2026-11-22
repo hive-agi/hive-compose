@@ -354,7 +354,8 @@
    [:consumer/network ViewNetwork]
    [:consumer/labels Labels]
    [:consumer/attach [:vector Attach]]
-   [:consumer/bindings [:map-of CapabilityId [:string {:min 1}]]]])
+   [:consumer/bindings [:map-of CapabilityId [:string {:min 1}]]]
+   [:consumer/provider-of {:optional true} [:vector [:string {:min 1}]]]])
 
 (def StartStep
   [:map

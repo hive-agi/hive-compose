@@ -46,19 +46,23 @@
 (defn- resolution-problems
   "Inconsistencies between bindings and instances, as [{:consumer :capability
    :instance :problem}]: an unknown instance, a capability mismatch, a private
-   instance bound by someone other than its one consumer."
+   instance bound by someone other than its one consumer, and an instance
+   nobody binds ({:instance :problem :unbound-instance})."
   [{:resolution/keys [instances bindings]}]
-  (vec
-   (for [[consumer caps] (sort-by key bindings)
-         [cap iid] (sort-by key caps)
-         :let [i (get instances iid)
-               problem (cond
-                         (nil? i) :unknown-instance
-                         (not= cap (:instance/capability i)) :capability-mismatch
-                         (and (not (:instance/share? i))
-                              (not= [consumer] (:instance/consumers i))) :private-instance-shared)]
-         :when problem]
-     {:consumer consumer :capability cap :instance iid :problem problem})))
+  (let [bound (set (mapcat vals (vals bindings)))]
+    (into
+     (vec (for [[consumer caps] (sort-by key bindings)
+                [cap iid] (sort-by key caps)
+                :let [i (get instances iid)
+                      problem (cond
+                                (nil? i) :unknown-instance
+                                (not= cap (:instance/capability i)) :capability-mismatch
+                                (and (not (:instance/share? i))
+                                     (not= [consumer] (:instance/consumers i))) :private-instance-shared)]
+                :when problem]
+            {:consumer consumer :capability cap :instance iid :problem problem}))
+     (for [iid (sort (keys instances)) :when (not (bound iid))]
+       {:instance iid :problem :unbound-instance}))))
 
 (defn- provider-compose-name
   "The compose project name of `provider`: its Project's, else its slug (an
@@ -137,6 +141,17 @@
              :when (< 1 (count ids))]
          {:consumer c :alias a :instances (vec ids)})))
 
+(defn instance-labels
+  "Labels on an instance's containers. A shared instance carries only
+   hive.instance: a per-run label on a service shared across runs would change
+   its compose config hash and recreate it on every new run's up, so per-run
+   ownership of a shared instance lives on the view networks (`labels`). A
+   private one carries hive.run, hive.stack, hive.instance and hive.consumer."
+  [run stack-id iid i]
+  (if (:instance/share? i)
+    {(:instance schema/docker-labels) iid}
+    (assoc (labels run stack-id iid) (:consumer schema/docker-labels) (first (:instance/consumers i)))))
+
 (defn- shadowed-services
   "[{:consumer :alias :instance}]: an instance alias on a consumer's view
    network equal to one of that consumer's own service names
@@ -155,8 +170,13 @@
               (assoc i
                      :instance/compose-project cp
                      :instance/services (vec (distinct (cons (:instance/service i) (:instance/aliases i))))
-                     :instance/labels (labels run stack-id iid)
-                     :instance/networks (vec (sort (distinct (map #(names/view-network run %) (get by iid)))))
+                     :instance/labels (instance-labels run stack-id iid i)
+                     ;; every binder's view network, and its provider's own when the
+                     ;; provider binds instances itself, so it reaches them there
+                     :instance/networks (vec (sort (distinct (map #(names/view-network run %)
+                                                                  (cond-> (get by iid)
+                                                                    (contains? bindings (:instance/provider i))
+                                                                    (conj (:instance/provider i)))))))
                      :instance/depends-on (instance-deps bindings iid i)))))
 
 (defn- plan-consumer [run stack-id instances consumer caps]
@@ -165,7 +185,8 @@
    :consumer/labels (labels run stack-id)
    :consumer/attach (vec (for [iid (sort (distinct (vals caps)))]
                            {:instance iid :aliases (:instance/aliases (get instances iid))}))
-   :consumer/bindings (into (sorted-map) caps)})
+   :consumer/bindings (into (sorted-map) caps)
+   :consumer/provider-of (vec (sort (keep (fn [[iid ip]] (when (= consumer (:instance/provider ip)) iid)) instances)))})
 
 (defn stack-plan
   "Result<StackPlan> for `resolution` in run `run`. `settings` gives the
@@ -217,7 +238,8 @@
                                 bindings)
                 net-clash (collisions (into {} (map (fn [[c cp]] [c (:consumer/network cp)])) consumers))
                 proj-clash (collisions (into {} (comp (remove (comp :instance/share? val))
-                                                      (map (fn [[iid ip]] [iid (:instance/compose-project ip)])))
+                                                      (map (fn [[_ ip]] [[(:instance/provider ip) (first (:instance/consumers ip))]
+                                                                         (:instance/compose-project ip)])))
                                              planned))
                 aliases (clashing-aliases consumers)
                 shadows (shadowed-services consumers (:services opts))]
@@ -334,7 +356,7 @@
    beside the state file `state-file`."
   [state-file stack-id]
   (let [dir (or (second (re-find #"^(.*)/[^/]*$" (str state-file))) ".")]
-    (str dir "/locks/" (names/slug stack-id) ".lock.edn")))
+    (str dir "/locks/" stack-id ".lock.edn")))
 
 ;; ---------------------------------------------------------------------------
 ;; release across stacks: a refcount over instances spanning compose projects
