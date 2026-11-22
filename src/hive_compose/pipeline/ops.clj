@@ -21,6 +21,8 @@
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
+            [hive-compose.promote.stack :as stack]
+            [hive-compose.promote.stack-run :as stack-run]
             [hive-compose.promote.target :as target]
             [hive-dsl.result :as r]
             [clojure.string :as str]))
@@ -333,17 +335,26 @@
    Any other section goes through compose; when compose cannot load the
    project's files because a variable is unset, the step falls back to
    container names and the answer names the variable under :missing-env, so
-   one unset variable never keeps a section running pass after pass."
-  [ctx p {id :profile/id :as step}]
-  (if (and (adopted-section? id) (by-name? ctx))
-    (execute-by-name! ctx p step)
-    (let [res (execute-by-service! ctx p step)
-          var (missing-variable res)]
-      (cond
-        (nil? var) res
-        (by-name? ctx) (r/map-ok (execute-by-name! ctx p step) #(assoc % :missing-env var))
-        :else (assoc res :missing-env var
-                     :hint (str var " is unset: set it in the project's :project/env"))))))
+   one unset variable never keeps a section running pass after pass.
+   Services a live stack run's instances keep alive (`:stacks` in the state,
+   hc-6) are spared, so no section release stops a stack's shared service."
+  [ctx p step0]
+  (let [{id :profile/id :as step}
+        (stack-run/spare-stack-held
+         step0 (stack/stack-held (into {} (map (fn [[k e]] [k (:plan e)])) (:stacks @(:state ctx)))))]
+    (cond-> (if (and (adopted-section? id) (by-name? ctx))
+              (execute-by-name! ctx p step)
+              (let [res (execute-by-service! ctx p step)
+                    var (missing-variable res)]
+                (cond
+                  (nil? var) res
+                  (by-name? ctx) (r/map-ok (execute-by-name! ctx p step) #(assoc % :missing-env var))
+                  :else (assoc res :missing-env var
+                               :hint (str var " is unset: set it in the project's :project/env")))))
+      (not= (:kept step) (:kept step0))
+      (r/map-ok #(assoc % :stack-kept (into (sorted-map)
+                                            (map (fn [s] [s [[:stack]]]))
+                                            (remove (set (:services step)) (:services step0))))))))
 
 (defn- forget [st id]
   (-> st
@@ -369,6 +380,8 @@
     (r/err? result) (assoc :error result)
     (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))
     (get-in result [:ok :by]) (assoc :by (get-in result [:ok :by]))
+    (get-in result [:ok :stack-kept]) (-> (update :kept (fnil merge (sorted-map)) (get-in result [:ok :stack-kept]))
+                                          (update :services #(vec (remove (set (keys (get-in result [:ok :stack-kept]))) %))))
     (or (:missing-env result) (get-in result [:ok :missing-env]))
     (assoc :missing-env (or (:missing-env result) (get-in result [:ok :missing-env])))))
 
@@ -656,8 +669,13 @@
         strays (reduce (fn [taken [_ proj]]
                          (let [whole (target/project-profile proj)
                                running (port/-running engine whole)
+                               ;; what a live stack run holds is the run's, never a stray
+                               held (get (stack/stack-held (into {} (map (fn [[k e]] [k (:plan e)]))
+                                                                 (:stacks @(:state ctx))))
+                                         (profile/project whole) #{})
                                unowned (when (r/ok? running)
-                                         (vec (remove (owned (profile/project whole) taken) (:ok running))))]
+                                         (vec (remove (some-fn (owned (profile/project whole) taken) held)
+                                                      (:ok running))))]
                            (if (seq unowned)
                              (let [closure (port/-closure engine (assoc whole :profile/services unowned))
                                    needs (if (r/ok? closure) (:ok closure) unowned)]
