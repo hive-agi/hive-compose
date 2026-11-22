@@ -150,6 +150,21 @@
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
 
+(defprotocol ISuiteRunner
+  "Runs one suite runner to its end under its resource caps (hc-16b): a host
+   command inside a memory-capped systemd user scope (ulimit -v when no user
+   manager answers), a container with docker's memory and cpu flags. See
+   `hive-compose.promote.oom` for the data."
+  (-run! [r spec]
+    "Result<{:exit n-or-nil :started-at ms :finished-at ms :output [line]
+     :timed-out? bool :cap {:mode :systemd|:ulimit|:docker|:none :mem bytes?
+     :cpus n? :note s?} :oom Finding?}>: run `spec` (a runner spec, see
+     `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
+     :command, :dir, :env, :timeout-ms, :test-id, :image, :name, :mounts,
+     :network, :labels, plus :resources {:mem bytes :cpus n}) and wait for its
+     end. A runner that exits non-zero, is OOM-killed or times out is an ok
+     answer; an error only when it could not be started at all."))
+
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
    networks (one per consumer and run), compose projects brought up with
