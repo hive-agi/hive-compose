@@ -117,15 +117,35 @@
   [m]
   (into {} (map (fn [[k v]] [(if (ident? k) (name k) k) v])) m))
 
+(defn normalize-resources
+  "Resources as JSON or EDN give them: \"unbounded\" (or the keyword) as
+   :unbounded, anything else as is, for the schema to judge."
+  [v]
+  (if (and (or (string? v) (keyword? v)) (= "unbounded" (name v))) :unbounded v))
+
+(defn- normalize-in
+  "`m` with `k` normalized by `f` when `m` is a map holding it."
+  [m k f]
+  (if (and (map? m) (contains? m k)) (update m k f) m))
+
+(defn normalize-provides
+  "Provides ({capability Provide}) with string capability names and
+   normalized `:resources`."
+  [provides]
+  (into {}
+        (map (fn [[k p]] [k (normalize-in p :resources normalize-resources)]))
+        (capability-keys provides)))
+
 (defn normalize-needs
-  "Needs ({capability Need}) with string capability names and each `:via` a
-   keyword, as JSON gives it a string."
+  "Needs ({capability Need}) with string capability names, each `:via` a
+   keyword, as JSON gives it a string, and normalized `:resources`."
   [needs]
   (if (map? needs)
     (into {}
           (map (fn [[k n]]
-                 [k (cond-> n
-                      (and (map? n) (string? (:via n))) (update :via keyword))]))
+                 [k (-> n
+                        (cond-> (and (map? n) (string? (:via n))) (update :via keyword))
+                        (normalize-in :resources normalize-resources))]))
           (capability-keys needs))
     needs))
 
@@ -157,7 +177,7 @@
             (:project/id p) (update :project/id name)
             (:project/dir p) (update :project/dir #(expand-home home %))
             (contains? p :project/activity) (update :project/activity activity-set)
-            (map? (:project/provides p)) (update :project/provides capability-keys)
+            (map? (:project/provides p)) (update :project/provides normalize-provides)
             (map? (:project/needs p)) (update :project/needs normalize-needs))]
     (cond-> p
       (:project/programs p) (update :project/programs #(normalize-programs home (:project/dir p) %)))))
@@ -173,7 +193,10 @@
             (fn [s]
               (cond-> s
                 (contains? s :stack/id) (update :stack/id id-name)
-                (map? (:stack/needs s)) (update :stack/needs normalize-needs)))
+                (map? (:stack/needs s)) (update :stack/needs normalize-needs)
+                (map? (:stack/resources s)) (update :stack/resources
+                                                    #(into {} (map (fn [[k v]] [k (normalize-resources v)]))
+                                                           (capability-keys %)))))
             stacks))
 
 (defn normalize-suites
@@ -216,7 +239,11 @@
                   :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})
         s (cond-> s
             (contains? cfg :compose/stacks) (assoc :compose/stacks (normalize-stacks (:compose/stacks cfg)))
-            (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg))))]
+            (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg)))
+            (contains? cfg :compose/default-resources)
+            (assoc :compose/default-resources (normalize-resources (:compose/default-resources cfg)))
+            (contains? cfg :compose/budget) (assoc :compose/budget (:compose/budget cfg))
+            (contains? cfg :compose/host-reserve) (assoc :compose/host-reserve (:compose/host-reserve cfg)))]
     (if-let [problems (schema/explain schema/Settings s)]
       (r/err :compose/invalid-config {:problems problems})
       (r/ok s))))
