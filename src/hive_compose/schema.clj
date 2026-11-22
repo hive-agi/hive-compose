@@ -1,5 +1,5 @@
 (ns hive-compose.schema
-  "Value objects: Profile, Active entry, Settings, Release step."
+  "Value objects: Profile, Active entry, Settings, Release step, CaseOutcome."
   (:require [malli.core :as m]
             [malli.error :as me]))
 
@@ -139,6 +139,47 @@
    [:project/idle-action {:optional true} IdleAction]
    [:project/activity {:optional true} Activity]])
 
+(def CaseStatus
+  "How one test case ended in one run, as JUnit XML and TAP report it."
+  [:enum :passed :failed :error :skipped])
+
+(def RunIdLocal
+  "A run id. The same rule as hc-2's RunId (kept local so flake history does
+   not depend on that branch; reconcile by pointing this at schema/RunId)."
+  [:re #"^[a-z0-9][a-z0-9-]{2,39}$"])
+
+(def CaseOutcome
+  "One row of flake history: how case `:case/id` of suite `:suite/id` ended in
+   run `:run/id` against `:project`, recorded at `:at` (epoch ms). `:run/sha`,
+   when the runner knows the commit under test, lets a regression name the
+   first failing commit.
+
+   A minimal local shape of what hc-8's run result carries (its Report cases,
+   ids `<suite>/<classname>.<name>`), so this layer can be reconciled with it
+   later without depending on it."
+  [:map
+   [:run/id RunIdLocal]
+   [:suite/id [:string {:min 1}]]
+   [:project {:optional true} [:string {:min 1}]]
+   [:case/id [:string {:min 1}]]
+   [:case/status CaseStatus]
+   [:case/time-s {:optional true} [:maybe number?]]
+   [:at :int]
+   [:run/sha {:optional true} [:string {:min 1}]]])
+
+(def FlakyConfig
+  "Thresholds of `hive-compose.promote.flaky`, every key optional (defaults in
+   `flaky/defaults`). `:window` is how many of a case's latest runs are
+   judged, `:min-runs` how many it needs before it is called anything but
+   :stable, `:flip-rate` the share of status changes between consecutive runs
+   of the window at or above which it is :flaky, and `:streak` how many
+   consecutive fails (passes) closing the window make a :regression (a :fixed)."
+  [:map
+   [:window {:optional true} [:int {:min 2}]]
+   [:min-runs {:optional true} [:int {:min 1}]]
+   [:flip-rate {:optional true} [:and number? [:>= 0] [:<= 1]]]
+   [:streak {:optional true} [:int {:min 1}]]])
+
 (def Settings
   [:map
    [:compose/projects [:map-of :string Project]]
@@ -158,7 +199,9 @@
    [:compose/cpu-busy-percent {:optional true} [:and number? [:>= 0]]]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
-   [:compose/program-grace-ms {:optional true} [:int {:min 0}]]])
+   [:compose/program-grace-ms {:optional true} [:int {:min 0}]]
+   [:compose/history-file {:optional true} [:string {:min 1}]]
+   [:compose/flaky {:optional true} FlakyConfig]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."

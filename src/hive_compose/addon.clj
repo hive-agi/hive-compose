@@ -11,7 +11,8 @@
 
    Config: see `hive-compose.promote.config`. `:compose/engine` injects an
    IComposeEngine in place of the docker CLI, `:compose/runner` an
-   IProgramRunner in place of the host one, `:compose/resolver` the
+   IProgramRunner in place of the host one, `:compose/history` an
+   IFlakeHistory in place of the history file, `:compose/resolver` the
    {scheme ISecretBackend} env references are read through in place of `pass`."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
@@ -19,6 +20,8 @@
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
+            [hive-compose.boundary.history :as history]
+            [hive-compose.pipeline.flaky :as flaky]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.promote.config :as config]
             [hive-compose.promote.env :as env]
@@ -114,6 +117,8 @@
      :processes (if (contains? cfg :compose/process-table)
                   (:compose/process-table cfg)
                   (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
+     :history (or (:compose/history cfg)
+                  (history/file-history (:compose/history-file settings)))
      :settings settings
      :state state
      :now (or (:compose/now cfg) now-ms)
@@ -183,6 +188,7 @@
    "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
+   "flaky" "test cases ranked by intermittent failure across recorded suite runs, each :flaky, :regression (failing since a named run and sha), :fixed or :stable. suite; project; limit (default 20)"
    "reload" "re-read the config"))
 
 (def commands
@@ -279,6 +285,10 @@
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
+        "flaky" (flaky/flaky ctx
+                             {:suite (some-> (param params "suite") str)
+                              :project (some-> (param params "project") str)}
+                             (or (some-> (param params "limit") long) 20))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
                                          :hint "command=help lists what each does"})))))
@@ -315,7 +325,9 @@
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
-                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes"}
+                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
+                              "suite" {:type "string" :description "[flaky] only cases of this suite"}
+                              "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
                               "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
                               "note" {:type "string" :description "[claim] what the agent works on"}
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
@@ -441,7 +453,12 @@
                           (if-let [ctx (:ctx @state)]
                             (swarm/nrepl ctx {:path path})
                             (r/err :compose/not-initialized)))
-     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))}))
+     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))
+     ;; hc-8's suite runner records each run result here (see pipeline.flaky).
+     :compose/record-run! (fn [run]
+                            (if-let [ctx (:ctx @state)]
+                              (flaky/record-run! ctx run)
+                              (r/err :compose/not-initialized)))}))
 
 (defn make-addon
   "Uninitialized IAddon. No thread, file or container is touched."
