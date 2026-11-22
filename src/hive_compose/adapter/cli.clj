@@ -241,6 +241,24 @@
   "Full ids of every running container the daemon knows, any project."
   ["docker" "ps" "-q" "--no-trunc"])
 
+(defn service-facts
+  "{service {:image :java-tool-options}} of `services` in a `config --format
+   json` document: the image each runs and the JAVA_TOOL_OPTIONS its file
+   sets (environment as a map or a list of VAR=value). Pure."
+  [s services]
+  (let [svcs (get (json/read-str s) "services")
+        jto (fn [envm] (cond
+                         (map? envm) (get envm "JAVA_TOOL_OPTIONS")
+                         (sequential? envm) (some #(when (str/starts-with? (str %) "JAVA_TOOL_OPTIONS=")
+                                                     (subs % (count "JAVA_TOOL_OPTIONS=")))
+                                                  envm)))]
+    (into (sorted-map)
+          (for [sv services
+                :let [m (get svcs sv)]
+                :when m]
+            [sv (cond-> {:image (str (get m "image" ""))}
+                  (string? (jto (get m "environment"))) (assoc :java-tool-options (jto (get m "environment"))))]))))
+
 (defn service-resources
   "{:volumes #{name} :ports #{port}} of `services` in a `config --format json`
    document: the real names of the named volumes they mount (the top-level
@@ -331,7 +349,8 @@
 (defn override?
   "True when ProjectSpec `spec` needs a generated override file."
   [spec]
-  (boolean (or (seq (:labels spec)) (seq (:networks spec)) (seq (:container-env spec)))))
+  (boolean (or (seq (:labels spec)) (seq (:networks spec)) (seq (:container-env spec))
+               (some seq (vals (:service-overrides spec))))))
 
 (defn override-doc
   "The compose override of ProjectSpec `spec` as data: each of its
@@ -339,13 +358,22 @@
    default network is then left out, so names resolve on those networks
    alone; networks a service declares in its own files stay) and receives the
    variables `:container-env` names, as null so compose reads their values
-   from its own environment. Pure."
-  [{:keys [services labels networks container-env]}]
+   from its own environment. `:service-overrides` ({service {key value}},
+   hc-16a resource caps: mem_limit, cpus, environment {VAR value}) is
+   merged into the entry of each service it names, environment per
+   variable; a service it names that `:services` does not is added. Pure."
+  [{:keys [services labels networks container-env service-overrides]}]
   (let [svc (cond-> {}
               (seq labels) (assoc "labels" (into (sorted-map) labels))
               (seq networks) (assoc "networks" (into (sorted-map) (map (fn [n] [n {}])) networks))
-              (seq container-env) (assoc "environment" (into (sorted-map) (map (fn [v] [v nil])) container-env)))]
-    (cond-> {"services" (into (sorted-map) (map (fn [s] [s svc])) services)}
+              (seq container-env) (assoc "environment" (into (sorted-map) (map (fn [v] [v nil])) container-env)))
+        entry (fn [s]
+                (let [o (get service-overrides s)
+                      e (get o "environment")]
+                  (cond-> (merge (if (some #{s} services) svc {}) (dissoc o "environment"))
+                    (seq e) (update "environment" #(into (sorted-map) (merge % e))))))
+        named (distinct (concat services (sort (keys (into {} (filter (comp seq val)) service-overrides)))))]
+    (cond-> {"services" (into (sorted-map) (map (fn [s] [s (entry s)])) named)}
       (seq networks) (assoc "networks" (into (sorted-map)
                                              (map (fn [n] [n {"external" true "name" n}]))
                                              networks)))))
@@ -537,6 +565,13 @@
   (-published [_ p]
     (parsed (run exec p (ps-argv p) timeout-ms) :compose/unparseable
             (comp published-ports parse-json-rows)))
+
+  port/IServiceImages
+  (-service-facts [_ p services]
+    (if (empty? services)
+      (r/ok {})
+      (parsed (run exec p (closure-argv (assoc p :profile/services (vec services))) timeout-ms)
+              :compose/unparseable #(service-facts % services))))
 
   port/IContainerOwnership
   (-live-containers [_]

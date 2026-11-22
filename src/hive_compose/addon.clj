@@ -31,6 +31,7 @@
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
             [hive-compose.adapter.procnet :as procnet]
+            [hive-compose.adapter.meminfo :as meminfo]
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
@@ -115,6 +116,9 @@
      :processes (if (contains? cfg :compose/process-table)
                   (:compose/process-table cfg)
                   (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
+     :host-memory (if (contains? cfg :compose/host-memory)
+                    (:compose/host-memory cfg)
+                    (meminfo/make-host-memory))
      :settings settings
      :state state
      :now (or (:compose/now cfg) now-ms)

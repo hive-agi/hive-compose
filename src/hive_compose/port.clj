@@ -157,6 +157,14 @@
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
 
+(defprotocol IServiceImages
+  "Optional engine capability: what services of a project run, so a stack
+   can tell a JVM image and keep its own JVM flags (hc-16a). An engine
+   without it is treated as knowing nothing: only `:jvm? true` injects."
+  (-service-facts [e profile services]
+    "Result<{service {:image string :java-tool-options string?}}>: the image
+     each of `services` runs and the JAVA_TOOL_OPTIONS its compose file sets."))
+
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
    networks (one per consumer and run), compose projects brought up with

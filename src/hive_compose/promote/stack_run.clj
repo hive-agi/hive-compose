@@ -22,6 +22,7 @@
    Every created network and every container a stack run creates under a
    run-scoped compose project carries hive.run. No IO."
   (:require [clojure.string :as str]
+            [hive-compose.promote.resources :as res]
             [hive-compose.promote.stack :as stack]
             [hive-compose.schema :as schema]))
 
@@ -80,6 +81,31 @@
                     :wait? (boolean wait?)})
       (not (:instance/share? ip)) (assoc :services closure
                                          :labels (:instance/labels ip)))))
+
+(defn instance-overrides
+  "{service {mem_limit cpus environment}} (string keys) that caps instance `ip`
+   (hc-16a): its answering services get `caps` (InstanceCaps) and, when they
+   run a JVM (`:jvm?`, else detected from the image in `facts` {service
+   {:image :java-tool-options}}), JAVA_TOOL_OPTIONS with the heap flag merged
+   under the service's own options (the compose file's, else the provider
+   project's env). Services that need nothing are left out."
+  [settings ip caps facts]
+  (let [proj-opts (let [v (get-in settings [:compose/projects (:instance/provider ip) :project/env
+                                            res/java-tool-options])]
+                    (when (string? v) v))]
+    (into (sorted-map)
+          (for [s (:instance/services ip)
+                :let [{:keys [image java-tool-options]} (get facts s)
+                      o (res/service-override caps (res/jvm? caps image)
+                                              (or java-tool-options proj-opts))]
+                :when (seq o)]
+            [s o]))))
+
+(defn with-overrides
+  "ProjectSpec `spec` carrying `overrides` (from `instance-overrides`) as
+   `:service-overrides`, unchanged when there are none."
+  [spec overrides]
+  (cond-> spec (seq overrides) (assoc :service-overrides overrides)))
 
 (defn consumer-labels
   "hive.run, hive.stack and hive.consumer of `consumer` in `run` of `stack-id`."

@@ -26,6 +26,7 @@
   (:require [clojure.string :as str]
             [hive-compose.port :as port]
             [hive-compose.promote.capability :as capability]
+            [hive-compose.promote.resources :as resources]
             [hive-compose.promote.stack :as stack]
             [hive-compose.promote.stack-run :as run]
             [hive-compose.promote.target :as target]
@@ -140,15 +141,71 @@
      #(into (sorted-map) (remove (comp empty? second)) %))))
 
 (defn resolve-plan
-  "Result<{:resolution :plan :wirings}> of stack `stack-id` for run `run-id`:
-   resolution (hc-3), StackPlan (hc-4) and Wirings (hc-5). Pure, no engine."
+  "Result<{:resolution :plan :wirings :budget}> of stack `stack-id` for run
+   `run-id`: resolution (hc-3), StackPlan (hc-4), Wirings (hc-5) and the
+   capped-memory Budget (hc-16a). Pure, no engine."
   [ctx stack-id run-id]
-  (let [settings (:settings ctx)]
+  (let [settings (:settings ctx)
+        projects (:compose/projects settings)]
     (r/let-ok [s (stack-config ctx stack-id)
-               res (capability/resolve-stack (:compose/projects settings) s)
+               needs (capability/consumer-needs projects (:stack/consumers s)
+                                                (cond-> {}
+                                                  (seq (:stack/needs s))
+                                                  (assoc (capability/stack-consumer s) (:stack/needs s))))
+               res (capability/resolve-needs projects needs)
                sp (stack/stack-plan settings res run-id {:stack stack-id})
                ws (wiring/wirings settings res run-id)]
-      (r/ok {:resolution res :plan sp :wirings ws}))))
+      (r/ok {:resolution res :plan sp :wirings ws
+             :budget (resources/budget settings s needs res)}))))
+
+;; ---------------------------------------------------------------------------
+;; resource caps (hc-16a)
+
+(defn- mem-available
+  "MemAvailable in bytes from the context's IHostMemory, nil when there is
+   none or it cannot be read (admission then checks the budgets alone)."
+  [ctx]
+  (when-let [m (:host-memory ctx)]
+    (when (satisfies? port/IHostMemory m)
+      (let [x (port/-mem-available m)] (when (r/ok? x) (:ok x))))))
+
+(defn- running-instances
+  "Ids of the shared instances of `sp` already up: held by another live run,
+   or running before this run (`pre`). They take no new host memory."
+  [ctx sp pre]
+  (let [held (set (for [[_ other] (live-plans ctx)
+                        [iid ip] (:stack/instances other)
+                        :when (:instance/share? ip)]
+                    iid))]
+    (into (set (keys pre)) (filter held) (keys (:stack/instances sp)))))
+
+(defn admit
+  "Result<Budget>: `budget` admitted against :stack/budget, :compose/budget
+   and the host's MemAvailable minus :compose/host-reserve, the instances in
+   `running` (ids) counting as already paid; else :compose/over-budget."
+  [ctx stack-id budget running]
+  (resources/admit budget
+                   (resources/limits (:settings ctx)
+                                     (get-in ctx [:settings :compose/stacks stack-id])
+                                     (mem-available ctx))
+                   running))
+
+(defn- instance-caps-overrides
+  "{service override} capping planned instance `ip`: a PRIVATE instance gets
+   its caps and JVM flag in its stack override; a shared one runs from its
+   provider's own files with no override (hc-6), so its caps are summed and
+   admitted but not written (writing them would recreate it under the
+   consumers already using it)."
+  [ctx engine budget ip]
+  (if (:instance/share? ip)
+    {}
+    (let [caps (get-in budget [:budget/instances (:instance/id ip)] {})
+          proj (project-of ctx (:instance/provider ip))
+          facts (if (satisfies? port/IServiceImages engine)
+                  (let [f (port/-service-facts engine (target/project-profile proj) (:instance/services ip))]
+                    (if (r/ok? f) (:ok f) {}))
+                  {})]
+      (run/instance-overrides (:settings ctx) ip caps facts))))
 
 (defn- consumer-services
   "Result<[service]>: what consumer `c` runs: the services of its section
@@ -174,9 +231,10 @@
 (defn- up-instance!
   "Result<row>: instance `ip` up (waited and gated when `wait?`) and joined
    to each of its consumers' view networks under its aliases."
-  [ctx engine ip wait?]
+  [ctx engine ip wait? budget]
   (let [spec (cond-> (run/instance-spec (:settings ctx) ip wait?)
-               (and wait? (wait-timeout-s ctx)) (assoc :wait-timeout-s (wait-timeout-s ctx)))
+               (and wait? (wait-timeout-s ctx)) (assoc :wait-timeout-s (wait-timeout-s ctx))
+               true (run/with-overrides (instance-caps-overrides ctx engine budget ip)))
         iid (:instance/id ip)]
     (r/let-ok [_ (let [u (port/-up-project! engine spec)]
                    (if (r/err? u)
@@ -241,9 +299,11 @@
   [ctx {stack-id :stack run-id :run wait? :wait? :or {wait? true}}]
   (r/let-ok [engine (stack-engine ctx)
              rid (pick-run-id ctx stack-id run-id)
-             {sp0 :plan ws :wirings} (resolve-plan ctx stack-id rid)
+             {sp0 :plan ws :wirings budget :budget} (resolve-plan ctx stack-id rid)
              sp (with-needs engine (:settings ctx) sp0)
-             pre (preexisting engine (:settings ctx) sp (live-plans ctx))]
+             pre (preexisting engine (:settings ctx) sp (live-plans ctx))
+             ;; hc-16a: refused before anything is recorded or started
+             _ (admit ctx stack-id budget (running-instances ctx sp pre))]
     (let [t (now ctx)
           consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))]
       (record! ctx rid (constantly {:stack/id stack-id :run rid :started-at t :last-touch t
@@ -252,7 +312,7 @@
       (let [res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
                                         (:stack/networks sp))
                            instances (all-ok (fn [{:step/keys [id]}]
-                                               (up-instance! ctx engine (get-in sp [:stack/instances id]) wait?))
+                                               (up-instance! ctx engine (get-in sp [:stack/instances id]) wait? budget))
                                              (filter #(= :instance (:step/kind %)) (:stack/start-order sp)))
                            cs (all-ok (fn [c]
                                         ;; recorded BEFORE its up: a failed up leaves
@@ -364,17 +424,27 @@
       (r/ok {:stacks (vec rows)}))))
 
 (defn plan
-  "Result<{:diff :text}>: hc-4 plan-diff of stack `stack-id` against what
-   runs now (by compose project label), and its rendering."
+  "Result<{:diff :text :budget :admission}>: hc-4 plan-diff of stack
+   `stack-id` against what runs now (by compose project label), the capped
+   memory of every instance with the total and what sharing saves (hc-16a),
+   and the rendering of both. `:admission` is :ok, or the
+   :compose/over-budget error stack-up would answer (then the text says so)."
   [ctx {stack-id :stack run-id :run}]
   (r/let-ok [engine (stack-engine ctx)
-             {sp :plan} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")))
+             {sp :plan budget :budget} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")))
              running (all-ok (fn [cp] (r/map-ok (project-health engine cp)
                                                 (fn [h] (for [[s {:keys [state]}] h :when (= "running" state)]
                                                           {:project cp :service s}))))
                              (distinct (map :instance/compose-project (vals (:stack/instances sp)))))]
-    (let [d (stack/plan-diff sp (apply concat running))]
-      (r/ok {:diff d :text (stack/render-diff d)}))))
+    (let [d (stack/plan-diff sp (apply concat running))
+          up (set (for [row (:instances d) :when (= :running (:state row))] (:instance row)))
+          verdict (admit ctx stack-id budget up)
+          admission (if (r/ok? verdict) :ok (dissoc verdict :ok))]
+      (r/ok {:diff d
+             :budget budget
+             :admission admission
+             :text (str (stack/render-diff d) "\n\n" (resources/summary budget)
+                        (when (not= :ok admission) (str "\nREFUSED: " (:message admission))))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; claims and the reaper
@@ -417,15 +487,35 @@
    :orphan-ttl-ms (* 60000 (or (:compose/orphan-ttl-minutes settings) (:compose/default-ttl-minutes settings) 60))
    :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) 30))})
 
+(defn- down-row [ctx rid extra]
+  (let [x (try (stack-down! ctx {:run rid})
+               (catch Throwable t (r/err :compose/release-threw {:message (str t)})))]
+    (merge (if (r/ok? x) {:run rid :ok? true} {:run rid :ok? false :error x}) extra)))
+
+(defn pressure-step!
+  "The reaper's memory pressure guard (hc-16a): when the host's MemAvailable
+   is below :compose/host-reserve, stop ONE run, the idle unclaimed run of
+   the lowest :stack/priority (resources/pressure-victim). Answers its row
+   (with :reason :memory-pressure, :available, :reserve), or nil."
+  [ctx]
+  (let [settings (:settings ctx)
+        available (mem-available ctx)]
+    (when (resources/under-pressure? settings available)
+      (when-let [rid (resources/pressure-victim settings (stacks ctx) (now ctx)
+                                                (:claim-ttl-ms (ttls settings)))]
+        (down-row ctx rid {:reason :memory-pressure
+                           :available available
+                           :reserve (resources/parse-mem (:compose/host-reserve settings))})))))
+
 (defn reap!
-  "{:reaped [report]}: take down every idle, unclaimed run. A run that cannot
-   be taken down answers its error row and stays."
+  "{:reaped [report]}: take down every idle, unclaimed run, then, while the
+   host is under memory pressure, the lowest-priority unclaimed run (one per
+   pass, so the next pass sees what it freed). A run that cannot be taken
+   down answers its error row and stays."
   [ctx]
   (if-not (satisfies? port/IStackEngine (:engine ctx))
     {:reaped []}
-    (let [rids (run/idle-runs (stacks ctx) (now ctx) (ttls (:settings ctx)))]
-      {:reaped (mapv (fn [rid]
-                       (let [x (try (stack-down! ctx {:run rid})
-                                    (catch Throwable t (r/err :compose/release-threw {:message (str t)})))]
-                         (if (r/ok? x) {:run rid :ok? true} {:run rid :ok? false :error x})))
-                     rids)})))
+    (let [rids (run/idle-runs (stacks ctx) (now ctx) (ttls (:settings ctx)))
+          idle (mapv #(down-row ctx % nil) rids)
+          pressure (pressure-step! ctx)]
+      {:reaped (cond-> idle pressure (conj pressure))})))
