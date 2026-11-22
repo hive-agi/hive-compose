@@ -36,7 +36,13 @@
                                    (default 10)
      :compose/program-grace-ms     how long a host program is watched after its
                                    start; one that exits within it is reported
-                                   :exited with its code and log tail (default 3000)"
+                                   :exited with its code and log tail (default 3000)
+     :compose/stacks               [Stack ..] or {id Stack}: consumers brought up with
+                                   every capability they need (optional)
+     :compose/suites               [Suite ..] or {id Suite}: test runners in any
+                                   language (optional)
+   A project places itself in the capability graph with :project/provides
+   {capability Provide} and :project/needs {capability Need} (see schema)."
   (:require [clojure.string :as str]
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]))
@@ -104,6 +110,34 @@
   [v]
   (if (coll? v) (into #{} (map keyword) v) v))
 
+(defn capability-keys
+  "`m` ({capability v}) with its capability names as strings, as JSON and EDN
+   keyword keys give them; a key that is no name stays as is, for the schema
+   to refuse."
+  [m]
+  (into {} (map (fn [[k v]] [(if (ident? k) (name k) k) v])) m))
+
+(defn normalize-needs
+  "Needs ({capability Need}) with string capability names and each `:via` a
+   keyword, as JSON gives it a string."
+  [needs]
+  (if (map? needs)
+    (into {}
+          (map (fn [[k n]]
+                 [k (cond-> n
+                      (and (map? n) (string? (:via n))) (update :via keyword))]))
+          (capability-keys needs))
+    needs))
+
+(defn- keyed-by
+  "`xs` ([X] or {id X}) normalized with `f` and keyed by `id-key`, or `xs`
+   untouched when it is no collection of maps, for the schema to refuse."
+  [id-key f xs]
+  (let [xs (if (and (map? xs) (every? map? (vals xs))) (as-seq id-key xs) xs)]
+    (if (and (sequential? xs) (every? map? xs))
+      (into {} (map (fn [x] (let [x (f x)] [(get x id-key) x]))) xs)
+      xs)))
+
 (defn normalize-profile
   "Profile with a string id, its dir expanded against `home` and its programs
    resolved against that dir."
@@ -116,15 +150,46 @@
       (:profile/programs p) (update :profile/programs #(normalize-programs home (:profile/dir p) %)))))
 
 (defn normalize-project
-  "Project with a string id, its dir expanded against `home` and its programs
-   resolved against that dir."
+  "Project with a string id, its dir expanded against `home`, its programs
+   resolved against that dir and its capability names as strings."
   [home p]
   (let [p (cond-> p
             (:project/id p) (update :project/id name)
             (:project/dir p) (update :project/dir #(expand-home home %))
-            (contains? p :project/activity) (update :project/activity activity-set))]
+            (contains? p :project/activity) (update :project/activity activity-set)
+            (map? (:project/provides p)) (update :project/provides capability-keys)
+            (map? (:project/needs p)) (update :project/needs normalize-needs))]
     (cond-> p
       (:project/programs p) (update :project/programs #(normalize-programs home (:project/dir p) %)))))
+
+(defn- id-name [v] (if (ident? v) (name v) v))
+
+(defn normalize-stacks
+  "Stacks ([Stack] or {id Stack}) as {id Stack} with string ids and string
+   capability names in their needs. A malformed value (no collection of maps,
+   a stack without id) is left for the schema to refuse, never thrown on."
+  [stacks]
+  (keyed-by :stack/id
+            (fn [s]
+              (cond-> s
+                (contains? s :stack/id) (update :stack/id id-name)
+                (map? (:stack/needs s)) (update :stack/needs normalize-needs)))
+            stacks))
+
+(defn normalize-suites
+  "Suites ([Suite] or {id Suite}) as {id Suite} with string ids, `:suite/dir`
+   expanded against `home`, string capability names in their needs and a
+   keyword report format. A malformed value is left for the schema to refuse."
+  [home suites]
+  (keyed-by :suite/id
+            (fn [s]
+              (cond-> s
+                (contains? s :suite/id) (update :suite/id id-name)
+                (string? (:suite/dir s)) (update :suite/dir #(expand-home home %))
+                (map? (:suite/needs s)) (update :suite/needs normalize-needs)
+                (string? (:suite/report-format s)) (update :suite/report-format keyword)))
+            suites))
+
 
 (defn profiles-file
   "Path of the profiles file `cfg` names, expanded against `home`."
@@ -134,7 +199,8 @@
 (defn settings
   "Result<Settings> from merged addon config `cfg`, the profiles read from the
    profiles file (`file-profiles`, nil when absent) and `home`. Inline profiles
-   override file profiles with the same id."
+   override file profiles with the same id. Stacks and suites appear only when
+   configured, so a config without them yields the Settings it always did."
   [cfg file-profiles home]
   (let [profiles (map #(normalize-profile home %)
                       (concat (as-seq :profile/id file-profiles)
@@ -147,7 +213,10 @@
                  {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
                   :compose/log-dir (expand-home home (or (:compose/log-dir cfg) default-log-dir))
                   :compose/projects (into {} (map (juxt :project/id identity)) projects)
-                  :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})]
+                  :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})
+        s (cond-> s
+            (contains? cfg :compose/stacks) (assoc :compose/stacks (normalize-stacks (:compose/stacks cfg)))
+            (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg))))]
     (if-let [problems (schema/explain schema/Settings s)]
       (r/err :compose/invalid-config {:problems problems})
       (r/ok s))))
