@@ -1,0 +1,15 @@
+# hive-compose fault injection (hc-12): one toxiproxy per stack run.
+# Brought up by the stack ops from hive-compose.promote.faults/project-spec,
+# which adds the run's labels and the faults network through an override.
+# The REST API is published on loopback only, on an ephemeral host port.
+services:
+  toxiproxy:
+    image: ${TOXIPROXY_IMAGE:-ghcr.io/shopify/toxiproxy:2.12.0}
+    command: ["-host=0.0.0.0"]
+    ports:
+      - "127.0.0.1::8474"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
