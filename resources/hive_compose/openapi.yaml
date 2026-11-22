@@ -2176,6 +2176,25 @@ components:
                 type: integer
                 minimum: 1
                 maximum: 65535
+              resources:
+                anyOf:
+                - const: unbounded
+                - type: object
+                  properties:
+                    mem:
+                      anyOf:
+                      - type: integer
+                        minimum: 1
+                      - type: string
+                        pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                    cpus:
+                      allOf:
+                      - type: number
+                      - type: number
+                        exclusiveMinimum: 0
+                    jvm?:
+                      type: boolean
+                  additionalProperties: false
               description:
                 type: string
             required:
@@ -2201,6 +2220,25 @@ components:
                   minLength: 1
               via:
                 type: string
+              resources:
+                anyOf:
+                - const: unbounded
+                - type: object
+                  properties:
+                    mem:
+                      anyOf:
+                      - type: integer
+                        minimum: 1
+                      - type: string
+                        pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                    cpus:
+                      allOf:
+                      - type: number
+                      - type: number
+                        exclusiveMinimum: 0
+                    jvm?:
+                      type: boolean
+                  additionalProperties: false
       required:
       - id
       - dir
@@ -2412,6 +2450,25 @@ components:
                       type: integer
                       minimum: 1
                       maximum: 65535
+                    resources:
+                      anyOf:
+                      - const: unbounded
+                      - type: object
+                        properties:
+                          mem:
+                            anyOf:
+                            - type: integer
+                              minimum: 1
+                            - type: string
+                              pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                          cpus:
+                            allOf:
+                            - type: number
+                            - type: number
+                              exclusiveMinimum: 0
+                          jvm?:
+                            type: boolean
+                        additionalProperties: false
                     description:
                       type: string
                   required:
@@ -2437,6 +2494,25 @@ components:
                         minLength: 1
                     via:
                       type: string
+                    resources:
+                      anyOf:
+                      - const: unbounded
+                      - type: object
+                        properties:
+                          mem:
+                            anyOf:
+                            - type: integer
+                              minimum: 1
+                            - type: string
+                              pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                          cpus:
+                            allOf:
+                            - type: number
+                            - type: number
+                              exclusiveMinimum: 0
+                          jvm?:
+                            type: boolean
+                        additionalProperties: false
             required:
             - id
             - dir
@@ -2654,6 +2730,54 @@ components:
                         minLength: 1
                     via:
                       type: string
+                    resources:
+                      anyOf:
+                      - const: unbounded
+                      - type: object
+                        properties:
+                          mem:
+                            anyOf:
+                            - type: integer
+                              minimum: 1
+                            - type: string
+                              pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                          cpus:
+                            allOf:
+                            - type: number
+                            - type: number
+                              exclusiveMinimum: 0
+                          jvm?:
+                            type: boolean
+                        additionalProperties: false
+              resources:
+                type: object
+                additionalProperties:
+                  anyOf:
+                  - const: unbounded
+                  - type: object
+                    properties:
+                      mem:
+                        anyOf:
+                        - type: integer
+                          minimum: 1
+                        - type: string
+                          pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                      cpus:
+                        allOf:
+                        - type: number
+                        - type: number
+                          exclusiveMinimum: 0
+                      jvm?:
+                        type: boolean
+                    additionalProperties: false
+              budget:
+                anyOf:
+                - type: integer
+                  minimum: 1
+                - type: string
+                  pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+              priority:
+                type: integer
               description:
                 type: string
             required:
@@ -2704,6 +2828,25 @@ components:
                           minLength: 1
                       via:
                         type: string
+                      resources:
+                        anyOf:
+                        - const: unbounded
+                        - type: object
+                          properties:
+                            mem:
+                              anyOf:
+                              - type: integer
+                                minimum: 1
+                              - type: string
+                                pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                            cpus:
+                              allOf:
+                              - type: number
+                              - type: number
+                                exclusiveMinimum: 0
+                            jvm?:
+                              type: boolean
+                          additionalProperties: false
                 projects:
                   type: array
                   items:
@@ -2735,11 +2878,61 @@ components:
                 timeout-ms:
                   type: integer
                   minimum: 1000
+                resources:
+                  anyOf:
+                  - const: unbounded
+                  - type: object
+                    properties:
+                      mem:
+                        anyOf:
+                        - type: integer
+                          minimum: 1
+                        - type: string
+                          pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                      cpus:
+                        allOf:
+                        - type: number
+                        - type: number
+                          exclusiveMinimum: 0
+                      jvm?:
+                        type: boolean
+                    additionalProperties: false
                 description:
                   type: string
               required:
               - id
             - {}
+        default-resources:
+          anyOf:
+          - const: unbounded
+          - type: object
+            properties:
+              mem:
+                anyOf:
+                - type: integer
+                  minimum: 1
+                - type: string
+                  pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+              cpus:
+                allOf:
+                - type: number
+                - type: number
+                  exclusiveMinimum: 0
+              jvm?:
+                type: boolean
+            additionalProperties: false
+        budget:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: string
+            pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+        host-reserve:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: string
+            pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
       required:
       - projects
       - profiles
@@ -3391,6 +3584,7 @@ components:
       - compose/invalid-stack
       - compose/invalid-version
       - compose/invalid-wiring
+      - compose/meminfo-unreadable
       - compose/method-not-allowed
       - compose/missing-param
       - compose/name-collision
@@ -3411,12 +3605,14 @@ components:
       - compose/orphans-hold-resources
       - compose/otlp-attributes-ref
       - compose/otlp-pair-broken
+      - compose/over-budget
       - compose/ownership-check-failed
       - compose/payload-too-large
       - compose/proc-unreadable
       - compose/program-needs-command
       - compose/release-threw
       - compose/run-exists
+      - compose/runner-failed
       - compose/secret-unresolved
       - compose/stack-down-incomplete
       - compose/stacks-unsupported

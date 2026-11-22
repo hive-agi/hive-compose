@@ -94,6 +94,7 @@
    :compose/orphans-hold-resources 409
    :compose/held-by-another-section 409
    :compose/run-exists 409
+   :compose/over-budget 409
    :compose/toxiproxy-proxy-conflict 409
    :compose/not-implemented 501
    :compose/command-failed 502
