@@ -39,7 +39,8 @@
             [hive-compose.pipeline.ownership :as ownership]
             [hive-addon.host :as addon-host]
             [hive-compose.api :as api]
-            [hive-compose.adapter.http :as http])
+            [hive-compose.adapter.http :as http]
+            [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
