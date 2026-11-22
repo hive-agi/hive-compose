@@ -9,6 +9,7 @@
             [clojure.test.check.properties :as prop]
             [hive-compose.adapter.runner :as runner]
             [hive-compose.port :as port]
+            [hive-compose.promote.env]
             [hive-dsl.result :as r]
             [hive-system.secrets.core :as sec]
             [hive-system.secrets.protocols :as proto]))
@@ -48,6 +49,7 @@
             "--label" "hive.consumer=suite:smoke" "--label" "hive.run=r01"]
            (take 10 argv)))
     (is (= ["-e" "HIVE_RUN_ID" "-e" "TOKEN" "img:1" "sh" "-c" "pytest -q"] (take-last 8 argv)))
+    (is (some #(str/starts-with? % "type=bind,source=") argv) "--mount, so a : in a path is safe")
     (is (not-any? #(str/includes? % "ci/token") argv))))
 
 (defspec env-args-are-names-only 50
@@ -62,9 +64,25 @@
     (is (r/ok? res) (pr-str res))
     (is (= 3 (get-in res [:ok :exit])) "a failing suite is an answer, not an error")
     (is (= ["token pass:ci/token" "FAIL x"] (get-in res [:ok :log-tail])) "the secret is scrubbed")
-    (is (= [["docker" "rm"] ["docker" "create"] ["docker" "start"] ["docker" "rm"]] (mapv #(vec (take 2 %)) argvs)))
-    (is (= secret (get-in (second @calls) [1 :env "TOKEN"])) "the value travels in the docker process env")
-    (is (= 5000 (get-in (nth @calls 2) [1 :timeout-ms])))))
+    (is (= [["docker" "image"] ["docker" "rm"] ["docker" "create"] ["docker" "start"] ["docker" "rm"]]
+           (mapv #(vec (take 2 %)) argvs)) "image present: no pull")
+    (is (= secret (get-in (nth @calls 2) [1 :env "TOKEN"])) "the value travels in the docker process env")
+    (is (= 5000 (get-in (nth @calls 3) [1 :timeout-ms])))))
+
+(deftest a-missing-image-is-pulled-under-its-own-timeout
+  (let [[calls exec] (recording {["image" "inspect"] (r/ok {:exit 1 :stdout "" :stderr "No such image"})})
+        res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver}) (spec))
+        pull (first (filter #(= "pull" (second (first %))) @calls))]
+    (is (r/ok? res) (pr-str res))
+    (is (= ["docker" "pull" "img:1"] (first pull)))
+    (is (= runner/default-pull-timeout-ms (get-in pull [1 :timeout-ms])) "not the 5 s run timeout"))
+  (let [[calls exec] (recording {["image" "inspect"] (r/ok {:exit 1 :stdout "" :stderr ""})
+                                 "pull" (r/err :shell/timeout {:timeout-ms 600000})})
+        res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver}) (spec))]
+    (is (= :shell/timeout (:error res)))
+    (is (fn? (:scrub res)) "errors carry :scrub too")
+    (is (not-any? #(= "create" (second (first %))) @calls))
+    (is (= ["docker" "rm" "-f" "hive-r01-smoke-shop"] (first (last @calls))))))
 
 (deftest an-unreadable-secret-starts-nothing
   (let [[calls exec] (recording {})
@@ -105,8 +123,30 @@
 (deftest extra-networks-are-connected-before-start
   (let [[calls exec] (recording {})
         _ (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver})
-                                (assoc (spec) :networks ["hive-r01-shop"]))]
-    (is (= ["docker" "network" "connect" "hive-r01-shop" "hive-r01-smoke-shop"] (first (nth @calls 2))))))
+                                (assoc (spec) :extra-networks ["hive-r01-suite-smoke2"]))]
+    (is (= ["docker" "network" "connect" "hive-r01-suite-smoke2" "hive-r01-smoke-shop"] (first (nth @calls 3))))
+    (is (= "start" (second (first (nth @calls 4)))) "connected before start")))
+
+(deftest a-failing-connect-still-removes-the-container
+  (let [[calls exec] (recording {["network" "connect"] (r/ok {:exit 1 :stdout "" :stderr "no such network"})})
+        res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver})
+                                  (assoc (spec) :extra-networks ["gone"]))]
+    (is (r/err? res))
+    (is (not-any? #(= "start" (second (first %))) @calls))
+    (is (= ["docker" "rm" "-f" "hive-r01-smoke-shop"] (first (last @calls))))))
+
+(deftest a-host-command-that-throws-is-an-error-with-scrub
+  (let [exec (fn [_ _] (throw (ex-info (str "boom " secret) {})))
+        res (port/-run-command! (runner/make-runner {:exec exec :compose/resolver resolver})
+                                {:runner :command :command "x" :env {"TOKEN" {:pass "ci/token"}} :reports-dir (tmp)})]
+    (is (= :compose/runner-threw (:error res)))
+    (is (not (str/includes? (pr-str (dissoc res :scrub)) secret)))
+    (is (fn? (:scrub res)))))
+
+(deftest scrub-replaces-the-longest-secret-first
+  (is (= "[pass:a/long]" (hive-compose.promote.env/scrub {"A" {:pass "a/short"} "B" {:pass "a/long"}}
+                                                         {"A" "tok" "B" "tok-extended"}
+                                                         "[tok-extended]"))))
 
 (deftest a-host-command-runs-in-its-dir-with-its-env
   (let [[calls exec] (recording {"run" (r/ok {:exit 0 :stdout "ok" :stderr ""})})

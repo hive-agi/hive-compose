@@ -3,12 +3,15 @@
    runner: one union stack, a runner per cell, JUnit read back, results
    recorded, down on success, kept on failure. test.check: the summary and
    the stack's fate follow the cells' outcomes, whatever they are."
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [hive-compose.boundary.runs :as runs]
+            [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.pipeline.suites :as suites]
             [hive-compose.stub :as stub]
             [hive-compose.stub-runner :as sr]
@@ -81,7 +84,8 @@
     (testing "a container joins the view network of the project under test"
       (is (= :container (::sr/kind smoke)))
       (is (= "hive-test000001-shop" (:network smoke)))
-      (is (nil? (:networks smoke)) "a suite with no needs has no network of its own")
+      (is (nil? (:extra-networks smoke)) "a suite with no needs has no network of its own")
+      (is (= suites/default-cell-timeout-ms (:timeout-ms smoke)) "a deadline is always set")
       (is (= {"hive.run" "test000001" "hive.consumer" "suite:smoke"} (:labels smoke)))
       (is (= {:pass "ci/token"} (get-in smoke [:env "TOKEN"])) "secret refs reach the runner unread"))
     (testing "a host command gets the wiring of its own needs and the correlation env"
@@ -163,7 +167,7 @@
         spec (first (sr/suite-runs (:suite-runner c)))]
     (is (= :passed (get-in res [:ok :status])) (pr-str res))
     (is (= "hive-test000001-billing" (:network spec)) "created on the project under test's view network")
-    (is (= ["hive-test000001-suite-api"] (:networks spec)) "and joins the suite consumer's own")
+    (is (= ["hive-test000001-suite-api"] (:extra-networks spec)) "and joins the suite consumer's own")
     (is (= "http://billing:8080" (get-in spec [:env "BILLING_URL"])) "service URLs from :suite/env")
     (is (= "db" (get-in spec [:env "PGHOST"])) "its needs from the suite consumer's wiring")
     (is (contains? (get-in (stub/networks (:engine c)) ["hive-test000001-suite-api" :members]) "pg-db-1")
@@ -183,7 +187,7 @@
     (is (= [:passed true true] [(get-in res [:ok :status]) (get-in res [:ok :reused?]) (get-in res [:ok :stack-kept?])]))
     (is (= before (set (map second (ups c)))) "nothing new came up: the run's pg serves the suite")
     (is (= ["hive-shop001-shop" ["hive-shop001-suite-api"]]
-           ((juxt :network :networks) (first (sr/suite-runs (:suite-runner c))))))
+           ((juxt :network :extra-networks) (first (sr/suite-runs (:suite-runner c))))))
     (is (= :compose/project-not-in-run (:error (suites/test! c {:suites "api" :projects "billing" :run "shop001"}))))
     (is (contains? (:stacks @(:state c)) "shop001") "the reused run stays")
     (is (not (contains? (stub/networks (:engine c)) "hive-shop001-suite-api")) "its suite network is gone")
@@ -229,32 +233,147 @@
       (is (= :report/none (get-in cell [:report-error :error])))
       (is (= :passed (:status cell)) "exit 0 with no report is the verdict"))))
 
-(deftest a-declared-host-reports-dir-is-read-only-for-fresh-files
+(deftest a-declared-host-reports-dir-is-emptied-then-collected
   (let [dir (tmp-dir)
         old (io/file dir "old.xml")]
     (spit old (sr/junit "load" 0 3))
-    (.setLastModified old 1000)
-    (let [c (-> (ctx {"load" {:exit 0}})
-                (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir)
-                (assoc :now #(System/currentTimeMillis)))
-          res (suites/test! c {:suites "load"})]
-      (is (= :passed (get-in res [:ok :status])) (pr-str res))
-      (is (.exists old) "a directory hive-compose does not own is never cleared")
-      (is (= 0 (get-in res [:ok :summary :cases :failed]))))))
+    (testing "a leftover of an earlier run is deleted before the cell, never read"
+      (let [c (-> (ctx {"load" {:exit 0}})
+                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
+            res (suites/test! c {:suites "load"})]
+        (is (= :passed (get-in res [:ok :status])) (pr-str res))
+        (is (not (.exists old)))
+        (is (= 0 (get-in res [:ok :summary :cases :failed])))))
+    (testing "what the runner writes there is moved into the cell's own dir and read"
+      (let [c (-> (ctx {"load" {:exit 1 :passed 1 :failed 1 :collect true}})
+                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
+            res (suites/test! c {:suites "load"})
+            cell (first (get-in res [:ok :cells]))]
+        (is (= 1 (get-in res [:ok :summary :cases :failed])))
+        (is (empty? (filter #(.isFile %) (file-seq (io/file dir)))) "collected, so the next cell starts clean")
+        (is (.isFile (io/file (:reports-dir cell) "junit.xml")))))))
 
-(deftest the-run-is-claimed-while-cells-run-and-touched-after
-  (let [seen (atom nil)
-        c (ctx {"load/shop" {:exit 1 :passed 0 :failed 1}})
-        c (assoc c :record-run! (fn [cx run]
-                                  (reset! seen (get-in @(:state cx) [:stacks (:run/id run) :claims]))
-                                  (r/ok {})))
-        clock (atom 5000)
-        c (assoc c :now #(deref clock))
-        res (do (swap! clock + 0) (suites/test! c {:suites "load"}))
+(deftest an-undeletable-leftover-stops-the-cell-loudly
+  (let [dir (tmp-dir)
+        sub (io/file dir "ro")
+        old (io/file sub "old.xml")]
+    (.mkdirs sub)
+    (spit old (sr/junit "load" 0 3))
+    (.setWritable sub false)
+    (try
+      (let [c (-> (ctx {"load" {:exit 0}})
+                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
+            res (suites/test! c {:suites "load"})
+            cell (first (get-in res [:ok :cells]))]
+        (when (.exists old) ;; root may delete anyway
+          (is (= :error (:status cell)))
+          (is (= :report/unclearable (get-in cell [:runner-error :error])))
+          (is (empty? (sr/suite-runs (:suite-runner c))) "the runner never ran on top of it")))
+      (finally (.setWritable sub true)))))
+
+(deftest the-reaper-never-takes-a-running-matrix
+  (let [clock (atom 0)
+        reaped (atom [])
+        c (-> (ctx {"load/shop" {:exit 1 :passed 0 :failed 1}})
+              (assoc :now #(deref clock))
+              (assoc-in [:settings :compose/claim-ttl-minutes] 1)
+              (assoc-in [:settings :compose/orphan-ttl-minutes] 1)
+              (assoc-in [:settings :compose/default-ttl-minutes] 1))
+        ;; the data phase and the cell each take 20 minutes of clock, far past
+        ;; every TTL, and run the reaper while they do
+        slow (fn [cx] (swap! clock + (* 20 60000)) (swap! reaped into (:reaped (stacks/reap! cx))))
+        c (assoc c :data-phase! (fn [cx _ _] (slow cx) :ok)
+                   :record-run! (fn [cx _] (slow cx) (r/ok {})))
+        res (suites/test! c {:suites "load"})
         run (get-in res [:ok :run])]
-    (is (contains? @seen (str "test:" run)) "the reaper sees a live claim mid-matrix")
-    (is (empty? (get-in @(:state c) [:stacks run :claims])) "released when the matrix ends")
-    (is (= 5000 (get-in @(:state c) [:stacks run :last-touch])))))
+    (is (r/ok? res) (pr-str res))
+    (is (empty? @reaped) "nothing reaped while the matrix ran")
+    (is (= :failed (get-in res [:ok :status])))
+    (is (contains? (:stacks @(:state c)) run) "kept for inspection")
+    (is (empty? (get-in @(:state c) [:stacks run :claims])) "test!'s claim released at the end")
+    (is (= @clock (get-in @(:state c) [:stacks run :last-touch])) "touched when the matrix ended")
+    (testing "after a full idle TTL the kept run goes"
+      (swap! clock + (* 2 60000))
+      (is (= [run] (mapv :run (:reaped (stacks/reap! c))))))))
+
+(deftest a-throw-anywhere-keeps-the-run-named-and-releases-its-claim
+  (testing "a cell that throws is an :error cell; the others still run"
+    (let [c (ctx {"load" {:throws true}})
+          res (suites/test! c {})
+          cells (get-in res [:ok :cells])]
+      (is (r/ok? res) (pr-str res))
+      (is (= :error (:status (first (filter #(= "load" (:suite/id %)) cells)))))
+      (is (= :compose/runner-threw (get-in (first cells) [:runner-error :error])))
+      (is (= 2 (count (filter #(= :passed (:status %)) cells))))
+      (is (empty? (get-in @(:state c) [:stacks (get-in res [:ok :run]) :claims])))))
+  (testing "a save that throws mid-matrix answers an error naming the run"
+    (let [n (atom 0)
+          c (assoc (ctx) :save! (fn [_] (when (> (swap! n inc) 3) (throw (ex-info "disk full" {}))) (r/ok nil)))
+          res (suites/test! c {})]
+      (is (r/err? res))
+      (is (= "test000001" (or (:run res) (get-in res [:ok :run]))))
+      (is (empty? (get-in @(:state c) [:stacks "test000001" :claims]))))))
+
+(deftest only-an-up-run-is-reused
+  (let [c (ctx)]
+    (stub/health! (:engine c) "pg" "db" :unhealthy)
+    (is (r/err? (suites/test! c {:suites "load" :run "part001"})))
+    (is (= :partial (get-in @(:state c) [:stacks "part001" :status])))
+    (let [res (suites/test! c {:suites "load" :run "part001"})]
+      (is (= :compose/run-not-up (:error res)))
+      (is (empty? (sr/suite-runs (:suite-runner c)))))))
+
+(deftest a-run-another-matrix-works-on-is-refused
+  (let [c (ctx)]
+    (is (r/ok? (suites/test! c {:suites "load" :run "busy001" :keep-up? true})))
+    (stacks/claim! c "busy001" "test:busy001" {})
+    (is (= :compose/run-busy (:error (suites/test! c {:suites "load" :run "busy001"}))))))
+
+(deftest a-foreign-claim-keeps-a-passing-stack-up
+  (let [c (assoc (ctx) :record-run! (fn [cx run] (stacks/claim! cx (:run/id run) "ling-7" {}) (r/ok {})))
+        res (suites/test! c {:suites "load"})]
+    (is (= :passed (get-in res [:ok :status])))
+    (is (true? (get-in res [:ok :stack-kept?])))
+    (is (= ["ling-7"] (get-in res [:ok :claimed-by])))))
+
+(deftest the-summary-and-each-result-are-written-to-the-run-dir
+  (let [c (ctx {"smoke/shop" {:exit 1 :passed 1 :failed 1}})
+        res (suites/test! c {})
+        run (get-in res [:ok :run])
+        read (runs/read-results (:state-dir c) run)]
+    (is (.isFile (io/file (get-in res [:ok :summary-file]))))
+    (is (= :failed (:status (clojure.edn/read-string (slurp (get-in res [:ok :summary-file]))))))
+    (is (= 3 (count (:results read))) "why reads every cell's result.edn")
+    (is (empty? (:skipped read)))))
+
+(deftest the-answer-carries-only-failed-cases-clipped
+  (let [big (apply str (repeat 5000 "x"))
+        raw (str "<testsuite name=\"load\">"
+                 (apply str (repeat 50 "<testcase classname=\"c\" name=\"ok\"/>"))
+                 "<testcase classname=\"c\" name=\"bad\"><failure message=\"m\"/><system-out>" big "</system-out></testcase>"
+                 "</testsuite>")
+        c (ctx {"load" {:exit 1 :raw raw}})
+        res (suites/test! c {:suites "load"})
+        rep (:report (first (get-in res [:ok :cells])))]
+    (is (= 50 (get-in rep [:report/totals :passed])))
+    (is (= 1 (count (:report/failed-cases rep))))
+    (is (nil? (:report/cases rep)))
+    (is (< (count (:case/output (first (:report/failed-cases rep)))) 2100))
+    (is (= 5000 (count (:case/output (first (filter #(= "bad" (:case/name %))
+                                                    (get-in (first @(:recorded c)) [:report :report/cases]))))))
+        "the history keeps the full text")))
+
+(deftest a-runner-without-scrub-has-its-texts-redacted
+  (let [secret "s3cr3t-tok"
+        raw (str "<testsuite name=\"load\"><testcase classname=\"c\" name=\"t\"><failure message=\"" secret "\"/>"
+                 "<system-out>" secret "</system-out></testcase></testsuite>")
+        c (-> (ctx {"load" {:exit 1 :raw raw}})
+              (assoc-in [:settings :compose/suites "load" :suite/env] {"TOKEN" {:pass "ci/token"}}))
+        res (suites/test! c {:suites "load"})]
+    (is (= :failed (get-in res [:ok :status])))
+    (is (not (str/includes? (pr-str res) secret)))
+    (is (not (str/includes? (pr-str @(:recorded c)) secret)))
+    (is (true? (get-in res [:ok :cells 0 :report :report/redacted?])))))
 
 (deftest secrets-in-reports-never-reach-the-answer-or-the-history
   (let [secret "s3cr3t-tok"
@@ -264,6 +383,7 @@
         c (ctx {"load" {:exit 1 :raw raw :scrub {secret "pass:ci/token"}}})
         res (suites/test! c {:suites "load"})]
     (is (= :failed (get-in res [:ok :status])))
+    (is (not (str/includes? (slurp (get-in res [:ok :summary-file])) secret)) "summary.edn scrubbed")
     (is (not (str/includes? (pr-str res) secret)) "answer scrubbed")
     (is (not (str/includes? (pr-str @(:recorded c)) secret)) "flake history scrubbed")
     (is (str/includes? (pr-str res) "pass:ci/token"))))

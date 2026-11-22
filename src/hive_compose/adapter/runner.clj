@@ -3,11 +3,15 @@
    processes run through an injected `exec` with hive-system's
    `shell.core/exec!` contract (argv, opts) -> Result.
 
-   A container runs as `docker create` (name, view network, reports mount,
-   labels, `-e VAR` by NAME only), `docker network connect` to any extra
-   network, `docker start -a`, then `docker rm -f`, which also runs after a
-   timeout or a failed start. Values never reach argv: the env of the
-   docker process carries them, and docker copies the named ones in.
+   A container runs as `docker image inspect`, then `docker pull` when the
+   image is absent (under its own `:pull-timeout-ms`, default 10 min, never
+   the run's), `docker create` (name, view network, reports mount, labels,
+   `-e VAR` by NAME only), `docker network connect` to each of
+   `:extra-networks`, `docker start -a`, then `docker rm -f`, which also runs
+   after a timeout, a failed step or a throw. Values never reach argv: the
+   env of the docker process carries them, and docker copies the named ones in.
+
+   Every answer, ok or error, carries `:scrub` (see `hive-compose.port/ISuiteRunner`).
 
    A host command runs in its `:dir` with its env, as `sh -c` for a string,
    as is for a vector. Either way, secret references in the env are read
@@ -28,6 +32,10 @@
   "How long a runner may take when its suite sets no :suite/timeout-ms."
   (* 30 60 1000))
 
+(def default-pull-timeout-ms
+  "How long a missing image may take to pull."
+  (* 10 60 1000))
+
 (def tail-lines 50)
 
 ;; ---------------------------------------------------------------------------
@@ -38,8 +46,18 @@
   [env]
   (vec (mapcat (fn [k] ["-e" k]) (sort (keys env)))))
 
-(defn mount-args [mounts]
-  (vec (mapcat (fn [{:keys [host container]}] ["-v" (str host ":" container)]) mounts)))
+(defn mount-args
+  "`--mount type=bind,...` per mount: unlike `-v`, a `:` in a path is no separator."
+  [mounts]
+  (vec (mapcat (fn [{:keys [host container]}]
+                 ["--mount" (str "type=bind,source=" host ",target=" container)])
+               mounts)))
+
+(defn inspect-image-argv [image]
+  ["docker" "image" "inspect" "--format" "{{.Id}}" image])
+
+(defn pull-argv [image]
+  ["docker" "pull" image])
 
 (defn create-argv
   "`docker create` of container RunnerSpec `spec`, on its view network."
@@ -103,6 +121,20 @@
               (r/ok stdout)
               (r/err :compose/command-failed {:argv argv :exit exit :stderr (str stderr)})))))
 
+(defn- threw
+  "The error answer of a runner step that threw: scrubbed, with :scrub."
+  [t scrub]
+  (r/err :compose/runner-threw {:exit nil :scrub scrub :message (scrub (str t))}))
+
+(defn- ensure-image!
+  "Result<image>: `image` present locally, pulled when it is not, the pull
+   bounded by `pull-ms`, not by the run's own timeout."
+  [exec image pull-ms]
+  (let [have (exec (inspect-image-argv image) {:timeout-ms 60000})]
+    (if (and (r/ok? have) (zero? (get-in have [:ok :exit])))
+      (r/ok image)
+      (r/map-ok (step! exec (pull-argv image) {:timeout-ms pull-ms}) (constantly image)))))
+
 (defrecord SuiteRunner [exec resolver now]
   port/ISuiteRunner
   (-run-container! [_ spec]
@@ -110,35 +142,42 @@
           nm (:name spec)]
       (r/let-ok [_ (ensure-dir! (:reports-dir spec))
                  resolved (secrets/resolve-env resolver declared)]
-        ;; everything from the first docker call on sits inside try/finally:
-        ;; a create that fails or times out half way still has its container removed
-        (try
-          ;; a leftover of an interrupted run under this name: best effort
-          (exec (rm-argv nm) {:timeout-ms 60000})
-          (r/let-ok [_ (r/map-err (step! exec (create-argv spec) {:env resolved})
-                                  #(update % :stderr (fn [s] (env/scrub declared resolved s))))
-                     _ (reduce (fn [acc n] (if (r/err? acc) (reduced acc) (step! exec (connect-argv n nm) {})))
-                               (r/ok nil) (:networks spec))]
-            (let [t0 (now)
-                  res (exec (start-argv nm) {:timeout-ms (timeout-ms spec)})]
-              (outcome res declared resolved t0 (now))))
-          (catch Throwable t
-            (r/err :compose/runner-threw {:exit nil :message (env/scrub declared resolved (str t))}))
-          (finally
-            (try (exec (rm-argv nm) {:timeout-ms 60000})
-                 (catch Throwable _best-effort-removal nil)))))))
+        (let [scrub #(env/scrub declared resolved %)
+              with-scrub (fn [res] (if (r/err? res)
+                                     (-> res
+                                         (assoc :scrub scrub :exit nil)
+                                         (update :stderr #(some-> % str scrub)))
+                                     res))]
+          ;; everything from the first docker call on sits inside try/finally:
+          ;; a pull, create or connect that fails or times out half way, or a
+          ;; throw, still has its container removed
+          (try
+            (with-scrub
+              (r/let-ok [_ (ensure-image! exec (:image spec) (or (:pull-timeout-ms spec) default-pull-timeout-ms))
+                         ;; a leftover of an interrupted run under this name: best effort
+                         _ (do (exec (rm-argv nm) {:timeout-ms 60000}) (r/ok nil))
+                         _ (step! exec (create-argv spec) {:env resolved})
+                         _ (reduce (fn [acc n] (if (r/err? acc) (reduced acc) (step! exec (connect-argv n nm) {})))
+                                   (r/ok nil) (:extra-networks spec))]
+                (let [t0 (now)
+                      res (exec (start-argv nm) {:timeout-ms (timeout-ms spec)})]
+                  (outcome res declared resolved t0 (now)))))
+            (catch Throwable t (threw t scrub))
+            (finally
+              (try (exec (rm-argv nm) {:timeout-ms 60000})
+                   (catch Throwable _best-effort-removal nil))))))))
   (-run-command! [_ spec]
     (let [declared (:env spec)]
       (r/let-ok [_ (ensure-dir! (:reports-dir spec))
                  resolved (secrets/resolve-env resolver declared)]
-        (try
-          (let [t0 (now)
-                res (exec (command-argv (:command spec))
-                          (cond-> {:timeout-ms (timeout-ms spec) :env resolved}
-                            (:dir spec) (assoc :dir (:dir spec))))]
-            (outcome res declared resolved t0 (now)))
-          (catch Throwable t
-            (r/err :compose/runner-threw {:exit nil :message (env/scrub declared resolved (str t))})))))))
+        (let [scrub #(env/scrub declared resolved %)]
+          (try
+            (let [t0 (now)
+                  res (exec (command-argv (:command spec))
+                            (cond-> {:timeout-ms (timeout-ms spec) :env resolved}
+                              (:dir spec) (assoc :dir (:dir spec))))]
+              (outcome res declared resolved t0 (now)))
+            (catch Throwable t (threw t scrub))))))))
 
 (defn make-runner
   "SuiteRunner. `opts`: :exec (default hive-system `shell.core/exec!`),

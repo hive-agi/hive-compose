@@ -159,9 +159,33 @@
   "Result<{:dir :removed n}>: every report file (.xml, .tap) under `dir`
    deleted, so a runner's attempt is never read together with a previous
    one's. Only report files go; nothing else in `dir` is touched. An absent
-   `dir` removes nothing. Use it on a directory hive-compose owns."
+   `dir` removes nothing. A file that cannot be deleted (another uid's, a
+   read-only mount) is :report/unclearable naming every leftover: the
+   attempt must not run on top of it."
   [dir]
-  (r/try-effect* :report/unclearable
-    (let [files (filter report-file? (file-seq (io/file dir)))]
-      (doseq [f files] (io/delete-file f true))
-      {:dir (str dir) :removed (count files)})))
+  (r/let-ok [files (r/try-effect* :report/unclearable
+                     (vec (filter report-file? (file-seq (io/file dir)))))]
+    (let [left (vec (for [^java.io.File f files
+                          :when (not (try (.delete f) (catch SecurityException _ false)))]
+                      (str f)))]
+      (if (seq left)
+        (r/err :report/unclearable {:dir (str dir) :leftovers left
+                                    :message (str (count left) " report file(s) under " dir " cannot be deleted")})
+        (r/ok {:dir (str dir) :removed (count files)})))))
+
+(defn collect-reports!
+  "Result<{:from :to :moved n}>: every report file under `from` (a suite's
+   declared reports dir) moved into directory `to` (the cell's own), named
+   by its path relative to `from` with `/` made `__`, so nested files never
+   collide. An absent `from` moves nothing."
+  [from to]
+  (r/try-effect* :report/uncollectable
+    (let [root (.toPath (io/file from))
+          files (filter report-file? (file-seq (io/file from)))]
+      (.mkdirs (io/file to))
+      (doseq [^java.io.File f files]
+        (let [rel (str/replace (str (.relativize root (.toPath f))) "/" "__")]
+          (java.nio.file.Files/move (.toPath f) (.toPath (io/file to rel))
+                                    (into-array java.nio.file.CopyOption
+                                                [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))
+      {:from (str from) :to (str to) :moved (count files)})))

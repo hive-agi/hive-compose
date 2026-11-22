@@ -95,10 +95,6 @@
                              :compose/process-table (->FixedTable snap)
                              :compose/runner nil
                              :compose/save! (constantly (r/ok nil))
-                             ;; its own state file: the default one is the operator's live state
-                             :compose/state-file (str (java.nio.file.Files/createTempDirectory
-                                                       "orphans-test" (make-array java.nio.file.attribute.FileAttribute 0))
-                                                      "/state.edn")
                              :compose/config-source (constantly {})
                              :compose/state-file (str dir "/state.edn")
                              :compose/log-dir (str dir "/logs")

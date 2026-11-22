@@ -1,7 +1,8 @@
 (ns hive-compose.stub-runner
   "An in-memory IProgramRunner: directories with build-file facts, a set of live
    pids, a recording of every start and stop, and faults injectable per method."
-  (:require [hive-compose.port :as port]
+  (:require [clojure.string]
+            [hive-compose.port :as port]
             [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
@@ -79,14 +80,16 @@
 
 (defn- run-suite! [world kind spec]
   (swap! world update :runs conj (assoc spec ::kind kind))
-  (let [{:keys [exit passed failed error raw scrub]} (script-of world spec)
+  (let [{:keys [exit passed failed error raw scrub throws collect]} (script-of world spec)
+        _ (when throws (throw (ex-info "stub runner threw" {})))
         scrub-fn (fn [s] (reduce (fn [s [v r]] (clojure.string/replace s v r)) s scrub))
         t (:clock (swap! world update :clock + 10))]
     (if error
-      (r/err error {:exit nil :log-tail ["runner died"] :started-ms (- t 10) :ended-ms t})
+      (r/err error (cond-> {:exit nil :log-tail ["runner died"] :started-ms (- t 10) :ended-ms t}
+                     scrub (assoc :scrub scrub-fn)))
       (do
         (when (or raw passed failed)
-          (let [dir (java.io.File. (str (:reports-dir spec)))]
+          (let [dir (java.io.File. (str (if collect (:collect-from spec) (:reports-dir spec))))]
             (.mkdirs dir)
             (spit (java.io.File. dir "junit.xml")
                   (or raw (junit (get-in spec [:cell :suite/id]) (or passed 0) (or failed 0))))))
