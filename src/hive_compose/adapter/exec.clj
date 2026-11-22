@@ -14,7 +14,8 @@
             [hive-compose.adapter.secrets :as secrets]
             [hive-compose.port :as port]
             [hive-compose.promote.env :as env]
-            [hive-dsl.result :as r])
+            [hive-dsl.result :as r]
+            [hive-compose.promote.data :as data])
   (:import (hive_compose.adapter.cli CliEngine)
            (hive_compose.adapter.host HostRunner)))
 
@@ -56,9 +57,13 @@
 
 (defn- run-with-env
   "Result of `argv` through `exec` with `declared` env read through
-   `resolver`; output scrubbed of resolved values."
+   `resolver`; output scrubbed of resolved values. An argv that could remove
+   a volume is refused here too (defence in depth beside the plan's check)."
   [exec resolver argv declared opts]
-  (r/let-ok [resolved (secrets/resolve-env resolver (or declared {}))]
+  (r/let-ok [_ (if (data/removes-volumes? argv)
+                 (r/err :compose/volume-removal-refused {:argv argv})
+                 (r/ok argv))
+             resolved (secrets/resolve-env resolver (or declared {}))]
     (finish (exec argv (cond-> (select-keys opts [:timeout-ms :dir])
                          (seq resolved) (assoc :env resolved)))
             argv

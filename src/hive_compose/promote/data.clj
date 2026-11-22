@@ -105,20 +105,43 @@
 ;; ---------------------------------------------------------------------------
 ;; volume safety
 
-(defn removes-volumes?
-  "True when `argv` could remove a volume: a `-v` or `--volumes` flag (any
-   `--volumes=..` too), a short-flag cluster holding `v` after `down` or `rm`
-   (`down -fv`, `rm -fv`), or `volume rm|remove|prune`. Deliberately coarse:
-   a tool that spells something else `-v` (psql's variables) must use its
-   long form (`--set=`), as the rendered steps do."
+(def ^:private shells #{"sh" "bash" "zsh" "dash" "ash" "ksh" "busybox" "env"})
+
+(defn- tokens
+  "Every whitespace-separated word of every argument, basenames for paths,
+   so `[\"sh\" \"-c\" \"docker compose down -v\"]` reads as the command it runs."
   [argv]
-  (let [a (mapv str argv)
-        destroyer? (some #{"down" "rm"} a)]
+  (vec (for [a argv
+             w (str/split (str/trim (str a)) #"\s+")
+             :when (seq w)]
+         w)))
+
+(defn removes-volumes?
+  "True when `argv` could remove or recreate a volume, refusing when in doubt.
+   Every argument is split on whitespace first, so a command wrapped in a shell
+   (`sh -c \"docker compose down -v\"`) or joined into one string is read as
+   the words it runs. Refused anywhere in those words: `-v`, `--volumes`
+   (`--volumes=..`), `-V`, `--renew-anon-volumes`, a short-flag cluster
+   holding `v` or `V` beside `down`/`rm`/`up`/`prune` (`down -fv`), `volume
+   rm|remove|prune`, `system prune`; and a shell `-c` script naming `volume`
+   or `prune` at all. A script the argv only names (`./seed.sh`) cannot be
+   read, so its contents are never checked: it is the provider's to keep
+   volume-safe. psql steps use `--set=`, never `-v`."
+  [argv]
+  (let [ws (tokens argv)
+        base (fn [w] (last (str/split w #"/")))
+        destroyer? (some #{"down" "rm" "up" "prune"} ws)
+        shell-script? (and (some (comp shells base) ws) (some #{"-c"} ws))]
     (boolean
-     (or (some #(or (= "-v" %) (= "--volumes" %) (str/starts-with? % "--volumes=")) a)
-         (and destroyer? (some #(re-matches #"-[a-zA-Z]*v[a-zA-Z]*" %) a))
-         (some (fn [[x y]] (and (= "volume" x) (#{"rm" "remove" "prune"} y)))
-               (partition 2 1 a))))))
+     (or (some #(or (#{"-v" "-V" "--volumes" "--renew-anon-volumes"} %)
+                    (str/starts-with? % "--volumes=")
+                    (str/starts-with? % "--renew-anon-volumes="))
+               ws)
+         (and destroyer? (some #(re-matches #"-[a-zA-Z]*[vV][a-zA-Z]*" %) ws))
+         (some (fn [[x y]] (or (and (= "volume" x) (#{"rm" "remove" "prune"} y))
+                               (and (= "system" x) (= "prune" y))))
+               (partition 2 1 ws))
+         (and shell-script? (some #(re-find #"(?i)volume|prune" %) ws))))))
 
 ;; ---------------------------------------------------------------------------
 ;; tenancy names: Kafka prefix rotation, Postgres databases
@@ -255,6 +278,13 @@
                (let [pd (provide-data settings (:instance/provider ip) (:instance/capability ip))]
                  (cond (r/err? pd) (reduced pd)
                        (nil? (:ok pd)) acc
+                       ;; a command reset on a shared instance must be told whose
+                       ;; tenancy to reset: without :tenancy it could only mean all of it
+                       (and (:instance/share? ip) (= :command (strategy (:ok pd)))
+                            (nil? (tenancy-var settings ip)))
+                       (reduced (r/err :compose/shared-reset-without-tenancy
+                                       {:instance (:instance/id ip) :consumer c
+                                        :hint "declare :tenancy {:env VAR} on the Provide (the reset must honour VAR), or use :prefix-rotate / :template-db"}))
                        :else (r/map-ok acc #(conj % {:instance ip :consumer c :data (:ok pd)
                                                     :tenancy-var (tenancy-var settings ip)})))))
              (r/ok []) rows)
@@ -271,7 +301,9 @@
    HIVE_TENANT_DATABASE and the template's database var."
   [{:keys [instance consumer data tenancy-var]} run gen database]
   (let [prefix (rotated-prefix run consumer gen)
-        db-var (get-in data [:template :database-env])]
+        ;; template-db: the database var defaults to libpq's PGDATABASE, so a
+        ;; migrate or seed lands in the template, never the instance's default db
+        db-var (get-in data [:template :database-env] "PGDATABASE")]
     (cond-> {tenant-prefix-var prefix}
       tenancy-var (assoc tenancy-var prefix)
       database (assoc tenant-database-var database)

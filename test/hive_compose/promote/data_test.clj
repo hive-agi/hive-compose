@@ -32,6 +32,7 @@
                                         :template {:database-env "PGDATABASE"}}}}
    "redis" {:project/id "redis" :project/dir "/w/redis"
             :project/provides {"redis" {:service "redis"
+                                        :tenancy {:env "KEY_PREFIX"}
                                         :reset {:exec {:service "redis" :argv ["redis-cli" "--scan-delete"]}}
                                         :seed {:command ["./seed-redis.sh"]}}}}
    "shop" {:project/id "shop" :project/dir "/w/shop"
@@ -112,6 +113,10 @@
                        {:command ["docker" "compose" "down" "-v"]})]
       (is (= :compose/volume-removal-refused
              (:error (data/lifecycle-plan (settings ps) (plan-of ps ["shop"]) :between-suites))))))
+  (testing "a :command reset on a shared instance without :tenancy is refused"
+    (let [ps (update-in projects ["redis" :project/provides "redis"] dissoc :tenancy)]
+      (is (= :compose/shared-reset-without-tenancy
+             (:error (data/lifecycle-plan (settings ps) (plan-of ps ["billing" "shop"]) :before-suite))))))
   (testing "an exec into a service the instance does not run"
     (let [ps (assoc-in projects ["redis" :project/provides "redis" :seed]
                        {:exec {:service "nope" :argv ["x"]}})]
@@ -134,6 +139,14 @@
   (is (data/removes-volumes? ["docker" "compose" "rm" "-fv"]))
   (is (data/removes-volumes? ["docker" "volume" "rm" "x"]))
   (is (data/removes-volumes? ["docker" "volume" "prune"]))
+  (is (data/removes-volumes? ["sh" "-c" "docker compose down -v"]))
+  (is (data/removes-volumes? ["/bin/bash" "-c" "docker volume prune -f"]))
+  (is (data/removes-volumes? ["docker compose down --volumes"]))
+  (is (data/removes-volumes? ["docker" "compose" "up" "-V"]))
+  (is (data/removes-volumes? ["docker" "compose" "up" "--renew-anon-volumes"]))
+  (is (data/removes-volumes? ["docker" "system" "prune" "-af"]))
+  (is (data/removes-volumes? ["sh" "-c" "x=volume; docker $x rm data"]) "in doubt: refused")
+  (is (not (data/removes-volumes? ["sh" "-c" "./seed.sh && echo done"])))
   (is (not (data/removes-volumes? ["docker" "compose" "down"])))
   (is (not (data/removes-volumes? (data/psql-argv {} "SELECT 1")))))
 
@@ -185,9 +198,26 @@
 (def gen-evil-argv
   (gen/let [prefix (gen/vector (gen/elements ["docker" "compose" "-p" "x" "down" "rm"]) 0 4)
             evil (gen/elements [["-v"] ["--volumes"] ["--volumes=true"] ["down" "-v"] ["rm" "-fv"]
-                                ["volume" "rm" "data"] ["volume" "prune"]])
+                                ["volume" "rm" "data"] ["volume" "prune"] ["system" "prune"]
+                                ["-V"] ["--renew-anon-volumes"] ["up" "-dV"]])
             suffix (gen/vector (gen/elements ["svc" "--remove-orphans"]) 0 2)]
     (vec (concat prefix evil suffix))))
+
+(def gen-wrapped-evil-argv
+  "An evil argv as it may really be written: as is, joined into one string,
+   or run by a shell `-c`."
+  (gen/let [argv gen-evil-argv
+            form (gen/elements [:split :joined :sh :bash-path])]
+    (let [s (str/join " " argv)]
+      (case form
+        :split argv
+        :joined [s]
+        :sh ["sh" "-c" s]
+        :bash-path ["/usr/bin/bash" "-lc" (str "set -e; " s)]))))
+
+(defspec wrapped-or-split-volume-removal-is-detected 200
+  (prop/for-all [argv gen-wrapped-evil-argv]
+    (data/removes-volumes? argv)))
 
 (defspec any-volume-removing-command-is-refused 50
   (prop/for-all [argv gen-evil-argv phase (gen/elements data/phases)
