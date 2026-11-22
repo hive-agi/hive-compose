@@ -103,6 +103,18 @@
         (is (= 1 (count (:stacks @(:state c)))) "audit was not recorded"))
       (testing "billing binds shop's kafka: only what it adds counts"
         (is (r/ok? (stacks/stack-up! c {:stack "billing"}))))))
+  (testing ":compose/budget: two runs of one stack sum their PRIVATE instances"
+    (let [c (ctx {:compose/budget "2g"} nil)]
+      (is (r/ok? (stacks/stack-up! c {:stack "audit"})) "audit 1.25g (private kafka + zookeeper) fits 2g")
+      (let [res (stacks/stack-up! c {:stack "audit"})]
+        (is (= :compose/over-budget (:error res))
+            "a second audit run starts a second private kafka: 2.5g > 2g")
+        (is (= (+ gi (* 256 mi)) (:others-mem res)) "the first run's private kafka and zookeeper")
+        (is (= 1 (count (:stacks @(:state c)))) "the second run was not recorded"))))
+  (testing ":compose/budget: a second run of a stack of SHARED instances adds nothing"
+    (let [c (ctx {:compose/budget "3g"} nil)]
+      (is (r/ok? (stacks/stack-up! c {:stack "shop"})))
+      (is (r/ok? (stacks/stack-up! c {:stack "shop"})) "both runs bind the same kafka and postgres")))
   (testing ":stack/budget"
     (let [c (ctx {:compose/stacks (assoc-in all-stacks ["shop" :stack/budget] "1g")} nil)]
       (is (= :stack (:basis (stacks/stack-up! c {:stack "shop"}))))))

@@ -197,19 +197,25 @@
 
 (defn others-mem
   "What :compose/budget is already spent on besides `budget` (this stack's):
-   the capped memory (closures included) of every live run's instances, each
-   counted once at the largest cap any run gives it; for an instance this
-   stack binds too, only what the live runs give it beyond this stack's own
-   count."
+   the capped memory (closures included) of every live run's instances.
+
+   A SHARED instance is one container whoever binds it, so it is keyed by
+   its id, counted once at the largest cap any run gives it, and for one
+   this stack binds too only what the live runs give it beyond this stack's
+   own count. A PRIVATE instance is a container per run: its id
+   (`<provider>/<cap>@<consumer>`) carries no run, so it is keyed by its
+   compose project and always adds; two runs of one stack sum, they never
+   collapse into one. A run recorded before runs carried :budget counts 0."
   [ctx budget]
-  (let [mine (:budget/instances budget)
-        live (reduce (fn [m [iid c]] (update m iid (fnil max 0) (resources/inst-mem c)))
-                     {}
-                     (for [[_ e] (stacks ctx)
-                           [iid _] (get-in e [:plan :stack/instances])]
-                       [iid (get-in e [:budget :budget/instances iid] {})]))]
-    (reduce + 0 (for [[iid m] live]
-                  (if-let [c (get mine iid)]
+  (let [mine   (:budget/instances budget)
+        key-of (fn [iid ip] (if (:instance/share? ip) iid [:private (:instance/compose-project ip) iid]))
+        live   (reduce (fn [m [k c]] (update m k (fnil max 0) (resources/inst-mem c)))
+                       {}
+                       (for [[_ e] (stacks ctx)
+                             [iid ip] (get-in e [:plan :stack/instances])]
+                         [(key-of iid ip) (get-in e [:budget :budget/instances iid] {})]))]
+    (reduce + 0 (for [[k m] live]
+                  (if-let [c (when (string? k) (get mine k))]
                     (max 0 (- m (resources/inst-mem c)))
                     m)))))
 
