@@ -60,18 +60,42 @@
          :when problem]
      {:consumer consumer :capability cap :instance iid :problem problem})))
 
+(defn- provider-compose-name
+  "The compose project name of `provider`: its Project's, else its slug (an
+   unknown provider is refused later, by instance-project)."
+  [projects provider]
+  (if-let [p (get projects provider)]
+    (project-compose-name p)
+    (names/slug provider)))
+
+(defn- fill-private-projects
+  "`resolution` with every private instance under its compose project for
+   `run`: `<provider compose name>-<slug consumer>-<run>`. Always recomputed,
+   so a resolver that leaves it out (or set it for another run) is planned
+   right."
+  [projects run resolution]
+  (update resolution :resolution/instances
+          (fn [is]
+            (into {} (map (fn [[iid i]]
+                            [iid (if (:instance/share? i)
+                                   i
+                                   (assoc i :instance/compose-project
+                                          (names/private-project (provider-compose-name projects (:instance/provider i))
+                                                                 (first (:instance/consumers i)) run)))]))
+                  is))))
+
 (defn- instance-project
-  "Result<compose project name> of instance `i` in `run`."
-  [projects run i]
+  "Result<compose project name> of instance `i`: the provider's compose
+   project name when shared (as `up` of that project runs it), the filled
+   private name otherwise. The provider must be a configured project."
+  [projects i]
   (let [provider (:instance/provider i)]
     (cond
-      (not (:instance/share? i))
-      (r/ok (names/private-project provider (first (:instance/consumers i)) run))
-      (contains? projects provider)
-      (r/ok (project-compose-name (get projects provider)))
-      :else
+      (not (contains? projects provider))
       (r/err :compose/unknown-provider {:instance (:instance/id i) :provider provider
-                                        :projects (vec (sort (keys projects)))}))))
+                                        :projects (vec (sort (keys projects)))})
+      (:instance/share? i) (r/ok (project-compose-name (get projects provider)))
+      :else (r/ok (:instance/compose-project i)))))
 
 (defn- instance-deps
   "Instances other than `iid` that `i`'s provider project is bound to: they
@@ -113,8 +137,20 @@
              :when (< 1 (count ids))]
          {:consumer c :alias a :instances (vec ids)})))
 
+(defn- shadowed-services
+  "[{:consumer :alias :instance}]: an instance alias on a consumer's view
+   network equal to one of that consumer's own service names
+   (`services` {consumer [service]}); Docker DNS would answer either."
+  [consumers services]
+  (vec (for [[c cp] (sort-by key consumers)
+             :let [own (set (get services c))]
+             {:keys [instance aliases]} (:consumer/attach cp)
+             a aliases
+             :when (own a)]
+         {:consumer c :alias a :instance instance})))
+
 (defn- plan-instance [projects run stack-id bindings by iid i]
-  (r/map-ok (instance-project projects run i)
+  (r/map-ok (instance-project projects i)
             (fn [cp]
               (assoc i
                      :instance/compose-project cp
@@ -140,10 +176,18 @@
    :compose/unknown-provider, :compose/name-collision (two consumers slugging
    to one view network, two private instances to one compose project),
    :compose/alias-clash (two instances answering one alias on one consumer's
-   network) and :compose/dependency-cycle."
+   network) and :compose/alias-shadows-service (an instance alias equal to one
+   of the consumer's own service names, given in `opts` as
+   {:services {consumer [service]}}, which Docker DNS would shadow) and
+   :compose/dependency-cycle. A private instance's compose project is always
+   computed here (`<provider compose name>-<slug consumer>-<run>`), whatever
+   the resolution carried."
   [settings resolution run opts]
   (let [stack-id (or (:stack opts) default-stack-id)
         projects (:compose/projects settings)
+        resolution (if (map? (:resolution/instances resolution))
+                     (fill-private-projects projects run resolution)
+                     resolution)
         {:resolution/keys [instances bindings]} resolution]
     (cond
       (not (m/validate schema/RunId run))
@@ -175,13 +219,17 @@
                 proj-clash (collisions (into {} (comp (remove (comp :instance/share? val))
                                                       (map (fn [[iid ip]] [iid (:instance/compose-project ip)])))
                                              planned))
-                aliases (clashing-aliases consumers)]
+                aliases (clashing-aliases consumers)
+                shadows (shadowed-services consumers (:services opts))]
             (cond
               (or (seq net-clash) (seq proj-clash))
               (r/err :compose/name-collision {:networks net-clash :compose-projects proj-clash})
 
               (seq aliases)
               (r/err :compose/alias-clash {:clashes aliases})
+
+              (seq shadows)
+              (r/err :compose/alias-shadows-service {:shadows shadows})
 
               :else
               (r/map-ok (topo-order (into {} (map (fn [[iid ip]] [iid (:instance/depends-on ip)])) planned))
