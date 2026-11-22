@@ -112,9 +112,31 @@
 
 (defn capability-keys
   "`m` ({capability v}) with its capability names as strings, as JSON and EDN
-   keyword keys give them."
+   keyword keys give them; a key that is no name stays as is, for the schema
+   to refuse."
   [m]
-  (into {} (map (fn [[k v]] [(name k) v])) m))
+  (into {} (map (fn [[k v]] [(if (ident? k) (name k) k) v])) m))
+
+(defn normalize-needs
+  "Needs ({capability Need}) with string capability names and each `:via` a
+   keyword, as JSON gives it a string."
+  [needs]
+  (if (map? needs)
+    (into {}
+          (map (fn [[k n]]
+                 [k (cond-> n
+                      (and (map? n) (string? (:via n))) (update :via keyword))]))
+          (capability-keys needs))
+    needs))
+
+(defn- keyed-by
+  "`xs` ([X] or {id X}) normalized with `f` and keyed by `id-key`, or `xs`
+   untouched when it is no collection of maps, for the schema to refuse."
+  [id-key f xs]
+  (let [xs (if (and (map? xs) (every? map? (vals xs))) (as-seq id-key xs) xs)]
+    (if (and (sequential? xs) (every? map? xs))
+      (into {} (map (fn [x] (let [x (f x)] [(get x id-key) x]))) xs)
+      xs)))
 
 (defn normalize-profile
   "Profile with a string id, its dir expanded against `home` and its programs
@@ -136,34 +158,38 @@
             (:project/dir p) (update :project/dir #(expand-home home %))
             (contains? p :project/activity) (update :project/activity activity-set)
             (map? (:project/provides p)) (update :project/provides capability-keys)
-            (map? (:project/needs p)) (update :project/needs capability-keys))]
+            (map? (:project/needs p)) (update :project/needs normalize-needs))]
     (cond-> p
       (:project/programs p) (update :project/programs #(normalize-programs home (:project/dir p) %)))))
 
+(defn- id-name [v] (if (ident? v) (name v) v))
+
 (defn normalize-stacks
   "Stacks ([Stack] or {id Stack}) as {id Stack} with string ids and string
-   capability names in their needs."
+   capability names in their needs. A malformed value (no collection of maps,
+   a stack without id) is left for the schema to refuse, never thrown on."
   [stacks]
-  (into {}
-        (map (fn [s]
-               (let [s (cond-> (update s :stack/id name)
-                         (map? (:stack/needs s)) (update :stack/needs capability-keys))]
-                 [(:stack/id s) s])))
-        (as-seq :stack/id stacks)))
+  (keyed-by :stack/id
+            (fn [s]
+              (cond-> s
+                (contains? s :stack/id) (update :stack/id id-name)
+                (map? (:stack/needs s)) (update :stack/needs normalize-needs)))
+            stacks))
 
 (defn normalize-suites
   "Suites ([Suite] or {id Suite}) as {id Suite} with string ids, `:suite/dir`
    expanded against `home`, string capability names in their needs and a
-   keyword report format."
+   keyword report format. A malformed value is left for the schema to refuse."
   [home suites]
-  (into {}
-        (map (fn [s]
-               (let [s (cond-> (update s :suite/id name)
-                         (:suite/dir s) (update :suite/dir #(expand-home home %))
-                         (map? (:suite/needs s)) (update :suite/needs capability-keys)
-                         (string? (:suite/report-format s)) (update :suite/report-format keyword))]
-                 [(:suite/id s) s])))
-        (as-seq :suite/id suites)))
+  (keyed-by :suite/id
+            (fn [s]
+              (cond-> s
+                (contains? s :suite/id) (update :suite/id id-name)
+                (string? (:suite/dir s)) (update :suite/dir #(expand-home home %))
+                (map? (:suite/needs s)) (update :suite/needs normalize-needs)
+                (string? (:suite/report-format s)) (update :suite/report-format keyword)))
+            suites))
+
 
 (defn profiles-file
   "Path of the profiles file `cfg` names, expanded against `home`."
