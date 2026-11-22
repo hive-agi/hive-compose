@@ -87,6 +87,8 @@
                              :compose/process-table (->FixedTable snap)
                              :compose/runner nil
                              :compose/save! (constantly (r/ok nil))
+                             ;; never the host's real state file: a live section there trips the ownership guard
+                             :compose/state-file (str (System/getProperty "java.io.tmpdir") "/hc-orph-" (System/nanoTime) ".edn")
                              :compose/config-source (constantly {})
                              :compose/profiles-file "/nonexistent/profiles.edn"
                              :compose/profiles {"db" {:profile/id "db" :profile/dir "/w/dc"
