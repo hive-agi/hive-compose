@@ -37,6 +37,11 @@
      :compose/program-grace-ms     how long a host program is watched after its
                                    start; one that exits within it is reported
                                    :exited with its code and log tail (default 3000)
+     :compose/history-file         flake history, EDN lines (default
+                                   flake-history.ednl beside the state file)
+     :compose/flaky                flake thresholds {:window :min-runs
+                                   :flip-rate :streak}, each optional (defaults
+                                   in `hive-compose.promote.flaky/defaults`)
      :compose/stacks               [Stack ..] or {id Stack}: consumers brought up with
                                    every capability they need (optional)
      :compose/suites               [Suite ..] or {id Suite}: test runners in any
@@ -117,15 +122,35 @@
   [m]
   (into {} (map (fn [[k v]] [(if (ident? k) (name k) k) v])) m))
 
+(defn normalize-resources
+  "Resources as JSON or EDN give them: \"unbounded\" (or the keyword) as
+   :unbounded, anything else as is, for the schema to judge."
+  [v]
+  (if (and (or (string? v) (keyword? v)) (= "unbounded" (name v))) :unbounded v))
+
+(defn- normalize-in
+  "`m` with `k` normalized by `f` when `m` is a map holding it."
+  [m k f]
+  (if (and (map? m) (contains? m k)) (update m k f) m))
+
+(defn normalize-provides
+  "Provides ({capability Provide}) with string capability names and
+   normalized `:resources`."
+  [provides]
+  (into {}
+        (map (fn [[k p]] [k (normalize-in p :resources normalize-resources)]))
+        (capability-keys provides)))
+
 (defn normalize-needs
-  "Needs ({capability Need}) with string capability names and each `:via` a
-   keyword, as JSON gives it a string."
+  "Needs ({capability Need}) with string capability names, each `:via` a
+   keyword, as JSON gives it a string, and normalized `:resources`."
   [needs]
   (if (map? needs)
     (into {}
           (map (fn [[k n]]
-                 [k (cond-> n
-                      (and (map? n) (string? (:via n))) (update :via keyword))]))
+                 [k (-> n
+                        (cond-> (and (map? n) (string? (:via n))) (update :via keyword))
+                        (normalize-in :resources normalize-resources))]))
           (capability-keys needs))
     needs))
 
@@ -157,7 +182,7 @@
             (:project/id p) (update :project/id name)
             (:project/dir p) (update :project/dir #(expand-home home %))
             (contains? p :project/activity) (update :project/activity activity-set)
-            (map? (:project/provides p)) (update :project/provides capability-keys)
+            (map? (:project/provides p)) (update :project/provides normalize-provides)
             (map? (:project/needs p)) (update :project/needs normalize-needs))]
     (cond-> p
       (:project/programs p) (update :project/programs #(normalize-programs home (:project/dir p) %)))))
@@ -173,7 +198,10 @@
             (fn [s]
               (cond-> s
                 (contains? s :stack/id) (update :stack/id id-name)
-                (map? (:stack/needs s)) (update :stack/needs normalize-needs)))
+                (map? (:stack/needs s)) (update :stack/needs normalize-needs)
+                (map? (:stack/resources s)) (update :stack/resources
+                                                    #(into {} (map (fn [[k v]] [k (normalize-resources v)]))
+                                                           (capability-keys %)))))
             stacks))
 
 (defn normalize-suites
@@ -187,7 +215,8 @@
                 (contains? s :suite/id) (update :suite/id id-name)
                 (string? (:suite/dir s)) (update :suite/dir #(expand-home home %))
                 (map? (:suite/needs s)) (update :suite/needs normalize-needs)
-                (string? (:suite/report-format s)) (update :suite/report-format keyword)))
+                (string? (:suite/report-format s)) (update :suite/report-format keyword)
+                (contains? s :suite/resources) (update :suite/resources normalize-resources)))
             suites))
 
 
@@ -195,6 +224,15 @@
   "Path of the profiles file `cfg` names, expanded against `home`."
   [cfg home]
   (expand-home home (or (:compose/profiles-file cfg) default-profiles-file)))
+
+(defn history-file
+  "Path of the flake history file: `:compose/history-file` expanded against
+   `home`, else `flake-history.ednl` beside the state file `state-file`."
+  [cfg home state-file]
+  (if-let [f (:compose/history-file cfg)]
+    (expand-home home f)
+    (let [parent (.getParent (java.io.File. ^String state-file))]
+      (if parent (str parent "/flake-history.ednl") "flake-history.ednl"))))
 
 (defn settings
   "Result<Settings> from merged addon config `cfg`, the profiles read from the
@@ -206,17 +244,24 @@
                       (concat (as-seq :profile/id file-profiles)
                               (as-seq :profile/id (:compose/profiles cfg))))
         projects (map #(normalize-project home %) (as-seq :project/id (:compose/projects cfg)))
+        state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
         s (merge defaults
                  (cond-> (select-keys cfg (keys defaults))
                    (contains? cfg :compose/activity)
                    (update :compose/activity activity-set))
-                 {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
+                 {:compose/state-file state-file
+                  :compose/history-file (history-file cfg home state-file)
                   :compose/log-dir (expand-home home (or (:compose/log-dir cfg) default-log-dir))
                   :compose/projects (into {} (map (juxt :project/id identity)) projects)
                   :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})
         s (cond-> s
+            (some? (:compose/flaky cfg)) (assoc :compose/flaky (:compose/flaky cfg))
             (contains? cfg :compose/stacks) (assoc :compose/stacks (normalize-stacks (:compose/stacks cfg)))
-            (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg))))]
+            (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg)))
+            (contains? cfg :compose/default-resources)
+            (assoc :compose/default-resources (normalize-resources (:compose/default-resources cfg)))
+            (contains? cfg :compose/budget) (assoc :compose/budget (:compose/budget cfg))
+            (contains? cfg :compose/host-reserve) (assoc :compose/host-reserve (:compose/host-reserve cfg)))]
     (if-let [problems (schema/explain schema/Settings s)]
       (r/err :compose/invalid-config {:problems problems})
       (r/ok s))))
@@ -237,7 +282,7 @@
 (def ^:private live-only
   "Settings a running addon keeps from init: the reaper period and where its
    state lives. A change to them applies at the next initialize!."
-  [:compose/tick-seconds :compose/state-file])
+  [:compose/tick-seconds :compose/state-file :compose/history-file])
 
 (defn settings-diff
   "What differs between Settings `old` and `new`: projects and profiles by id,

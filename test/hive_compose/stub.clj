@@ -8,7 +8,9 @@
 ;; SPDX-License-Identifier: MIT
 
 (defn- record! [world call]
-  (swap! world update :calls conj call))
+  (swap! world update :calls conj call)
+  ;; the call hook (`on-call!`) runs on the calling thread, before the call acts
+  (when-let [f (:on-call @world)] (f call)))
 
 (defn- fault [world method]
   (when (contains? (:fail @world) method)
@@ -234,7 +236,7 @@
                 (r/ok {:network network :containers [c]}))))))
   (-up-project! [{:keys [world]} spec]
     (record! world [:up-project (:project spec) (vec (:services spec))
-                    (select-keys spec [:labels :networks :wait? :container-env :files])])
+                    (select-keys spec [:labels :networks :wait? :container-env :files :service-overrides])])
     (if (empty? (:services spec))
       (r/ok {:out "" :skipped :no-services})
       (or (fault world :up-project)
@@ -326,6 +328,13 @@
    (->StubEngine (atom {:closures closures :running running :projects projects :calls [] :fail #{}}))))
 
 (defn calls [e] (:calls @(:world e)))
+
+(defn on-call!
+  "Run `f` with every recorded call `[method ..]`, on the calling thread,
+   before the call acts on the world: a test blocks a thread there to force
+   an interleaving. nil removes the hook."
+  [e f]
+  (swap! (:world e) assoc :on-call f))
 (defn running [e project] (get-in @(:world e) [:running project] #{}))
 (defn fail! [e & methods] (swap! (:world e) update :fail into methods))
 
@@ -359,3 +368,31 @@
    ({service {:volumes #{name} :ports #{port}}})."
   [e project m]
   (swap! (:world e) assoc-in [:holds project] m))
+
+;; ---------------------------------------------------------------------------
+;; IDataExec: `docker exec` into a running container of the world. Every call
+;; is recorded as [:exec project service argv env]; `exec-fails!` makes an
+;; argv holding a given text exit non-zero with a stderr.
+
+(extend-type StubEngine
+  port/IDataExec
+  (-exec! [{:keys [world]} {:keys [project service]} argv opts]
+    (record! world [:exec project service (vec argv) (:env opts {})])
+    (or (fault world :exec)
+        (let [c (get-in @world [:containers (container-name project service)])]
+          (if-not (= "running" (:state c))
+            (r/err :compose/no-container {:project project :service service})
+            (if-let [[_ stderr] (first (filter (fn [[text _]] (some #(.contains ^String % text) argv))
+                                               (:exec-fails @world)))]
+              (r/err :compose/command-failed {:exit 1 :stderr stderr})
+              (r/ok {:exit 0 :out ""})))))))
+
+(defn exec-fails!
+  "Make every exec whose argv holds `text` in an argument fail with `stderr`."
+  [e text stderr]
+  (swap! (:world e) update :exec-fails (fnil assoc {}) text stderr))
+
+(defn execs
+  "[[:exec project service argv env] ...] recorded so far."
+  [e]
+  (filterv #(= :exec (first %)) (calls e)))

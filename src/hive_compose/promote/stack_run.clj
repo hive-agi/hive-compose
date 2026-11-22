@@ -23,6 +23,7 @@
    run-scoped compose project carries hive.run. No IO."
   (:require [clojure.string :as str]
             [hive-compose.promote.otel :as otel]
+            [hive-compose.promote.resources :as res]
             [hive-compose.promote.stack :as stack]
             [hive-compose.schema :as schema]))
 
@@ -81,6 +82,37 @@
                     :wait? (boolean wait?)})
       (not (:instance/share? ip)) (assoc :services closure
                                          :labels (:instance/labels ip)))))
+
+(defn instance-overrides
+  "{service {mem_limit cpus environment}} (string keys) that caps instance `ip`
+   (hc-16a): its answering services get `caps` (InstanceCaps) and, when they
+   run a JVM (`:jvm?`, else detected from the image in `facts` {service
+   {:image :java-tool-options}}), JAVA_TOOL_OPTIONS with the heap flag merged
+   under the service's own options (the compose file's, else the provider
+   project's env). The JVM flag goes only where a mem_limit is written. The
+   closure services (`:closure` of `caps`, {service bytes}, see
+   resources/with-closure) get a mem_limit too, unless their own compose file
+   sets one (`:mem-limit` in `facts`), and the flag when their image is a JVM.
+   Services that need nothing are left out."
+  [settings ip caps facts]
+  (let [proj-opts (let [v (get-in settings [:compose/projects (:instance/provider ip) :project/env
+                                            res/java-tool-options])]
+                    (when (string? v) v))
+        own (for [s (:instance/services ip)
+                  :let [{:keys [image java-tool-options]} (get facts s)]]
+              [s (res/service-override caps (res/jvm? caps image) (or java-tool-options proj-opts))])
+        closure (for [[s m] (:closure caps)
+                      :let [{:keys [image java-tool-options mem-limit]} (get facts s)]
+                      :when (nil? mem-limit)]
+                  [s (res/service-override {:mem m :unbounded? false} (res/java-image? image)
+                                           (or java-tool-options proj-opts))])]
+    (into (sorted-map) (filter (comp seq second)) (concat own closure))))
+
+(defn with-overrides
+  "ProjectSpec `spec` carrying `overrides` (from `instance-overrides`) as
+   `:service-overrides`, unchanged when there are none."
+  [spec overrides]
+  (cond-> spec (seq overrides) (assoc :service-overrides overrides)))
 
 (defn consumer-labels
   "hive.run, hive.stack and hive.consumer of `consumer` in `run` of `stack-id`."
@@ -197,9 +229,10 @@
    section holds it (`section-held`, {compose-project #{service}}, which
    keeps and releases it). Shared instances run under their provider's
    compose project, so `running` keys are both provider and compose project.
-   Marks only grow: a mark is never cleared, so whichever run leaves last
-   never removes what ran before the runs. Pure; computed against the state
-   current inside the swap, so concurrent runs cannot race it."
+   A mark of a running service is never cleared, so whichever run leaves
+   last never removes what ran before the runs; only `reconcile-preexisting`
+   drops the mark of one that no longer runs. Pure; computed against the
+   state current inside the swap, under the stack lock."
   [marks running runs run section-held]
   (let [others (held-by-others runs run)]
     (reduce-kv (fn [m provider svcs]
@@ -209,6 +242,28 @@
                    (cond-> m (seq fresh) (update provider (fnil into (sorted-set)) fresh))))
                (or marks {})
                running)))
+
+(defn reconcile-preexisting
+  "Preexistence marks with those a run's probe disproves dropped. `probed`
+   is #{[provider-project service]}: the footprints of the run's shared
+   instances, which the probe read. `running` is {provider-project
+   #{service}}: what of them ran. A mark of a probed service that does not
+   run, and that no other live run's instance holds (`runs` {run StackPlan},
+   `run` excluded), is the world's no longer: whoever removed it took it
+   back, so this run starts it and owns it, and its down releases it. A
+   mark of a running service, or of one outside the probe, stays. Pure;
+   computed inside the swap, under the stack lock."
+  [marks probed running runs run]
+  (let [others (held-by-others runs run)
+        gone (fn [provider svc]
+               (and (contains? probed [provider svc])
+                    (not (contains? (get running provider #{}) svc))
+                    (not (others [provider svc]))))]
+    (reduce-kv (fn [m provider svcs]
+                 (let [kept (into (sorted-set) (remove #(gone provider %)) svcs)]
+                   (if (seq kept) (assoc m provider kept) (dissoc m provider))))
+               (or marks {})
+               (or marks {}))))
 
 (defn preexisting-of
   "[service] marked preexisting for the provider project of release `step`

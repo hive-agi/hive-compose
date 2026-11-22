@@ -82,14 +82,14 @@
         load (get by "load/shop")]
     (is (= 2 (count runs)))
     (testing "a container joins the view network of the project under test"
-      (is (= :container (::sr/kind smoke)))
+      (is (= :container (:runner smoke)))
       (is (= "hive-test000001-shop" (:network smoke)))
       (is (nil? (:extra-networks smoke)) "a suite with no needs has no network of its own")
       (is (= suites/default-cell-timeout-ms (:timeout-ms smoke)) "a deadline is always set")
       (is (= {"hive.run" "test000001" "hive.consumer" "suite:smoke"} (:labels smoke)))
       (is (= {:pass "ci/token"} (get-in smoke [:env "TOKEN"])) "secret refs reach the runner unread"))
     (testing "a host command gets the wiring of its own needs and the correlation env"
-      (is (= :command (::sr/kind load)))
+      (is (= :command (:runner load)))
       (is (= "db" (get-in load [:env "PGHOST"])))
       (is (= "load/shop/" (get-in load [:env "HIVE_TEST_ID_PREFIX"])))
       (is (= "test000001" (get-in load [:env "HIVE_RUN_ID"])))
@@ -101,8 +101,9 @@
         {:keys [run status exit summary stack-kept? hint]} (:ok res)]
     (is (r/ok? res))
     (is (= [:failed 1] [status exit]))
-    (is (= [{:suite/id "smoke" :project "shop" :status :failed :exit 1 :cases ["smoke/c.bad0"]}]
-           (:failures summary)))
+    (is (= [{:suite/id "smoke" :project "shop" :status :failed :exit 1 :cases ["smoke/case-3"]}]
+           (:failures summary))
+        "smoke resolves a secret and the stub answers no :scrub: case ids are redacted to their position")
     (is (true? stack-kept?))
     (is (contains? (:stacks @(:state c)) run) "kept for inspection")
     (is (re-find #"stack-down run=test000001" hint))))
@@ -233,36 +234,92 @@
       (is (= :report/none (get-in cell [:report-error :error])))
       (is (= :passed (:status cell)) "exit 0 with no report is the verdict"))))
 
-(deftest a-declared-host-reports-dir-is-emptied-then-collected
-  (let [dir (tmp-dir)
-        old (io/file dir "old.xml")]
+(defn- with-declared-dir
+  "`c` whose load suite runs in `root` and declares `reports` under it."
+  [c root reports]
+  (-> c
+      (assoc-in [:settings :compose/suites "load" :suite/dir] root)
+      (assoc-in [:settings :compose/suites "load" :suite/reports-dir] reports)))
+
+(deftest a-declared-host-reports-dir-is-stashed-then-collected
+  (let [root (tmp-dir)
+        dir (io/file root "build" "reports")
+        old (io/file dir "old.xml")
+        pom (io/file root "pom.xml")]
+    (.mkdirs dir)
     (spit old (sr/junit "load" 0 3))
-    (testing "a leftover of an earlier run is deleted before the cell, never read"
-      (let [c (-> (ctx {"load" {:exit 0}})
-                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
-            res (suites/test! c {:suites "load"})]
+    (spit pom "<project/>")
+    (testing "a leftover of an earlier run is MOVED to the cell's stale-reports before the cell, never read"
+      (let [c (with-declared-dir (ctx {"load" {:exit 0}}) root "build/reports")
+            res (suites/test! c {:suites "load"})
+            cell (first (get-in res [:ok :cells]))
+            stale (io/file (.getParent (io/file (:reports-dir cell))) "stale-reports" "declared" "old.xml")]
         (is (= :passed (get-in res [:ok :status])) (pr-str res))
         (is (not (.exists old)))
+        (is (.isFile stale) "moved, never deleted")
+        (is (.isFile pom) "nothing outside the declared dir is touched")
         (is (= 0 (get-in res [:ok :summary :cases :failed])))))
     (testing "what the runner writes there is moved into the cell's own dir and read"
-      (let [c (-> (ctx {"load" {:exit 1 :passed 1 :failed 1 :collect true}})
-                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
+      (let [c (with-declared-dir (ctx {"load" {:exit 1 :passed 1 :failed 1 :collect true}}) root "build/reports")
             res (suites/test! c {:suites "load"})
             cell (first (get-in res [:ok :cells]))]
         (is (= 1 (get-in res [:ok :summary :cases :failed])))
-        (is (empty? (filter #(.isFile %) (file-seq (io/file dir)))) "collected, so the next cell starts clean")
-        (is (.isFile (io/file (:reports-dir cell) "junit.xml")))))))
+        (is (empty? (filter #(.isFile %) (file-seq dir))) "collected, so the next cell starts clean")
+        (is (.isFile (io/file (:reports-dir cell) "junit.xml")))
+        (is (.isFile pom))))))
 
-(deftest an-undeletable-leftover-stops-the-cell-loudly
-  (let [dir (tmp-dir)
+(deftest an-unsafe-declared-reports-dir-is-refused
+  (let [root (tmp-dir)
+        pom (io/file root "pom.xml")]
+    (spit pom "<project/>")
+    (java.nio.file.Files/createSymbolicLink (.toPath (io/file root "self")) (.toPath (io/file root))
+                                            (make-array java.nio.file.attribute.FileAttribute 0))
+    (doseq [[why reports] [[:is-root "."] [:is-root "./"] [:link-escapes "self"]]]
+      (testing (str why " " reports)
+        (let [c (with-declared-dir (ctx) root reports)
+              res (suites/test! c {:suites "load"})]
+          (is (= :compose/unsafe-reports-dir (:error res)) (pr-str res))
+          (is (= why (:reason res)))
+          (is (empty? (ups c)) "nothing started")
+          (is (.isFile pom)))))))
+
+(deftest the-reports-dir-must-lie-strictly-inside-the-suite-dir
+  (let [root (tmp-dir)]
+    (is (= :is-root (:reason (hive-compose.boundary.report/safe-reports-dir root root))))
+    (is (= :is-root (:reason (hive-compose.boundary.report/safe-reports-dir root (str root "/x/..")))))
+    (is (= :ancestor (:reason (hive-compose.boundary.report/safe-reports-dir root (.getParent (io/file root))))))
+    (is (= :outside (:reason (hive-compose.boundary.report/safe-reports-dir root (tmp-dir)))))
+    (is (= :outside (:reason (hive-compose.boundary.report/safe-reports-dir root (str root "/../elsewhere")))))
+    (is (r/ok? (hive-compose.boundary.report/safe-reports-dir root (str root "/target/reports"))))
+    (testing "a link inside the suite dir that points at it, or out of it, is refused"
+      (let [up (io/file root "up")
+            out (io/file root "out")]
+        (java.nio.file.Files/createSymbolicLink (.toPath up) (.toPath (io/file root)) (make-array java.nio.file.attribute.FileAttribute 0))
+        (java.nio.file.Files/createSymbolicLink (.toPath out) (.toPath (io/file (tmp-dir))) (make-array java.nio.file.attribute.FileAttribute 0))
+        (is (= :link-escapes (:reason (hive-compose.boundary.report/safe-reports-dir root (str up)))))
+        (is (= :link-escapes (:reason (hive-compose.boundary.report/safe-reports-dir root (str out "/reports")))))))))
+
+(deftest report-walks-never-follow-links
+  (let [root (tmp-dir)
+        elsewhere (tmp-dir)
+        victim (io/file elsewhere "keep.xml")]
+    (spit victim (sr/junit "x" 1 0))
+    (java.nio.file.Files/createSymbolicLink (.toPath (io/file root "linked")) (.toPath (io/file elsewhere))
+                                            (make-array java.nio.file.attribute.FileAttribute 0))
+    (is (empty? (hive-compose.boundary.report/report-files root)))
+    (is (r/ok? (hive-compose.boundary.report/stash-reports! root (str (tmp-dir) "/stash"))))
+    (is (.isFile victim) "a linked dir is never entered")))
+
+(deftest an-unmovable-leftover-stops-the-cell-loudly
+  (let [root (tmp-dir)
+        dir (io/file root "reports")
         sub (io/file dir "ro")
         old (io/file sub "old.xml")]
     (.mkdirs sub)
     (spit old (sr/junit "load" 0 3))
     (.setWritable sub false)
     (try
-      (let [c (-> (ctx {"load" {:exit 0}})
-                  (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir))
+      (let [c (with-declared-dir (ctx {"load" {:exit 0}}) root "reports")
             res (suites/test! c {:suites "load"})
             cell (first (get-in res [:ok :cells]))]
         (when (.exists old) ;; root may delete anyway
@@ -327,7 +384,59 @@
   (let [c (ctx)]
     (is (r/ok? (suites/test! c {:suites "load" :run "busy001" :keep-up? true})))
     (stacks/claim! c "busy001" "test:busy001" {})
-    (is (= :compose/run-busy (:error (suites/test! c {:suites "load" :run "busy001"}))))))
+    (is (= :compose/run-busy (:error (suites/test! c {:suites "load" :run "busy001"}))))
+    (testing "a dead test claim (a JVM that died mid-matrix) does not block reuse"
+      (let [clock (atom 5000)
+            c (assoc c :now #(deref clock))]
+        (swap! clock + (* 31 60000))
+        (is (= :passed (get-in (suites/test! c {:suites "load" :run "busy001"}) [:ok :status])))))))
+
+(deftest two-reuses-of-one-run-never-both-run
+  (let [c (-> (ctx)
+              (assoc-in [:settings :compose/suites "api"] api-suite)
+              (assoc-in [:settings :compose/stacks "shop"] {:stack/id "shop" :stack/consumers ["shop"]}))
+        _ (stacks/stack-up! c {:stack "shop" :run "shop002"})
+        inner (atom nil)
+        ;; while the first matrix runs its cell, a second asks for the same run
+        c (assoc c :record-run! (fn [cx _] (reset! inner (suites/test! cx {:suites "api" :projects "shop" :run "shop002"}))
+                                  (r/ok {})))
+        res (suites/test! c {:suites "api" :projects "shop" :run "shop002"})]
+    (is (= :passed (get-in res [:ok :status])) (pr-str res))
+    (is (= :compose/run-busy (:error @inner)) "the second is refused before it attaches anything")
+    (is (= 1 (count (sr/suite-runs (:suite-runner c)))) "only the first ran a cell")
+    (is (not (contains? (stub/networks (:engine c)) "hive-shop002-suite-api")) "the first still detached its network")))
+
+(deftest a-run-taken-down-mid-matrix-is-never-resurrected
+  (let [c (-> (ctx)
+              (assoc-in [:settings :compose/suites "api"] api-suite)
+              (assoc-in [:settings :compose/stacks "shop"] {:stack/id "shop" :stack/consumers ["shop"]}))
+        _ (stacks/stack-up! c {:stack "shop" :run "shop003"})
+        c (assoc c :record-run! (fn [cx _] (stacks/stack-down! cx {:run "shop003"}) (r/ok {})))
+        res (suites/test! c {:suites "api" :projects "shop" :run "shop003"})]
+    (is (r/ok? res) (pr-str res))
+    (is (not (contains? (:stacks @(:state c)) "shop003")) "no ghost entry written back")))
+
+(deftest a-throw-on-a-reused-run-still-detaches-its-networks
+  (let [c (-> (ctx)
+              (assoc-in [:settings :compose/suites "api"] api-suite)
+              (assoc-in [:settings :compose/stacks "shop"] {:stack/id "shop" :stack/consumers ["shop"]}))
+        _ (stacks/stack-up! c {:stack "shop" :run "shop004"})
+        n (atom 0)
+        ;; saves 1..2 are the claim and the attach; the third, a lease, throws
+        c (assoc c :save! (fn [_] (when (= 3 (swap! n inc)) (throw (ex-info "disk full" {})))))
+        res (suites/test! c {:suites "api" :projects "shop" :run "shop004"})]
+    (is (= :compose/test-threw (:error res)) (pr-str res))
+    (is (not (contains? (stub/networks (:engine c)) "hive-shop004-suite-api")) "detached in the finally")
+    (is (not-any? #{"hive-shop004-suite-api"} (get-in @(:state c) [:stacks "shop004" :networks])))
+    (is (empty? (get-in @(:state c) [:stacks "shop004" :claims])) "claim released")))
+
+(deftest an-interrupt-stops-the-matrix
+  (let [c (assoc (ctx) :record-run! (fn [_ _] (.interrupt (Thread/currentThread)) (r/ok {})))
+        res (try (suites/test! c {}) (finally (Thread/interrupted)))
+        cells (get-in res [:ok :cells])]
+    (is (r/ok? res) (pr-str res))
+    (is (= 1 (count (sr/suite-runs (:suite-runner c)))) "no cell starts after the interrupt")
+    (is (= [:compose/interrupted :compose/interrupted] (keep #(get-in % [:runner-error :error]) cells)))))
 
 (deftest a-foreign-claim-keeps-a-passing-stack-up
   (let [c (assoc (ctx) :record-run! (fn [cx run] (stacks/claim! cx (:run/id run) "ling-7" {}) (r/ok {})))
@@ -387,6 +496,33 @@
     (is (not (str/includes? (pr-str res) secret)) "answer scrubbed")
     (is (not (str/includes? (pr-str @(:recorded c)) secret)) "flake history scrubbed")
     (is (str/includes? (pr-str res) "pass:ci/token"))))
+
+(deftest every-free-text-is-scrubbed-or-redacted
+  (let [secret "s3cr3t-tok"
+        junit (str "<testsuite name=\"load\"><testcase classname=\"c." secret "\" name=\"t\">"
+                   "<failure message=\"m\"/></testcase></testsuite>")
+        tap (str "TAP version 13\n1..2\nnot ok 1 - x\nBail out! token " secret "\n")
+        broken (str "<testsuite name=\"load\"><testcase name=\"" secret)]
+    (testing "with the runner's :scrub: classname, a TAP bail-out, a parser error message"
+      (doseq [raw [junit tap broken]]
+        (let [c (ctx {"load" {:exit 1 :raw raw :scrub {secret "pass:ci/token"}}})
+              res (suites/test! c {:suites "load"})]
+          (is (r/ok? res) (pr-str res))
+          (is (not (str/includes? (pr-str res) secret)) (str "answer: " raw))
+          (is (not (str/includes? (slurp (get-in res [:ok :summary-file])) secret)))
+          (is (not (str/includes? (pr-str @(:recorded c)) secret))))))
+    (testing "with no :scrub but refs in the env: ids, names, classnames and the output tail go"
+      (doseq [raw [junit tap broken]]
+        (let [c (-> (ctx {"load" {:exit 1 :raw raw :output [(str "TOKEN=" secret)]}})
+                    (assoc-in [:settings :compose/suites "load" :suite/env] {"TOKEN" {:pass "ci/token"}}))
+              res (suites/test! c {:suites "load"})]
+          (is (not (str/includes? (pr-str res) secret)) (str "answer: " raw))
+          (is (not (str/includes? (pr-str @(:recorded c)) secret))))))
+    (testing "a runner error's message is scrubbed too"
+      (let [c (ctx {"load" {:error :compose/runner-failed :throws (str " " secret) :scrub {secret "pass:ci/token"}}})
+            res (suites/test! c {:suites "load"})]
+        (is (not (str/includes? (pr-str res) secret)))
+        (is (str/includes? (pr-str res) "pass:ci/token"))))))
 
 (def outcome-gen
   (gen/one-of [(gen/fmap (fn [[p f]] {:exit (if (pos? f) 1 0) :passed p :failed f})

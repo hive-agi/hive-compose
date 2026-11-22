@@ -1,5 +1,5 @@
 (ns hive-compose.schema
-  "Value objects: Profile, Active entry, Settings, Release step; and for
+  "Value objects: Profile, Active entry, Settings, Release step, CaseOutcome; and for
    stacks Provide, Need, Stack, Instance, Resolution, Wiring, Suite, RunId with
    the pure Docker name builders slug, view-network and private-project."
   (:require [clojure.string :as str]
@@ -197,6 +197,38 @@
   [provider-project consumer run]
   (str provider-project "-" (slug consumer) "-" run))
 
+;; ---------------------------------------------------------------------------
+;; Resource caps (hc-16a). A cap bounds one instance's containers (compose
+;; mem_limit / cpus); the stack plan sums the capped memory of its instances
+;; and refuses a run over a budget or over the host's MemAvailable minus
+;; :compose/host-reserve. Precedence, high to low, per key: the stack's
+;; :stack/resources for the capability, the consumers' Need :resources (a
+;; shared instance takes the largest), the Provide's :resources,
+;; :compose/default-resources. :unbounded at the winning level opts out: no
+;; cap is written and the instance is left out of the sum (listed under
+;; :budget/uncapped). Interpreted only by hive-compose.promote.resources.
+
+(def MemSize
+  "Memory as bytes (a positive int) or docker's notation: digits with an
+   optional k|m|g|t unit (binary, case-insensitive, optional trailing b):
+   \"512m\", \"2g\", \"1536M\", \"64kb\"."
+  [:or [:int {:min 1}] [:re #"^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z"]])
+
+(def Caps
+  "Caps on one instance's containers. `:mem` its compose mem_limit, `:cpus`
+   its compose cpus (fraction of cores), `:jvm?` true injects
+   JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75 (merged per flag, the consumer's
+   own flags win); a java image (openjdk, temurin, corretto, clojure ..) is
+   detected without it, and `:jvm? false` turns the detection off."
+  [:map {:closed true}
+   [:mem {:optional true} MemSize]
+   [:cpus {:optional true} [:and number? [:> 0]]]
+   [:jvm? {:optional true} :boolean]])
+
+(def Resources
+  "Caps, or :unbounded (explicit opt-out: no cap, not summed)."
+  [:or [:= :unbounded] Caps])
+
 (def Provide
   "One capability a project offers. `:service` is the compose service that
    answers it (its depends_on closure comes along). `:env` is what a consumer
@@ -214,6 +246,7 @@
    [:env {:optional true} Env]
    [:tenancy {:optional true} [:map [:env [:string {:min 1}]]]]
    [:port {:optional true} [:int {:min 1 :max 65535}]]
+   [:resources {:optional true} Resources]
    [:description {:optional true} :string]])
 
 (def Need
@@ -223,13 +256,18 @@
    `:provider` pins a project id when several provide the capability.
    `:services` narrows which of the consumer's services get the wiring (all
    by default). `:via` interposes a capability between consumer and instance
-   (e.g. :toxiproxy, hc-12); config gives it as a string or keyword."
+   (e.g. :toxiproxy, hc-12); config gives it as a string or keyword.
+   `:resources` overrides the Provide's caps on the instance answering it; a
+   shared instance takes, per key, the largest cap its consumers would have
+   had alone (a consumer with no cap has no opinion); one consumer's explicit
+   :unbounded unbounds it."
   [:map
    [:version {:optional true} VersionRange]
    [:share? {:optional true} :boolean]
    [:provider {:optional true} [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z"]]
    [:services {:optional true} [:vector [:string {:min 1}]]]
-   [:via {:optional true} :keyword]])
+   [:via {:optional true} :keyword]
+   [:resources {:optional true} Resources]])
 
 (def Provides [:map-of CapabilityId Provide])
 
@@ -237,11 +275,19 @@
 
 (def Stack
   "A named set of consumers brought up together with every capability they
-   need. `:stack/needs` adds needs of the stack itself (e.g. otel)."
+   need. `:stack/needs` adds needs of the stack itself (e.g. otel).
+   `:stack/resources` overrides caps per capability for this stack, above
+   every other level. `:stack/budget` bounds this stack's capped memory
+   (besides :compose/budget). `:stack/priority` orders the reaper's pressure
+   guard: under memory pressure the idle unclaimed stack with the LOWEST
+   priority is stopped first (default 0)."
   [:map
    [:stack/id [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z"]]
    [:stack/consumers [:vector {:min 1} ConsumerId]]
    [:stack/needs {:optional true} Needs]
+   [:stack/resources {:optional true} [:map-of CapabilityId Resources]]
+   [:stack/budget {:optional true} MemSize]
+   [:stack/priority {:optional true} :int]
    [:stack/description {:optional true} :string]])
 
 (def ComposeProjectName
@@ -427,6 +473,9 @@
     [:suite/reports-dir {:optional true} [:string {:min 1}]]
     [:suite/report-format {:optional true} ReportFormat]
     [:suite/timeout-ms {:optional true} [:int {:min 1000}]]
+    ;; how long a container suite's missing image may take to pull (default 10 min)
+    [:suite/pull-timeout-ms {:optional true} [:int {:min 1000}]]
+    [:suite/resources {:optional true} Resources]
     [:suite/description {:optional true} :string]]
    [:fn {:error/message "a suite needs :suite/image or :suite/command"}
     (fn [s] (or (contains? s :suite/image) (contains? s :suite/command)))]])
@@ -458,6 +507,42 @@
    [:project/provides {:optional true} Provides]
    [:project/needs {:optional true} Needs]])
 
+(def CaseStatus
+  "How one test case ended in one run, as JUnit XML and TAP report it."
+  [:enum :passed :failed :error :skipped])
+
+(def CaseOutcome
+  "One row of flake history: how case `:case/id` of suite `:suite/id` ended in
+   run `:run/id` against `:project`, recorded at `:at` (epoch ms). `:run/sha`,
+   when the runner knows the commit under test, lets a regression name the
+   first failing commit.
+
+   A minimal local shape of what hc-8's run result carries (its Report cases,
+   ids `<suite>/<classname>.<name>`), so this layer can be reconciled with it
+   later without depending on it."
+  [:map
+   [:run/id RunId]
+   [:suite/id [:string {:min 1}]]
+   [:project {:optional true} [:string {:min 1}]]
+   [:case/id [:string {:min 1}]]
+   [:case/status CaseStatus]
+   [:case/time-s {:optional true} [:maybe number?]]
+   [:at :int]
+   [:run/sha {:optional true} [:string {:min 1}]]])
+
+(def FlakyConfig
+  "Thresholds of `hive-compose.promote.flaky`, every key optional (defaults in
+   `flaky/defaults`). `:window` is how many of a case's latest runs are
+   judged, `:min-runs` how many it needs before it is called anything but
+   :stable, `:flip-rate` the share of status changes between consecutive runs
+   of the window at or above which it is :flaky, and `:streak` how many
+   consecutive fails (passes) closing the window make a :regression (a :fixed)."
+  [:map
+   [:window {:optional true} [:int {:min 2}]]
+   [:min-runs {:optional true} [:int {:min 1}]]
+   [:flip-rate {:optional true} [:and number? [:>= 0] [:<= 1]]]
+   [:streak {:optional true} [:int {:min 1}]]])
+
 (def Settings
   [:map
    [:compose/projects [:map-of :string Project]]
@@ -478,8 +563,54 @@
    [:compose/claim-ttl-minutes [:int {:min 1}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
    [:compose/program-grace-ms {:optional true} [:int {:min 0}]]
+   [:compose/history-file {:optional true} [:string {:min 1}]]
+   [:compose/flaky {:optional true} FlakyConfig]
    [:compose/stacks {:optional true} [:map-of :string Stack]]
-   [:compose/suites {:optional true} [:map-of :string Suite]]])
+   [:compose/suites {:optional true} [:map-of :string Suite]]
+   [:compose/default-resources {:optional true} Resources]
+   [:compose/budget {:optional true} MemSize]
+   [:compose/host-reserve {:optional true} MemSize]])
+
+(def InstanceCaps
+  "The caps the stack plan resolved for one instance: `:mem` in bytes and
+   `:cpus` (each absent when no level sets it), `:jvm?` whether
+   JAVA_TOOL_OPTIONS is injected (absent: detected from the image),
+   `:unbounded?` the explicit opt-out, and `:source` the level the memory cap
+   came from."
+  [:map
+   [:mem {:optional true} [:int {:min 1}]]
+   [:cpus {:optional true} [:and number? [:> 0]]]
+   [:jvm? {:optional true} :boolean]
+   [:unbounded? :boolean]
+   [:source [:enum :stack :need :provide :default :none]]])
+
+(def Budget
+  "What the stack plan sums: the caps of each instance, the total capped
+   memory (a shared instance counted once), what one private copy per
+   consumer would have summed, the difference sharing saved, and the
+   instances left out of the sum (unbounded or without a mem cap)."
+  [:map
+   [:budget/instances [:map-of :string InstanceCaps]]
+   [:budget/total-mem [:int {:min 0}]]
+   [:budget/unshared-mem [:int {:min 0}]]
+   [:budget/saved-mem [:int {:min 0}]]
+   [:budget/uncapped [:vector :string]]])
+
+(def OverBudget
+  "The data of the Result error :compose/over-budget. `:basis` names the
+   limit that refused: :stack (:stack/budget), :budget (:compose/budget) or
+   :host (MemAvailable minus :compose/host-reserve, both then given). `:limit`
+   is that limit in bytes, `:total-mem` the plan's capped sum, `:over` their
+   difference; `:instances` each capped instance by memory, largest first."
+  [:map
+   [:basis [:enum :stack :budget :host]]
+   [:limit [:int {:min 0}]]
+   [:total-mem [:int {:min 0}]]
+   [:over [:int {:min 1}]]
+   [:available {:optional true} [:int {:min 0}]]
+   [:reserve {:optional true} [:int {:min 0}]]
+   [:instances [:vector [:map [:instance :string] [:mem [:int {:min 0}]]]]]
+   [:message :string]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."

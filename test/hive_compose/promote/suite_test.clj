@@ -6,6 +6,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [hive-compose.adapter.suite-runner :as suite-runner]
             [hive-compose.promote.otel :as otel]
             [hive-compose.promote.suite :as suite]
             [hive-compose.schema :as schema]
@@ -267,7 +268,7 @@
                                                  :wiring-env {"OTEL_RESOURCE_ATTRIBUTES" "team=core"})
                                             {:suite/id "load" :project "web"})))
           attrs (otel/parse-resource-attributes (env "OTEL_RESOURCE_ATTRIBUTES"))]
-      (is (= {"team" "core" "hive.run.id" "r01" "service.name" "k6"} attrs))))
+      (is (= {"team" "core" "hive.run.id" "r01" "service.name" "k6" "hive.test.id" "load/web"} attrs))))
   (testing "a suite may name its own service.name; hive.* stays ours"
     (let [s (assoc-in suites ["smoke" :suite/env "OTEL_RESOURCE_ATTRIBUTES"] "service.name=mine,hive.test.id=x")
           attrs (otel/parse-resource-attributes
@@ -281,14 +282,14 @@
                                       {:suite/id "load" :project "web"}))))))
 
 (deftest with-the-real-otlp-env
-  (let [spec (:ok (suite/runner-spec (ctx :otlp-env otel/otlp-env) {:suite/id "smoke" :project "billing/api"}))
+  (let [spec (:ok (suite/runner-spec (ctx :otlp-env otel/otlp-env) {:suite/id "smoke" :project "billing.api"}))
         env (:env spec)
         attrs (otel/parse-resource-attributes (env "OTEL_RESOURCE_ATTRIBUTES"))]
     (is (nil? (m/explain suite/RunnerSpec spec)))
     (is (= (otel/endpoint :container :grpc) (env "OTEL_EXPORTER_OTLP_ENDPOINT")))
     (is (= "suite-smoke" (env "OTEL_SERVICE_NAME")))
-    (is (= {"hive.run.id" "r01" "service.name" "suite-smoke" "hive.test.id" "smoke/billing/api"} attrs))
-    (is (= "test.id=smoke%2Fbilling%2Fapi" (env "BAGGAGE")))
+    (is (= {"hive.run.id" "r01" "service.name" "suite-smoke" "hive.test.id" "smoke/billing.api"} attrs))
+    (is (= "test.id=smoke%2Fbilling.api" (env "BAGGAGE")))
     (is (= "hive-r01-billing-api" (:network spec))))
   (is (= (otel/endpoint :host :grpc)
          (get-in (:ok (suite/runner-spec (ctx :otlp-env otel/otlp-env) {:suite/id "api" :project "shop"}))
@@ -304,6 +305,65 @@
                  (fn [n] (apply str (repeat (* 2 n) "A"))) (fn [_] (throw (ex-info "entropy gone" {})))]]
       (is (= :compose/invalid-trace-id
              (:error (suite/runner-spec (ctx :id-source src) {:suite/id "load" :project "web"})))))))
+
+(deftest path-traversal-is-refused
+  (doseq [bad [".." "." "a/../b" "/abs" "a:b" "a b" "" "-x" "billing/api"]]
+    (is (= :compose/invalid-param (:error (suite/runner-spec (ctx) {:suite/id "smoke" :project bad})))
+        (str "project " (pr-str bad)))
+    (is (= :compose/invalid-param (:error (suite/runner-spec (ctx :suites (assoc suites bad (get suites "smoke")))
+                                                             {:suite/id bad :project "shop"})))
+        (str "suite " (pr-str bad))))
+  (testing "a command's reports dir never leaves :suite/dir"
+    (doseq [bad ["/tmp/x" "../x" "out/../../x"]]
+      (is (= :compose/invalid-param
+             (:error (suite/runner-spec (ctx :suites (assoc-in suites ["api" :suite/reports-dir] bad))
+                                        {:suite/id "api" :project "shop"})))
+          bad))
+    (is (= :compose/invalid-param
+           (:error (suite/runner-spec (ctx :suites (update suites "api" dissoc :suite/dir))
+                                      {:suite/id "api" :project "shop"})))
+        "a relative reports dir with no :suite/dir to be relative to")))
+
+(def gen-unsafe-part
+  (gen/one-of [(gen/elements [".." "." "..." "a/../b" "/abs" "a:b" "" "/" "a/b" "c:\\x"])
+               (gen/fmap (fn [[a b]] (str a "/" b)) (gen/tuple gen/string-alphanumeric gen/string-alphanumeric))
+               (gen/fmap #(str % ":") gen/string-alphanumeric)
+               (gen/fmap #(str "../" %) gen/string-alphanumeric)]))
+
+(defspec unsafe-ids-never-become-paths 200
+  (prop/for-all [bad gen-unsafe-part]
+    (and (= :compose/invalid-param (:error (suite/runner-spec (ctx) {:suite/id "smoke" :project bad})))
+         (= :compose/invalid-param (:error (suite/runner-spec (ctx :suites {bad (get suites "smoke")})
+                                                              {:suite/id bad :project "shop"}))))))
+
+(deftest resources-reach-the-spec-and-the-container-argv
+  (let [capped (assoc-in suites ["smoke" :suite/resources] {:mem "256m" :cpus 0.5})
+        spec (:ok (suite/runner-spec (ctx :suites capped) {:suite/id "smoke" :project "shop"}))
+        cs (#'suite-runner/caps spec)
+        argv (suite-runner/create-argv spec cs)]
+    (is (= {:mem (* 256 1024 1024) :cpus 0.5} cs) "the adapter reads the spec's :resources")
+    (is (nil? (m/explain suite/RunnerSpec spec)))
+    (is (= {:mem "256m" :cpus 0.5} (:resources spec)))
+    (is (some #{"--memory"} argv) (pr-str argv))
+    (is (some #{"--cpus"} argv) (pr-str argv)))
+  (testing ":compose/default-resources is the fallback, a suite's own caps win, :unbounded passes through"
+    (is (= {:mem "1g"} (:resources (:ok (suite/runner-spec (ctx :default-resources {:mem "1g"})
+                                                            {:suite/id "api" :project "shop"})))))
+    (is (= :unbounded (:resources (:ok (suite/runner-spec (ctx :suites (assoc-in suites ["api" :suite/resources] :unbounded)
+                                                               :default-resources {:mem "1g"})
+                                                          {:suite/id "api" :project "shop"})))))
+    (is (not (contains? (:ok (suite/runner-spec (ctx) {:suite/id "api" :project "shop"})) :resources)))))
+
+(deftest slug-alike-cells-get-distinct-container-names
+  (is (not= (suite/container-name "r01" "smoke" "a.b") (suite/container-name "r01" "smoke" "a-b")))
+  (is (str/starts-with? (suite/container-name "r01" "smoke" "a.b") "hive-r01-smoke-a-b-")))
+
+(deftest test-id-is-forced-without-otlp
+  (let [s (assoc-in suites ["load" :suite/env] {"OTEL_RESOURCE_ATTRIBUTES" "hive.test.id=x"})
+        attrs (otel/parse-resource-attributes
+               (get-in (:ok (suite/runner-spec (ctx :suites s :otlp-env nil) {:suite/id "load" :project "web"}))
+                       [:env "OTEL_RESOURCE_ATTRIBUTES"]))]
+    (is (= "load/web" (attrs "hive.test.id")))))
 
 (def traceparent-re #"^00-[0-9a-f]{32}-[0-9a-f]{16}-01\z")
 
@@ -324,7 +384,7 @@
 
 (defspec runner-env-is-always-correlated 200
   (prop/for-all [sid gen-id-part
-                 project (gen/one-of [gen-id-part (gen/elements ["billing/api" "ünï" "a b" "x=y;z,w"])])
+                 project (gen/one-of [gen-id-part (gen/elements ["billing.api" "a_b" "x-y.z" "9"])])
                  run (gen/fmap #(apply str %) (gen/vector (gen/elements (seq "abc0123456789")) 3 12))
                  src gen-hex-source
                  image? gen/boolean
@@ -399,6 +459,22 @@
       (is (string? (:project res)))
       (is (every? #(and (string? (:case/id %)) (keyword? (:case/status %)))
                   (get-in res [:report :report/cases]))))))
+
+(deftest an-oom-finding-reaches-the-cell-result
+  (let [f {:oom/service "smoke/shop" :oom/source :container :oom/cap 268435456 :oom/exit 137
+           :oom/line "smoke/shop OOM-killed at 256m"}
+        out (suite/runner-outcome {:exit 137 :started-at 10 :finished-at 30 :timed-out? false :oom f}
+                                  (r/err :report/none {:dir "/x"}))
+        res (suite/cell-result "r01" cell out)]
+    (is (= f (:oom res)))
+    (is (= :error (:status res)))
+    (is (= 20 (:duration-ms res)))
+    (is (= "smoke/shop OOM-killed at 256m" (get-in (suite/matrix-summary [res]) [:failures 0 :oom/line]))))
+  (testing "no finding, no :oom; a timed-out runner has no exit"
+    (let [res (suite/cell-result "r01" cell (suite/runner-outcome {:exit 1 :timed-out? true} (r/err :report/none {})))]
+      (is (not (contains? res :oom)))
+      (is (nil? (:exit res)))
+      (is (not (contains? (first (:failures (suite/matrix-summary [res]))) :oom/line))))))
 
 (def gen-status (gen/elements [:passed :failed :error :skipped]))
 (def gen-exit (gen/one-of [(gen/return 0) (gen/return nil) (gen/choose -1 255)]))

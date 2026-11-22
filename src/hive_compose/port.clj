@@ -139,6 +139,13 @@
   (-health [q]
     "Result<{:ready? true}>: the trace store answers, or why it does not."))
 
+(defprotocol IHostMemory
+  "The host's memory, so a stack plan can be admitted against what is free
+   and the reaper can relieve pressure (hc-16a). Stubbed in tests."
+  (-mem-available [m]
+    "Result<long>: MemAvailable in bytes (Linux /proc/meminfo), or why it
+     cannot be read. Never a throw."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
@@ -149,6 +156,52 @@
     "Result<{:volumes #{name} :ports #{port}}>: the docker volumes (their real
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
+
+(defprotocol IServiceImages
+  "Optional engine capability: what services of a project run, so a stack
+   can tell a JVM image and keep its own JVM flags (hc-16a). An engine
+   without it is treated as knowing nothing: only `:jvm? true` injects."
+  (-service-facts [e profile services]
+    "Result<{service {:image string :java-tool-options string? :mem-limit
+     MemSize?}}>: the image each of `services` runs, the JAVA_TOOL_OPTIONS
+     and the memory limit its compose file sets."))
+
+(defprotocol IFlakeHistory
+  "Append-only history of test case outcomes across runs (CaseOutcome rows,
+   see `hive-compose.schema`), read by `hive-compose.promote.flaky`."
+  (-append! [h rows]
+    "Result<{:appended n}>: add `rows` to the history. Rows are never
+     rewritten or removed; appending a run again adds its rows again (the
+     reader keeps one per run). Empty `rows` is a no-op.")
+  (-history [h query]
+    "Result<[row]>: every row recorded, in append order, narrowed by `query`
+     {:suite s :project p} (a nil or absent key matches any). An absent
+     history is []."))
+
+(defprotocol ISuiteRunner
+  "Runs one suite runner to its end under its resource caps (hc-16b): a host
+   command inside a memory-capped systemd user scope (ulimit -v when no user
+   manager answers), a container with docker's memory and cpu flags. See
+   `hive-compose.promote.oom` for the data.
+
+   A value of `:env` may be a secret reference, read only here, at spawn.
+   Every answer, ok or error, carries `:scrub` (fn [text]) -> text: the text
+   with every value the runner resolved from a reference replaced by that
+   reference's rendering. The caller passes every text it reads afterwards
+   (the reports) through it; a runner that resolved references and answers
+   no :scrub has its reports' free text redacted."
+  (-run! [r spec]
+    "Result<{:exit n-or-nil :started-at ms :finished-at ms :output [line]
+     :timed-out? bool :cap {:mode :systemd|:ulimit|:docker|:none :mem bytes?
+     :cpus n? :note s?} :oom Finding? :scrub fn}>: run `spec` (a runner spec,
+     see `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
+     :command, :dir, :env, :timeout-ms, :pull-timeout-ms, :test-id,
+     :reports-dir (created before the runner starts), :image, :name, :mounts,
+     :network, :extra-networks, :labels, plus :resources {:mem bytes :cpus n})
+     and wait for its end. A runner that exits non-zero, is OOM-killed or
+     times out is an ok answer; an error (carrying :exit nil and :scrub) only
+     when it could not be started at all: a secret that cannot be read, no
+     docker, a pull that fails or times out."))
 
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
@@ -192,6 +245,27 @@
   (-networks-labelled [e labels]
     "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
 
+(defprotocol IDataExec
+  "Optional engine capability: run a data command (migrate, seed, reset)
+   inside a running container of a stack instance (hc-9). Never removes a
+   container or a volume."
+  (-exec! [e target argv opts]
+    "Result<{:exit 0 :out}>: `docker exec` of `argv` in the running container of
+     `target` ({:project compose-project :service svc}), with `opts` {:env
+     {VAR EnvValue} :timeout-ms n}; secret references in :env are read only
+     now. A non-zero exit is :compose/command-failed carrying :exit and
+     :stderr; no running container is :compose/no-container."))
+
+(defprotocol ICommandRunner
+  "Optional runner capability: run a host command to completion (hc-9 data
+   commands declared as `:command`), unlike `IProgramRunner/-start!`, which
+   detaches a long-lived program."
+  (-run-command! [r argv opts]
+    "Result<{:exit 0 :out}>: run `argv` with `opts` {:dir path :env {VAR
+     EnvValue} :timeout-ms n} and wait for it; secret references in :env are
+     read only now. A non-zero exit is :compose/command-failed carrying :exit
+     and :stderr."))
+
 (defprotocol IToxiproxyClient
   "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is
    {:name :listen :upstream :enabled :toxics [toxic]}, a toxic {\"name\"
@@ -212,30 +286,3 @@
     "Result<{:reset true}>: remove every toxic and enable every proxy.")
   (-list [c]
     "Result<{name Proxy}>: every proxy with its toxics."))
-
-(defprotocol ISuiteRunner
-  "Runs one suite x project cell (hc-8) to the end. A RunnerSpec is what
-   `hive-compose.promote.suite/runner-spec` answers: the runner, its env (a
-   value may be a secret reference, read only here, at spawn), the host
-   `:reports-dir` (created by the runner before it starts) and, for a
-   container, image, name, mounts, network, `:extra-networks` and labels.
-
-   Every answer, ok or error, carries `:scrub` (fn [text]) -> text: the
-   text with every value the runner resolved from a secret reference
-   replaced by that reference's rendering. The caller passes every text it
-   reads afterwards (the reports) through it; a runner that resolved
-   references and answers no :scrub has its reports' free text redacted.
-
-   A test that fails is no runner error: a non-zero exit is an answer. The
-   error is for a runner that could not start or was cut off (a secret that
-   cannot be read, no docker, a pull or run timeout), and it carries what is
-   known (:exit nil, :log-tail)."
-  (-run-container! [r spec]
-    "Result<{:exit n :started-ms :ended-ms :log-tail [line] :scrub fn}>: run
-     the container of `spec` once, its image pulled first when absent, on its
-     network(s), its reports directory mounted, labelled; it is removed
-     afterwards.")
-  (-run-command! [r spec]
-    "Result<{:exit n :started-ms :ended-ms :log-tail [line] :scrub fn}>: run
-     the host command of `spec` in `:dir` with `:env`, bounded by
-     `:timeout-ms`."))
