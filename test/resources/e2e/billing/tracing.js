@@ -27,7 +27,8 @@ function env(name) {
   return v === undefined || v.trim() === '' ? undefined : v.trim();
 }
 
-// Copies baggage member test.id (and env HIVE_RUN_ID) onto every span at start.
+// Copies baggage member test.id onto every span at start, as test.id and
+// hive.test.id (the hive-compose otel capability's name), plus env HIVE_RUN_ID.
 class TestIdSpanProcessor {
   constructor(runId) {
     this.runId = runId;
@@ -35,7 +36,10 @@ class TestIdSpanProcessor {
   onStart(span, parentContext) {
     const bag = parentContext && propagation.getBaggage(parentContext);
     const entry = bag && bag.getEntry('test.id');
-    if (entry && entry.value) span.setAttribute('test.id', entry.value);
+    if (entry && entry.value) {
+      span.setAttribute('test.id', entry.value);
+      span.setAttribute('hive.test.id', entry.value);
+    }
     if (this.runId) span.setAttribute('hive.run.id', this.runId);
   }
   onEnd() {}

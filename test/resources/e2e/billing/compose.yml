@@ -12,7 +12,7 @@ services:
     build: .
     image: hive-compose-e2e/billing:dev
     ports:
-      - "${BILLING_PORT:-18081}:8080"
+      - "${BILLING_PORT:-0}:8080"
     environment:
       # Passed through from the host only when set there.
       - KAFKA_BOOTSTRAP
@@ -32,10 +32,3 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
-    networks:
-      - e2e
-
-networks:
-  e2e:
-    name: ${HIVE_NETWORK:-hive-e2e}
-    external: true

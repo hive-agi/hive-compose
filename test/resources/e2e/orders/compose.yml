@@ -5,7 +5,7 @@ services:
     build: .
     image: hive-compose-e2e/orders:dev
     ports:
-      - "${ORDERS_PORT:-18080}:8080"
+      - "${ORDERS_PORT:-0}:8080"
     expose:
       - "8080"
     environment:
@@ -15,16 +15,12 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-orders}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+    stop_grace_period: 15s
     healthcheck:
       test: ["CMD", "/orders", "-healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 5s
-    networks:
-      - hive
-
-networks:
-  hive:
-    name: ${HIVE_NETWORK:-hive-e2e}
-    external: true

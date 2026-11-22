@@ -70,7 +70,7 @@ function handleMessage({ topic, partition, message }) {
         'messaging.consumer.group.name': GROUP_ID,
         'messaging.destination.partition.id': String(partition),
         'messaging.kafka.offset': Number(message.offset),
-        ...(testId ? { 'test.id': testId } : {}),
+        ...(testId ? { 'test.id': testId, 'hive.test.id': testId } : {}),
       },
     },
     parentCtx,

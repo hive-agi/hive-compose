@@ -22,8 +22,8 @@ XML or TAP reports.
   That is the deliberate failure `compose why` has to find.
 * **billing** consumes `${TOPIC_PREFIX}orders`, continues the producer's trace
   per message, and serves `GET /invoices` and `GET /healthz`.
-* Both copy the baggage member `test.id` onto every span as the attribute
-  `test.id` (and `HIVE_RUN_ID`, when set, as `hive.run.id`).
+* Both copy the baggage member `test.id` onto every span as the attributes
+  `test.id` and `hive.test.id` (and `HIVE_RUN_ID`, when set, as `hive.run.id`).
 
 Every project reads its wiring from the environment, nothing is hardcoded:
 
@@ -33,8 +33,18 @@ Every project reads its wiring from the environment, nothing is hardcoded:
 | `TOPIC_PREFIX` | tenancy prefix so consumers of a shared Kafka do not cross-talk |
 | `HIVE_RUN_ID` | the stack run id |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | standard OTel SDK config |
-| `HIVE_NETWORK` | docker network the run's containers share (default `hive-e2e`, external) |
-| `KAFKA_ALIAS` | (kafka only) network alias and advertised host of that instance |
+
+No compose file names a network. hive-compose attaches each consumer to its
+run's view network (and adds its labels) with its own override file. By hand,
+`hive-network.yml` puts a project's default network on the shared external
+network `${HIVE_NETWORK:-hive-e2e}`.
+
+Isolation is by network, not by alias: compose always gives a service its
+service name as a DNS alias, so two `kafka` (or `billing`) instances on one
+network would both answer to that name. A private instance and its consumer
+therefore get their own network, and only `otel` is attached to every one.
+Host ports default to ephemeral (`ORDERS_PORT`/`BILLING_PORT` opt in), so
+any number of instances run side by side.
 
 ## The scenario
 
@@ -63,7 +73,7 @@ Declared as capabilities (sketch, hc-2 schema):
    isolates runs on the shared broker, not producer from consumer).
 2. C (`billing` again, under another compose project name) says
    `:share? false` and gets a **private** Kafka: `-p kafka-<consumer>-<run>`
-   with its own `KAFKA_ALIAS`, so it never sees A's orders.
+   on its own network, so it never sees A's orders.
 3. `orders-suite` runs with `TRACEPARENT` and `BAGGAGE` set; per case it sends
    a fresh `traceparent` in that trace and `baggage: test.id=<case>`. It
    writes `junit.xml` (or `results.tap`) to `/reports`: case
@@ -79,19 +89,26 @@ cd test/resources/e2e
 docker network create hive-e2e
 docker run -d --name lgtm --network hive-e2e -p 3000:3000 grafana/otel-lgtm:0.11.10
 
-docker compose -p kafka -f kafka/compose.yml up -d --wait
+N="-f hive-network.yml"
+docker compose -p kafka -f kafka/compose.yml $N up -d --wait
 
 export KAFKA_BOOTSTRAP=kafka:9092 TOPIC_PREFIX=run1. HIVE_RUN_ID=run1
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://lgtm:4318 OTEL_RESOURCE_ATTRIBUTES=hive.run.id=run1
-docker compose -p orders  -f orders/compose.yml  up -d --build --wait
-docker compose -p billing -f billing/compose.yml up -d --build --wait
+docker compose -p orders  -f orders/compose.yml  $N up -d --build --wait
+docker compose -p billing -f billing/compose.yml $N up -d --build --wait
 
-REPORTS_DIR=$PWD/reports docker compose -p suite -f suite/compose.yml run --rm suite   # exits 1
-REPORTS_DIR=$PWD/reports docker compose -p suite -f suite/compose.yml --profile tap run --rm suite-tap
+REPORTS_DIR=$PWD/reports docker compose -p suite -f suite/compose.yml $N run --rm suite   # exits 1
+REPORTS_DIR=$PWD/reports docker compose -p suite -f suite/compose.yml $N --profile tap run --rm suite-tap
+
+# project C: billing again, with its own private Kafka on its own network
+docker network create hive-e2e-c && docker network connect hive-e2e-c lgtm
+HIVE_NETWORK=hive-e2e-c docker compose -p kafka-c -f kafka/compose.yml $N up -d --wait
+HIVE_NETWORK=hive-e2e-c OTEL_SERVICE_NAME=billing-c \
+  docker compose -p billing-c -f billing/compose.yml $N up -d --wait   # GET /invoices stays []
 ```
 
 Then Grafana (`localhost:3000`, Explore, Tempo) answers
-`{span.test.id="orders.place_boom_order" && status=error}`.
+`{span.hive.test.id="orders.place_boom_order" && status=error}`.
 
 Tear down with `docker compose -p <name> -f <dir>/compose.yml down` per project,
 `docker rm -f lgtm` and `docker network rm hive-e2e`.

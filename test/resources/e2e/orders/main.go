@@ -45,13 +45,15 @@ func port() string {
 	return "8080"
 }
 
-// attrProcessor copies baggage member test.id and env HIVE_RUN_ID onto every
-// span at start.
+// attrProcessor copies baggage member test.id onto every span at start, as
+// test.id and hive.test.id (the hive-compose otel capability's name), plus
+// env HIVE_RUN_ID as hive.run.id.
 type attrProcessor struct{ runID string }
 
 func (p attrProcessor) OnStart(ctx context.Context, s sdktrace.ReadWriteSpan) {
 	if m := baggage.FromContext(ctx).Member("test.id"); m.Value() != "" {
-		s.SetAttributes(attribute.String("test.id", m.Value()))
+		s.SetAttributes(attribute.String("test.id", m.Value()),
+			attribute.String("hive.test.id", m.Value()))
 	}
 	if p.runID != "" {
 		s.SetAttributes(attribute.String("hive.run.id", p.runID))
@@ -69,7 +71,9 @@ func initTracing(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		resource.WithFromEnv(), // OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES
 		resource.WithTelemetrySDK(),
 	)
-	if err != nil {
+	if errors.Is(err, resource.ErrPartialResource) {
+		log.Printf("resource: %v (continuing with the attributes that parsed)", err)
+	} else if err != nil {
 		return nil, err
 	}
 	opts := []sdktrace.TracerProviderOption{
@@ -120,6 +124,24 @@ func (c headerCarrier) Keys() []string {
 	return ks
 }
 
+// retriable reports the errors a write to a topic that is still being
+// auto-created answers with, also when wrapped in a batch's WriteErrors.
+func retriable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var we kafka.WriteErrors
+	if errors.As(err, &we) {
+		for _, e := range we {
+			if e != nil && !retriable(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, kafka.UnknownTopicOrPartition) || errors.Is(err, kafka.LeaderNotAvailable)
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -139,8 +161,9 @@ func (s *server) orders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	span := trace.SpanFromContext(ctx)
 
+	forced := r.Header.Get("X-Fail") == "1"
 	var o Order
-	if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&o); err != nil && !forced {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "bad request")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid order json"})
@@ -152,12 +175,20 @@ func (s *server) orders(w http.ResponseWriter, r *http.Request) {
 		attribute.Int("order.qty", o.Qty),
 	)
 
-	if r.Header.Get("X-Fail") == "1" || o.SKU == "boom" {
+	// The rejection is recorded on its own child span: otelhttp overwrites the
+	// server span's status with (Error, "") for a 5xx once the handler returns,
+	// which would erase the message `why` looks for.
+	_, vspan := s.tracer.Start(ctx, "orders validate")
+	if forced || o.SKU == "boom" {
+		vspan.RecordError(errors.New(failMsg))
+		vspan.SetStatus(codes.Error, failMsg)
+		vspan.End()
 		span.RecordError(errors.New(failMsg))
 		span.SetStatus(codes.Error, failMsg)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": failMsg})
 		return
 	}
+	vspan.End()
 
 	body, _ := json.Marshal(o)
 	pctx, pspan := s.tracer.Start(ctx, s.writer.Topic+" publish",
@@ -176,7 +207,7 @@ func (s *server) orders(w http.ResponseWriter, r *http.Request) {
 	// The first write to a fresh topic races its auto-creation; the broker
 	// answers UnknownTopicOrPartition until the leader is elected. Retry that
 	// one error for a bounded time, then give up.
-	for i := 0; i < 20 && errors.Is(err, kafka.UnknownTopicOrPartition) && wctx.Err() == nil; i++ {
+	for i := 0; i < 20 && retriable(err) && wctx.Err() == nil; i++ {
 		time.Sleep(250 * time.Millisecond)
 		err = s.writer.WriteMessages(wctx, msg)
 	}

@@ -2,11 +2,13 @@
 # The compose project name comes from `docker compose -p <name>`, so the same
 # file serves the shared instance (-p kafka) and a private one
 # (-p kafka-<consumer>-<run>). Nothing here is fixed to one instance:
-# no container_name, no host port unless KAFKA_PORT is set by the caller.
+# no container_name, no host port.
 #
-# Consumers reach the broker as `${KAFKA_ALIAS:-kafka}:9092` on the network
-# ${HIVE_NETWORK:-hive-e2e}; a private instance gets its own alias (and
-# usually its own network) so it never answers for the shared one.
+# Consumers reach the broker as `kafka:9092`. The file names no
+# network: hive-compose attaches the run's network (and labels) through its own
+# override; by hand use ../hive-network.yml. A private instance lives on its
+# own network: compose aliases every service by its name, so two brokers on
+# one network would both answer to `kafka`.
 
 services:
   kafka:
@@ -15,7 +17,7 @@ services:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${KAFKA_ALIAS:-kafka}:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
@@ -32,11 +34,3 @@ services:
       timeout: 10s
       retries: 24
       start_period: 10s
-    networks:
-      e2e:
-        aliases: ["${KAFKA_ALIAS:-kafka}"]
-
-networks:
-  e2e:
-    name: ${HIVE_NETWORK:-hive-e2e}
-    external: true

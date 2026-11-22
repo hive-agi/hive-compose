@@ -21,7 +21,6 @@ services:
       REPORT_FORMAT: junit
     volumes:
       - ${REPORTS_DIR:-./reports}:/reports
-    networks: [e2e]
 
   suite-tap:
     build: .
@@ -32,9 +31,3 @@ services:
       REPORT_FORMAT: tap
     volumes:
       - ${REPORTS_DIR:-./reports}:/reports
-    networks: [e2e]
-
-networks:
-  e2e:
-    name: ${HIVE_NETWORK:-hive-e2e}
-    external: true
