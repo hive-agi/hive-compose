@@ -8,6 +8,7 @@
    entities (XXE) nor entity expansion (billion laughs) can happen, and loads
    no external DTD or schema."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [hive-compose.promote.report :as report]
             [hive-dsl.result :as r])
   (:import (java.io StringReader)
@@ -62,7 +63,8 @@
     (report/malformed :xml/not-text)
     (let [res (r/try-effect* :report/malformed
                 (let [builder (doto (.newDocumentBuilder (factory)) (.setErrorHandler quiet))]
-                  (element->tree (.getDocumentElement (.parse builder (InputSource. (StringReader. s)))))))]
+                  (element->tree (.getDocumentElement
+                                  (.parse builder (InputSource. (StringReader. (str/replace-first s #"^\uFEFF" ""))))))))]
       (if (r/err? res)
         (report/malformed :xml/unparseable :message (:message res))
         res))))
@@ -72,6 +74,10 @@
   [s]
   (r/let-ok [tree (xml-tree s)]
     (report/from-junit-tree tree)))
+
+(def max-bytes
+  "Largest report file read, 64 MiB."
+  (* 64 1024 1024))
 
 (def formats
   "What a suite may declare as its report format (:suite/report-format)."
@@ -102,21 +108,38 @@
    the file named in an error."
   ([path] (read-report path :auto))
   ([path format]
-   (r/let-ok [text (r/try-effect* :report/unreadable (slurp (io/file path)))]
+   (r/let-ok [text (r/try-effect* :report/unreadable
+                     (let [f (io/file path)]
+                       (when (> (.length f) max-bytes)
+                         (throw (ex-info "report file too large" {:bytes (.length f) :max max-bytes})))
+                       (slurp f)))]
      (r/map-err (parse text format) #(assoc % :file (str path))))))
+
+(defn- foreign-xml?
+  "True for an err of an .xml file that is XML but not JUnit (Maven's
+   failsafe-summary.xml, TestNG's testng-results.xml): in :auto such a file
+   lies beside the reports and is skipped, not a failure."
+  [res]
+  (= :junit/unknown-root (:reason res)))
 
 (defn read-reports
   "Result<Report> merging every report file under directory `dir` (a suite's
    :suite/reports-dir), sorted by path, each read in `format` (default
-   :auto). A file that cannot be read fails the whole; a directory holding no
-   report is `:report/none`."
+   :auto). A file that cannot be read fails the whole, except that :auto
+   skips XML whose root is not JUnit (listed under :report/skipped-files); a
+   directory holding no report is `:report/none`."
   ([dir] (read-reports dir :auto))
   ([dir format]
-   (let [files (sort-by str (filter report-file? (file-seq (io/file dir))))]
-     (if (empty? files)
-       (r/err :report/none {:dir (str dir)})
-       (loop [files files acc []]
-         (if-let [f (first files)]
-           (let [res (read-report f format)]
-             (if (r/err? res) res (recur (rest files) (conj acc (:ok res)))))
-           (r/ok (report/merge-reports acc))))))))
+   (r/let-ok [files (r/try-effect* :report/unreadable
+                      (vec (sort-by str (filter report-file? (file-seq (io/file dir))))))]
+     (loop [files files acc [] skipped []]
+       (if-let [f (first files)]
+         (let [res (read-report f format)]
+           (cond
+             (r/ok? res) (recur (rest files) (conj acc (:ok res)) skipped)
+             (and (= :auto format) (foreign-xml? res)) (recur (rest files) acc (conj skipped (str f)))
+             :else res))
+         (if (empty? acc)
+           (r/err :report/none {:dir (str dir) :skipped-files skipped})
+           (r/ok (cond-> (report/merge-reports acc)
+                   (seq skipped) (assoc :report/skipped-files skipped)))))))))

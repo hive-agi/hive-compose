@@ -180,6 +180,49 @@
   (is (nil? (report/detect-format nil)))
   (is (= :format/unknown (:reason (br/parse "")))))
 
+(defn- tap-cases [s]
+  (mapv (juxt :case/id :case/status) (:report/cases (:ok (report/parse-tap s)))))
+
+(deftest review-regressions
+  (testing "regexes stay linear on long lines (ReDoS)"
+    (let [pad (apply str (repeat 60000 " "))
+          t0 (System/nanoTime)]
+      (doseq [s [(str "ok 1 - a" pad "x") (str "ok 1 - a" pad "# x")
+                 (str "not ok" pad "#" pad) (str "ok 1 - " (apply str (repeat 200000 "#")))]]
+        (is (r/ok? (report/parse-tap s))))
+      (is (< (/ (- (System/nanoTime) t0) 1e6) 2000.0))))
+  (testing "an unterminated YAML block never swallows later test points"
+    (is (= [["a" :passed] ["b" :failed] ["c" :passed]]
+           (tap-cases "ok 1 - a\n  ---\n  x: 1\nnot ok 2 - b\nok 3 - c\n1..3")))
+    (is (= [["a" :passed] ["b" :failed]] (tap-cases "ok 1 - a\n---\nnot ok 2 - b"))))
+  (testing "a directive is the word skip, skipped or todo standing alone"
+    (is (= [["handle #TODOs" :passed] ["foo#skip-list" :passed] ["x" :skipped] ["y" :skipped]
+            ;; TAP 14: whitespace after # is optional, so this one is a TODO
+            ["fix" :skipped]]
+           (tap-cases "ok 1 - handle #TODOs\nok 2 - foo#skip-list\nok 3 - x # SKIP: why\nok 4 - y # skipped\nnot ok 5 - fix #todo list"))))
+  (testing "a number must stand alone"
+    (is (= [["123abc" :passed]] (tap-cases "ok 123abc"))))
+  (testing "a byte order mark is ignored"
+    (is (= [["a" :passed]] (tap-cases "\uFEFFok 1 - a\n1..1")))
+    (is (= {:passed 1 :failed 0 :error 0 :skipped 0}
+           (:report/totals (:ok (br/parse "\uFEFF<testsuite><testcase name='a'/></testsuite>"))))))
+  (testing "read-reports answers a Result for a nil dir"
+    (is (r/err? (br/read-reports nil)))))
+
+(deftest foreign-xml-beside-reports
+  (let [dir (doto (java.io.File/createTempFile "hc8-reports" "") (.delete) (.mkdirs))]
+    (try
+      (spit (io/file dir "TEST-a.xml") (fixture "surefire.xml"))
+      (spit (io/file dir "failsafe-summary.xml") "<failsafe-summary result=\"255\"><completed>4</completed></failsafe-summary>")
+      (testing ":auto skips XML that is not JUnit and says so"
+        (let [rep (:ok (br/read-reports dir))]
+          (is (report/valid-report? rep))
+          (is (= 4 (count (:report/cases rep))))
+          (is (= [(str (io/file dir "failsafe-summary.xml"))] (:report/skipped-files rep)))))
+      (testing "a declared :junit fails fast on it"
+        (is (= :junit/unknown-root (:reason (br/read-reports dir :junit)))))
+      (finally (run! #(.delete ^java.io.File %) (reverse (file-seq dir)))))))
+
 (deftest declared-format
   (testing ":suite/report-format :auto | :junit | :tap"
     (is (= :junit (:report/format (:ok (br/parse (fixture "pytest.xml") :junit)))))

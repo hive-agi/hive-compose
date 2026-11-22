@@ -52,7 +52,8 @@
    [:report/format [:enum :junit :tap :mixed]]
    [:report/cases [:vector Case]]
    [:report/totals Totals]
-   [:report/bail-out {:optional true} :string]])
+   [:report/bail-out {:optional true} :string]
+   [:report/skipped-files {:optional true} [:vector :string]]])
 
 (def valid-report? (m/validator Report))
 
@@ -161,16 +162,26 @@
 ;; TAP 13/14: text -> Report
 ;; ---------------------------------------------------------------------------
 
-(def ^:private test-re #"^(not ok|ok)(?=\s|$)\s*(\d+)?\s*(?:-\s*)?(.*)$")
+(def max-line
+  "Characters of a TAP line that are read; the rest of a longer line is
+   dropped, so no line costs more than a bounded, linear scan."
+  65536)
+
+;; Every regex here is linear on its line: no nested or adjacent quantifiers
+;; over the same characters before a forced failure (see `tap-is-linear`).
+(def ^:private test-re #"^(not ok|ok)(?=\s|$)(?:\s+(\d+)(?=\s|$))?\s*(?:-\s*)?(.*)$")
 (def ^:private plan-re #"^1\.\.(\d{1,9})(?:\s*#.*)?$")
 (def ^:private bail-re #"^Bail out!\s*(.*)$")
 (def ^:private version-re #"(?i)^TAP version \d+$")
-(def ^:private directive-re #"(?i)^(.*?)\s*(?<!\\)#\s*(skip|todo)\S*\s*(.*)$")
+(def ^:private directive-re #"(?i)#\s*(skip(?:ped)?|todo)(?=[\s:]|$)[\s:]*")
+
+(defn- indent [line]
+  (count (re-find #"^ *" line)))
 
 (defn- depth
   "Subtest depth of `line`: TAP 14 indents a subtest by four spaces."
   [line]
-  (quot (count (re-find #"^ *" line)) 4))
+  (quot (indent line) 4))
 
 (defn- token [line]
   (let [body (str/trim line)
@@ -183,6 +194,17 @@
       (str/starts-with? body "#") {:kind :comment :depth d :text body}
       :else {:kind :other :depth d})))
 
+(defn- yaml-end?
+  "True when `line` ends a YAML block opened by a `---` indented `base`: its
+   `...`, a line indented less, or a TAP line (an unterminated block never
+   swallows the test points after it)."
+  [base line]
+  (or (= "..." (str/trim line))
+      (and (not (str/blank? line))
+           (or (< (indent line) base)
+               (and (= (indent line) base)
+                    (#{:test :plan :bail :version} (:kind (token line))))))))
+
 (defn- lex
   "TAP lines as tokens, each YAML block `---` .. `...` collapsed into one
    :yaml token holding its raw text."
@@ -190,21 +212,37 @@
   (loop [lines lines out []]
     (if-let [line (first lines)]
       (if (= "---" (str/trim line))
-        (let [[block more] (split-with #(not= "..." (str/trim %)) (rest lines))]
-          (recur (rest more)
+        (let [[block more] (split-with (complement (partial yaml-end? (indent line))) (rest lines))
+              closed? (= "..." (some-> (first more) str/trim))]
+          (recur (if closed? (rest more) more)
                  (conj out {:kind :yaml :depth (depth line)
-                            :text (str/join "\n" (concat [line] block (take 1 more)))})))
+                            :text (str/join "\n" (concat [line] block (when closed? [(first more)])))})))
         (recur (rest lines) (conj out (token line))))
       out)))
+
+(defn- find-directive
+  "[index word end] of the `# SKIP` / `# TODO` directive in `text`: the first
+   `#` at the start or after whitespace (so never an escaped `\\#`) followed
+   by the word skip, skipped or todo standing alone."
+  [^String text]
+  (let [m (re-matcher directive-re text)
+        n (count text)]
+    (loop [i (str/index-of text "#")]
+      (when i
+        (if (and (or (zero? i) (Character/isWhitespace (.charAt text (int (dec i)))))
+                 (do (.region m i n) (.lookingAt m)))
+          [i (.group m 1) (.end m)]
+          (recur (str/index-of text "#" (inc i))))))))
 
 (defn- split-directive
   "[description directive reason] of a test point's text; an escaped `\\#`
    belongs to the description."
   [text]
-  (let [[_ desc directive reason] (re-matches directive-re text)
-        unescape #(str/trim (str/replace % "\\#" "#"))]
-    (if directive
-      [(unescape desc) (keyword (str/lower-case directive)) (blank->nil (str/trim reason))]
+  (let [unescape #(str/trim (str/replace % "\\#" "#"))]
+    (if-let [[i word end] (find-directive text)]
+      [(unescape (subs text 0 i))
+       (if (str/starts-with? (str/lower-case word) "skip") :skip :todo)
+       (blank->nil (str/trim (subs text end)))]
       [(unescape text) nil nil])))
 
 (defn- point-status [ok? directive]
@@ -327,7 +365,9 @@
   (if-not (string? text)
     (malformed :tap/not-text)
     (try
-      (let [tokens (lex (str/split-lines (str/replace text #"\r\n?" "\n")))
+      (let [lines (->> (str/split-lines (str/replace (str/replace-first text #"^\uFEFF" "") #"\r\n?" "\n"))
+                       (map #(if (> (count %) max-line) (subs % 0 max-line) %)))
+            tokens (lex lines)
             [run [bail]] (split-with #(not= :bail (:kind %)) tokens)
             bail (some-> bail :reason str/trim)
             {:keys [points plan]} (fold-level (vec run) 0)]
