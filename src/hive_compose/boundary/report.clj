@@ -8,7 +8,6 @@
    entities (XXE) nor entity expansion (billion laughs) can happen, and loads
    no external DTD or schema."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
             [hive-compose.promote.report :as report]
             [hive-dsl.result :as r])
   (:import (java.io StringReader)
