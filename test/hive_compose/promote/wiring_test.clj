@@ -88,6 +88,34 @@
                       "kafka:9092")]
       (is (r/ok? (wiring/wiring s resolution "r01" "shop"))))))
 
+(deftest otlp-pair-collision-between-providers
+  (let [s (-> settings
+              (assoc-in [:compose/projects "infra" :project/provides "kafka" :env "OTEL_EXPORTER_OTLP_ENDPOINT"] "http://a:4317")
+              (assoc-in [:compose/projects "infra" :project/provides "kafka" :env "OTEL_EXPORTER_OTLP_PROTOCOL"] "grpc")
+              (assoc-in [:compose/projects "infra" :project/provides "postgres" :env "OTEL_EXPORTER_OTLP_ENDPOINT"] "http://b:4318")
+              (assoc-in [:compose/projects "infra" :project/provides "postgres" :env "OTEL_EXPORTER_OTLP_PROTOCOL"] "http/protobuf"))
+        w (wiring/wiring s resolution "r01" "shop")]
+    (is (= :compose/env-collision (:error w)))
+    (is (= "OTEL_EXPORTER_OTLP_ENDPOINT+OTEL_EXPORTER_OTLP_PROTOCOL" (:key w)))
+    (is (= "shop" (:consumer w)))))
+
+(deftest consumers-slugging-alike-are-refused
+  (let [res (-> resolution
+                (assoc-in [:resolution/bindings "billing/api"] {"kafka" "infra/kafka"})
+                (assoc-in [:resolution/bindings "billing-api"] {"kafka" "infra/kafka"}))
+        ws (wiring/wirings settings res "r01")]
+    (is (= :compose/consumer-name-collision (:error ws)))
+    (is (= #{"billing/api" "billing-api"} (set (:consumers ws))))))
+
+(deftest malformed-input-is-a-result
+  (is (= :compose/invalid-consumer (:error (wiring/wiring settings resolution "r01" nil))))
+  (is (= :compose/invalid-extra-envs (:error (wiring/wiring settings resolution "r01" "shop" {"A" "1"}))))
+  (is (= :compose/invalid-extra-envs (:error (wiring/wiring settings resolution "r01" "shop" ["A=1"]))))
+  (testing "a consumer bound to nothing still gets its network, prefix and HIVE_RUN_ID"
+    (let [w (:ok (wiring/wiring settings resolution "r01" "nobody"))]
+      (is (= [] (:wiring/attach w)))
+      (is (= "r01" (get-in w [:wiring/env "HIVE_RUN_ID"]))))))
+
 (deftest unknown-instance-and-bad-run
   (is (= :compose/unknown-instance
          (:error (wiring/wiring settings (assoc-in resolution [:resolution/bindings "x"] {"kafka" "nope"})

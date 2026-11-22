@@ -160,23 +160,30 @@
 
 (defn- providers-env
   "The merged `:env` of `insts`, or an error on a key two instances set to
-   different values. Keys owned by the OTLP rules are left to merge-env."
+   different values. The OTLP pair is compared as one unit (its key in the
+   error is `OTEL_EXPORTER_OTLP_ENDPOINT+OTEL_EXPORTER_OTLP_PROTOCOL`);
+   resource attributes merge per key and never collide."
   [settings insts]
-  (reduce (fn [acc inst]
-            (let [e (:env (provide settings inst) {})
-                  clash (first (for [[k v] (apply dissoc e resource-attributes-var otlp-pair)
-                                     :let [[owner v'] (get (:owners acc) k)]
-                                     :when (and owner (not= owner (:instance/id inst)) (not= v v'))]
-                                 [k owner]))]
-              (if clash
-                (reduced (r/err :compose/env-collision
-                                {:key (first clash)
-                                 :instances [(second clash) (:instance/id inst)]}))
-                (-> acc
-                    (update :env merge-env e)
-                    (update :owners into (map (fn [[k v]] [k [(:instance/id inst) v]])) e)))))
-          {:env {} :owners {}}
-          insts))
+  (let [pair-key (str/join "+" otlp-pair)
+        comparable (fn [e]
+                     (cond-> (apply dissoc e resource-attributes-var otlp-pair)
+                       (some #(contains? e %) otlp-pair) (assoc pair-key (select-keys e otlp-pair))))]
+    (reduce (fn [acc inst]
+              (let [e (:env (provide settings inst) {})
+                    c (comparable e)
+                    clash (first (for [[k v] c
+                                       :let [[owner v'] (get (:owners acc) k)]
+                                       :when (and owner (not= owner (:instance/id inst)) (not= v v'))]
+                                   [k owner]))]
+                (if clash
+                  (reduced (r/err :compose/env-collision
+                                  {:key (first clash)
+                                   :instances [(second clash) (:instance/id inst)]}))
+                  (-> acc
+                      (update :env merge-env e)
+                      (update :owners into (map (fn [[k v]] [k [(:instance/id inst) v]])) c)))))
+            {:env {} :owners {}}
+            insts)))
 
 (defn- attach
   "One attach entry per distinct bound instance, by instance id."
@@ -190,8 +197,18 @@
   "The Wiring of `consumer`, its env restricted to the capabilities whose Need
    serves `service` (all when nil)."
   [settings resolution run consumer extra-envs service]
-  (if-not (m/validate schema/RunId run)
+  (cond
+    (not (m/validate schema/RunId run))
     (r/err :compose/invalid-run {:run run})
+
+    (not (m/validate schema/ConsumerId consumer))
+    (r/err :compose/invalid-consumer {:consumer consumer})
+
+    (not (and (sequential? (or extra-envs [])) (every? #(m/validate schema/Env %) extra-envs)))
+    (r/err :compose/invalid-extra-envs {:consumer consumer
+                                        :problems (schema/explain [:sequential schema/Env] extra-envs)})
+
+    :else
     (r/let-ok [binding (bound resolution consumer)]
       (let [prefix (names/tenancy-prefix run consumer)
             served (->> binding
@@ -222,7 +239,8 @@
    and its tenancy prefix. `extra-envs` is a seq of Env maps merged in
    order over the providers' env and under the consumer's own env."
   [settings resolution run consumer & [extra-envs]]
-  (wire settings resolution run consumer extra-envs nil))
+  (let [w (wire settings resolution run consumer extra-envs nil)]
+    (cond-> w (r/err? w) (assoc :consumer consumer))))
 
 (defn service-env
   "Result<Env> `service` of `consumer` receives: the Wiring env restricted to
@@ -234,11 +252,28 @@
 
 (defn wirings
   "Result<{consumer Wiring}> for every consumer bound in `resolution`.
-   `extra-envs-fn`, (fn [consumer] [Env ...]), supplies each one's extra envs."
+   `extra-envs-fn`, (fn [consumer] [Env ...]), supplies each one's extra envs.
+   Two consumers whose ids slug alike (\"billing/api\", \"billing-api\") would
+   share a view network and a tenancy prefix: that is a
+   :compose/consumer-name-collision naming both."
   [settings resolution run & [extra-envs-fn]]
-  (let [f (or extra-envs-fn (constantly nil))]
-    (reduce (fn [acc consumer]
-              (let [w (wiring settings resolution run consumer (f consumer))]
-                (if (r/err? w) (reduced w) (r/ok (assoc (:ok acc) consumer (:ok w))))))
-            (r/ok {})
-            (sort (keys (:resolution/bindings resolution))))))
+  (let [f (or extra-envs-fn (constantly nil))
+        ws (reduce (fn [acc consumer]
+                     (let [w (wiring settings resolution run consumer (f consumer))]
+                       (if (r/err? w)
+                         (reduced (assoc w :consumer consumer))
+                         (r/ok (assoc (:ok acc) consumer (:ok w))))))
+                   (r/ok {})
+                   (sort (keys (:resolution/bindings resolution))))]
+    (if (r/err? ws)
+      ws
+      (let [clash (->> (vals (:ok ws))
+                       (group-by (juxt :wiring/network :wiring/prefix))
+                       vals
+                       (filter #(< 1 (count %)))
+                       first)]
+        (if clash
+          (r/err :compose/consumer-name-collision
+                 {:consumers (mapv :wiring/consumer clash)
+                  :network (:wiring/network (first clash))})
+          ws)))))
