@@ -3902,6 +3902,9 @@ components:
       - compose/unparseable
       - compose/unsupported-media-type
       - compose/volume-removal-refused
+      - report/malformed
+      - report/none
+      - report/unreadable
       - secrets/unknown-backend
       - trace/bad-id
       - trace/bad-json
