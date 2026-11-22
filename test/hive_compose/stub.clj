@@ -238,7 +238,17 @@
       (r/ok {:out "" :skipped :no-services})
       (or (fault world :up-project)
           (missing-network world spec)
-          (let [{:keys [project services labels networks]} spec]
+          ;; as compose: `up` starts the depends_on of what it names (unless
+          ;; :no-deps?); the model is the one of the project the files define.
+          (let [{:keys [project labels networks]} spec
+                ;; the files define the model: that of the project the dir names
+                model (or (get-in @world [:projects project])
+                          (get-in @world [:projects (profile/default-project (:dir spec))])
+                          {})
+                services (if (or (:no-deps? spec) (empty? model))
+                           (vec (:services spec))
+                           (closure model (filter model (:services spec))))
+                services (vec (distinct (concat services (remove model (:services spec)))))]
             (swap! world
                    (fn [w]
                      (-> (reduce (fn [w s]

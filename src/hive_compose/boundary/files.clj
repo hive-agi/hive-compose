@@ -55,8 +55,12 @@
   (let [res (save-state! path lock)]
     (if (r/err? res) (assoc res :error :compose/lock-unwritable) res)))
 
-(defn- persisted [st]
-  {:active (or (:active st) {}) :current (:current st)})
+(defn- persisted
+  "What the state file holds: the active map, the current section and, once a
+   stack ran, the stack runs (`:stacks`, absent from older files)."
+  [st]
+  (cond-> {:active (or (:active st) {}) :current (:current st)}
+    (contains? st :stacks) (assoc :stacks (or (:stacks st) {}))))
 
 (defn sync-state!
   "Merge the live state with the file at `path` and write the merge.
