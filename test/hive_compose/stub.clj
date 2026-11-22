@@ -236,7 +236,7 @@
                 (r/ok {:network network :containers [c]}))))))
   (-up-project! [{:keys [world]} spec]
     (record! world [:up-project (:project spec) (vec (:services spec))
-                    (select-keys spec [:labels :networks :wait? :container-env :files])])
+                    (select-keys spec [:labels :networks :wait? :container-env :files :service-overrides])])
     (if (empty? (:services spec))
       (r/ok {:out "" :skipped :no-services})
       (or (fault world :up-project)

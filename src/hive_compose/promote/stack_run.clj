@@ -23,6 +23,7 @@
    run-scoped compose project carries hive.run. No IO."
   (:require [clojure.string :as str]
             [hive-compose.promote.otel :as otel]
+            [hive-compose.promote.resources :as res]
             [hive-compose.promote.stack :as stack]
             [hive-compose.schema :as schema]))
 
@@ -81,6 +82,37 @@
                     :wait? (boolean wait?)})
       (not (:instance/share? ip)) (assoc :services closure
                                          :labels (:instance/labels ip)))))
+
+(defn instance-overrides
+  "{service {mem_limit cpus environment}} (string keys) that caps instance `ip`
+   (hc-16a): its answering services get `caps` (InstanceCaps) and, when they
+   run a JVM (`:jvm?`, else detected from the image in `facts` {service
+   {:image :java-tool-options}}), JAVA_TOOL_OPTIONS with the heap flag merged
+   under the service's own options (the compose file's, else the provider
+   project's env). The JVM flag goes only where a mem_limit is written. The
+   closure services (`:closure` of `caps`, {service bytes}, see
+   resources/with-closure) get a mem_limit too, unless their own compose file
+   sets one (`:mem-limit` in `facts`), and the flag when their image is a JVM.
+   Services that need nothing are left out."
+  [settings ip caps facts]
+  (let [proj-opts (let [v (get-in settings [:compose/projects (:instance/provider ip) :project/env
+                                            res/java-tool-options])]
+                    (when (string? v) v))
+        own (for [s (:instance/services ip)
+                  :let [{:keys [image java-tool-options]} (get facts s)]]
+              [s (res/service-override caps (res/jvm? caps image) (or java-tool-options proj-opts))])
+        closure (for [[s m] (:closure caps)
+                      :let [{:keys [image java-tool-options mem-limit]} (get facts s)]
+                      :when (nil? mem-limit)]
+                  [s (res/service-override {:mem m :unbounded? false} (res/java-image? image)
+                                           (or java-tool-options proj-opts))])]
+    (into (sorted-map) (filter (comp seq second)) (concat own closure))))
+
+(defn with-overrides
+  "ProjectSpec `spec` carrying `overrides` (from `instance-overrides`) as
+   `:service-overrides`, unchanged when there are none."
+  [spec overrides]
+  (cond-> spec (seq overrides) (assoc :service-overrides overrides)))
 
 (defn consumer-labels
   "hive.run, hive.stack and hive.consumer of `consumer` in `run` of `stack-id`."

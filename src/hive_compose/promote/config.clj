@@ -37,6 +37,11 @@
      :compose/program-grace-ms     how long a host program is watched after its
                                    start; one that exits within it is reported
                                    :exited with its code and log tail (default 3000)
+     :compose/history-file         flake history, EDN lines (default
+                                   flake-history.ednl beside the state file)
+     :compose/flaky                flake thresholds {:window :min-runs
+                                   :flip-rate :streak}, each optional (defaults
+                                   in `hive-compose.promote.flaky/defaults`)
      :compose/stacks               [Stack ..] or {id Stack}: consumers brought up with
                                    every capability they need (optional)
      :compose/suites               [Suite ..] or {id Suite}: test runners in any
@@ -220,6 +225,15 @@
   [cfg home]
   (expand-home home (or (:compose/profiles-file cfg) default-profiles-file)))
 
+(defn history-file
+  "Path of the flake history file: `:compose/history-file` expanded against
+   `home`, else `flake-history.ednl` beside the state file `state-file`."
+  [cfg home state-file]
+  (if-let [f (:compose/history-file cfg)]
+    (expand-home home f)
+    (let [parent (.getParent (java.io.File. ^String state-file))]
+      (if parent (str parent "/flake-history.ednl") "flake-history.ednl"))))
+
 (defn settings
   "Result<Settings> from merged addon config `cfg`, the profiles read from the
    profiles file (`file-profiles`, nil when absent) and `home`. Inline profiles
@@ -230,15 +244,18 @@
                       (concat (as-seq :profile/id file-profiles)
                               (as-seq :profile/id (:compose/profiles cfg))))
         projects (map #(normalize-project home %) (as-seq :project/id (:compose/projects cfg)))
+        state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
         s (merge defaults
                  (cond-> (select-keys cfg (keys defaults))
                    (contains? cfg :compose/activity)
                    (update :compose/activity activity-set))
-                 {:compose/state-file (expand-home home (or (:compose/state-file cfg) default-state-file))
+                 {:compose/state-file state-file
+                  :compose/history-file (history-file cfg home state-file)
                   :compose/log-dir (expand-home home (or (:compose/log-dir cfg) default-log-dir))
                   :compose/projects (into {} (map (juxt :project/id identity)) projects)
                   :compose/profiles (into {} (map (juxt :profile/id identity)) profiles)})
         s (cond-> s
+            (some? (:compose/flaky cfg)) (assoc :compose/flaky (:compose/flaky cfg))
             (contains? cfg :compose/stacks) (assoc :compose/stacks (normalize-stacks (:compose/stacks cfg)))
             (contains? cfg :compose/suites) (assoc :compose/suites (normalize-suites home (:compose/suites cfg)))
             (contains? cfg :compose/default-resources)
@@ -265,7 +282,7 @@
 (def ^:private live-only
   "Settings a running addon keeps from init: the reaper period and where its
    state lives. A change to them applies at the next initialize!."
-  [:compose/tick-seconds :compose/state-file])
+  [:compose/tick-seconds :compose/state-file :compose/history-file])
 
 (defn settings-diff
   "What differs between Settings `old` and `new`: projects and profiles by id,
