@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="4" failures="1" errors="1" skipped="1">
+	<testsuite name="example.com/shop/cart" tests="4" failures="1" errors="1" id="0" hostname="ci-7" skipped="1" time="0.010" timestamp="2026-11-22T17:10:03Z">
+		<properties>
+			<property name="go.version" value="go1.22.0 linux/amd64"></property>
+		</properties>
+		<testcase name="TestAdd" classname="example.com/shop/cart" time="0.000"></testcase>
+		<testcase name="TestTotal" classname="example.com/shop/cart" time="0.001">
+			<failure message="Failed"><![CDATA[    cart_test.go:31: total = 9, want 10]]></failure>
+		</testcase>
+		<testcase name="TestKafka" classname="example.com/shop/cart" time="0.000">
+			<skipped message="Skipped"><![CDATA[    cart_test.go:40: KAFKA_BROKERS not set]]></skipped>
+		</testcase>
+		<testcase name="TestCheckout" classname="example.com/shop/cart" time="0.002">
+			<error message="Runtime error"><![CDATA[panic: runtime error: index out of range [3] with length 3]]></error>
+		</testcase>
+		<system-out><![CDATA[ok  	example.com/shop/cart	0.010s]]></system-out>
+	</testsuite>
+</testsuites>

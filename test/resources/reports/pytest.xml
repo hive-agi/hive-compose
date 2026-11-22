@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="1" skipped="1" tests="4" time="0.051" timestamp="2026-11-22T17:10:03.120934-03:00" hostname="ci-7"><testcase classname="tests.test_orders" name="test_create" time="0.001" /><testcase classname="tests.test_orders" name="test_cancel[paid]" time="0.002"><failure message="assert 'paid' == 'cancelled'&#10;  - cancelled&#10;  + paid">def test_cancel(order):
+&gt;       assert order.status == "cancelled"
+E       AssertionError: assert 'paid' == 'cancelled'
+
+tests/test_orders.py:14: AssertionError</failure></testcase><testcase classname="tests.test_orders" name="test_refund" time="0.000"><skipped type="pytest.skip" message="refunds not wired yet">/app/tests/test_orders.py:18: refunds not wired yet</skipped></testcase><testcase classname="tests.test_orders" name="test_ship" time="0.000"><error message="failed on setup with &quot;KeyError: 'PG_URL'&quot;">@pytest.fixture
+def db():
+&gt;       return connect(os.environ["PG_URL"])
+E       KeyError: 'PG_URL'</error><system-err>connecting...</system-err></testcase></testsuite></testsuites>
