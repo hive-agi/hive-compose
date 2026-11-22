@@ -392,9 +392,13 @@
 ;; (d) Cell result
 ;; ---------------------------------------------------------------------------
 
-(defn- failures [report]
+(defn- failures
+  "Failed and errored cases of `report`: the larger of its totals and its
+   cases, so a report whose totals were not recounted still fails."
+  [report]
   (let [t (:report/totals report)]
-    (+ (:failed t 0) (:error t 0))))
+    (max (+ (:failed t 0) (:error t 0))
+         (count (filter #(#{:failed :error} (:case/status %)) (:report/cases report))))))
 
 (defn cell-status
   "How a cell ended.

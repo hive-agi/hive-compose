@@ -375,6 +375,9 @@
       (is (= 2 (count (get-in res [:report :report/cases]))))))
   (testing "failing cases fail the cell even at exit 0"
     (is (= :failed (:status (suite/cell-result "r01" cell {:exit 0 :report (r/ok (report [:passed :failed]))})))))
+  (testing "a failed case fails the cell even when the totals were not recounted"
+    (is (= :failed (:status (suite/cell-result "r01" cell {:exit 0 :report (r/ok (assoc (report [:failed])
+                                                                                         :report/totals {:passed 1 :failed 0 :error 0 :skipped 0}))})))))
   (testing "a bail-out fails the cell"
     (is (= :failed (:status (suite/cell-result "r01" cell {:exit 0 :report (r/ok (assoc (report [:passed]) :report/bail-out "db down"))})))))
   (testing "a non-zero exit fails a green report"
