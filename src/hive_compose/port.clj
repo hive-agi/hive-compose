@@ -191,3 +191,24 @@
      :unhealthy :starting :none.")
   (-networks-labelled [e labels]
     "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
+
+(defprotocol IDataExec
+  "Optional engine capability: run a data command (migrate, seed, reset)
+   inside a running container of a stack instance (hc-9). Never removes a
+   container or a volume."
+  (-exec! [e target argv opts]
+    "Result<{:exit 0 :out}>: `docker exec` of `argv` in the running container of
+     `target` ({:project compose-project :service svc}), with `opts` {:env
+     {VAR EnvValue} :timeout-ms n}; secret references in :env are read only
+     now. A non-zero exit is :compose/command-failed carrying :exit and
+     :stderr; no running container is :compose/no-container."))
+
+(defprotocol ICommandRunner
+  "Optional runner capability: run a host command to completion (hc-9 data
+   commands declared as `:command`), unlike `IProgramRunner/-start!`, which
+   detaches a long-lived program."
+  (-run! [r argv opts]
+    "Result<{:exit 0 :out}>: run `argv` with `opts` {:dir path :env {VAR
+     EnvValue} :timeout-ms n} and wait for it; secret references in :env are
+     read only now. A non-zero exit is :compose/command-failed carrying :exit
+     and :stderr."))

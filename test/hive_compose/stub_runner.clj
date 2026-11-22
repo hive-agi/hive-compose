@@ -59,3 +59,14 @@
    `tail` as the last lines of its log `log`."
   [rn program-id exit-code log tail]
   (swap! (:world rn) assoc-in [:dies program-id] {:exit-code exit-code :log log :tail tail}))
+
+;; ICommandRunner: host commands run to completion, recorded as
+;; [:run argv opts]; `fail!` :run makes every one fail.
+(extend-type StubRunner
+  port/ICommandRunner
+  (-run! [{:keys [world]} argv opts]
+    (record! world [:run (vec argv) opts])
+    (or (fault world :run)
+        (r/ok {:exit 0 :out ""}))))
+
+(defn runs [rn] (filterv #(= :run (first %)) (calls rn)))
