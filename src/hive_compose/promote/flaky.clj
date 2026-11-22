@@ -22,6 +22,12 @@
                   more
      :stable      otherwise (too few runs, or fails too rare to call)
 
+   OOM-killed rows (`:case/oom? true`, see `hive-compose.promote.oom`) are
+   never judged: they neither fail nor flip a case, so an OOM is never read
+   as a flake. A case with an OOM row in its last `:window` runs and no real
+   fail there is classed :oom; real fails beside it keep their own class.
+   Either way the report counts them under :ooms with :last-oom.
+
    The score ranking cases is the window's flip rate, scaled down while the
    window holds fewer than `:min-runs` runs.
 
@@ -75,7 +81,9 @@
                       :suite/id suite
                       :at (or (:run/at run) (:finished-at run) (:started-at run) at)}
                (some? (:project run)) (assoc :project (id-str (:project run)))
-               (some? (:run/sha run)) (assoc :run/sha (str (:run/sha run))))
+               (some? (:run/sha run)) (assoc :run/sha (str (:run/sha run)))
+               ;; hc-16b: a run OOM-killed at its cap marks every row it records
+               (some? (:oom run)) (assoc :case/oom? true))
         cases (get-in run [:report :report/cases])
         exit (:exit run)
         died? (and (empty? cases) (not (and (number? exit) (zero? exit))))
@@ -117,11 +125,16 @@
               (assoc (last (sort-by tie-break rs)) :at (apply min (map :at rs)))))
        (sort-by (juxt :at :run/id))))
 
-(defn- verdict [status]
-  (case status
-    :passed :pass
-    (:failed :error) :fail
-    nil))
+(defn- verdict
+  "The judged verdict of a row: :pass | :fail, nil for skipped rows and for
+   OOM-killed ones (`:case/oom? true`, hc-16b): a run killed at its memory
+   cap says nothing about the test, so it neither fails nor flips it."
+  [row]
+  (when-not (:case/oom? row)
+    (case (:case/status row)
+      :passed :pass
+      (:failed :error) :fail
+      nil)))
 
 (defn- flips [vs]
   (count (filter (fn [[a b]] (not= a b)) (partition 2 1 vs))))
@@ -166,12 +179,16 @@
   "The verdict on one case from all its `rows`, under thresholds `cfg`."
   [cfg rows]
   (let [rs (ordered rows)
-        judged (filterv (comp verdict :case/status) rs)
-        vs (mapv (comp verdict :case/status) judged)
+        judged (filterv verdict rs)
+        vs (mapv verdict judged)
         win (vec (take-last (:window cfg) judged))
         wv (vec (take-last (:window cfg) vs))
         n (count wv)
-        class (classify cfg wv)
+        ooms (filterv :case/oom? rs)
+        recent-oom? (and (seq ooms)
+                         (some :case/oom? (take-last (:window cfg) rs))
+                         (not-any? #{:fail} wv))
+        class (if recent-oom? :oom (classify cfg wv))
         passes (count (filter #{:pass} vs))
         fails (- (count vs) passes)
         w-rate (ratio (flips wv) (dec n))
@@ -196,6 +213,7 @@
                       :trend (str/join (map (comp trend-char :case/status) win))}
              :last (run-ref (last rs))}
       project (assoc :project project)
+      (seq ooms) (assoc :ooms (count ooms) :last-oom (run-ref (peek ooms)))
       (= :regression class) (assoc :since (run-ref (tail-of :fail)))
       (and (= :regression class) last-pass) (assoc :last-pass (run-ref last-pass))
       (= :fixed class) (assoc :fixed-since (run-ref (tail-of :pass))))))
@@ -212,7 +230,7 @@
                  (or (nil? project) (= project (:project row)))))
           rows))
 
-(def ^:private class-order {:flaky 0 :regression 1 :fixed 2 :stable 3})
+(def ^:private class-order {:flaky 0 :regression 1 :oom 2 :fixed 3 :stable 4})
 
 (defn rank
   "The verdict on every case of `rows` under thresholds `cfg`: :flaky cases
