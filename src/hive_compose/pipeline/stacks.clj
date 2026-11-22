@@ -40,7 +40,7 @@
 (def claim-prefix "stack:")
 
 (defn- persist! [{:keys [state save!]}]
-  (when save! (save! (select-keys @state [:active :current :stacks]))))
+  (when save! (save! (select-keys @state [:active :current :stacks :preexisting]))))
 
 (defn- now [ctx] ((:now ctx)))
 
@@ -145,9 +145,12 @@
   [ctx stack-id run-id]
   (let [settings (:settings ctx)]
     (r/let-ok [s (stack-config ctx stack-id)
-               res (capability/resolve-stack (:compose/projects settings) s)
+               ;; a stack's own needs (otel, ...) are needs of every container
+               ;; consumer in it, shared: one instance joins each view network
+               res (capability/resolve-stack (:compose/projects settings) s
+                                             {:extra (run/stack-needs-per-consumer s)})
                sp (stack/stack-plan settings res run-id {:stack stack-id})
-               ws (wiring/wirings settings res run-id)]
+               ws (wiring/wirings settings res run-id (run/otlp-envs res run-id))]
       (r/ok {:resolution res :plan sp :wirings ws}))))
 
 (defn- consumer-services
@@ -246,8 +249,12 @@
              pre (preexisting engine (:settings ctx) sp (live-plans ctx))]
     (let [t (now ctx)
           consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))]
+      ;; preexistence is global and permanent: set by the first run that finds
+      ;; an instance's services running outside every run, never cleared
+      (swap! (:state ctx) update :preexisting
+             #(run/mark-preexisting % (:stack/instances sp) pre))
       (record! ctx rid (constantly {:stack/id stack-id :run rid :started-at t :last-touch t
-                                    :plan sp :preexisting pre :networks (:stack/networks sp)
+                                    :plan sp :networks (:stack/networks sp)
                                     :consumers {} :status :partial}))
       (let [res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
                                         (:stack/networks sp))
@@ -306,7 +313,9 @@
 (defn- down-run! [ctx engine rid]
   (let [e (get (stacks ctx) rid)
         sp (:plan e)
-        steps (mapv #(run/sparing-preexisting % (get-in e [:preexisting (:instance %)]))
+        steps (mapv #(run/sparing-preexisting
+                      % (run/preexisting-of (:preexisting @(:state ctx))
+                                            (get-in sp [:stack/instances (:instance %)])))
                     (stack/stack-releases (live-plans ctx) rid (:active @(:state ctx))))
         consumers (mapv #(down-consumer! ctx engine %) (sort-by key (:consumers e)))
         nets (mapv #(port/-network-rm! engine %) (:networks e))

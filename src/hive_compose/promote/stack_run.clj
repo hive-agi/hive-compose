@@ -22,6 +22,7 @@
    Every created network and every container a stack run creates under a
    run-scoped compose project carries hive.run. No IO."
   (:require [clojure.string :as str]
+            [hive-compose.promote.otel :as otel]
             [hive-compose.promote.stack :as stack]
             [hive-compose.schema :as schema]))
 
@@ -141,6 +142,29 @@
     (cond-> (update step :services #(vec (remove pre %)))
       (seq spared) (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:preexisting]]])) spared))))
 
+(defn stack-needs-per-consumer
+  "{consumer Needs}: the stack's own `:stack/needs` as extra needs of each of
+   its container consumers, so a capability the stack needs (otel) is bound
+   by every consumer and joins every view network. Empty when the stack
+   needs nothing."
+  [stack]
+  (if-let [needs (not-empty (:stack/needs stack))]
+    (into {} (for [c (:stack/consumers stack) :when (container-consumer? c)] [c needs]))
+    {}))
+
+(def otel-capability "otel")
+
+(defn otlp-envs
+  "The extra-envs-fn for `promote.wiring/wirings`: a consumer bound to an
+   `otel` instance in `resolution` gets the OTLP env (endpoint on its view
+   network, `http://otel:4317`, with its protocol as a pair, service name and
+   hive.run.id). A consumer bound to none gets nothing: no endpoint nobody
+   answers."
+  [resolution run]
+  (fn [consumer]
+    (when (get-in resolution [:resolution/bindings consumer otel-capability])
+      [(otel/otlp-env {:run-id run :service (schema/slug consumer)})])))
+
 (defn without-provided
   "`services` of a consumer minus what its own provided instances (`ips`,
    hc-4 `:consumer/provider-of`) run, their depends_on closures included: a
@@ -160,6 +184,32 @@
     (cond-> step
       (seq spared) (-> (update :services #(vec (remove h %)))
                        (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:stack]]])) spared)))))
+
+(defn preexisting-key
+  "The global preexistence key of instance plan `ip`: its provider project
+   and its service, `<provider>/<service>` (\"infra/kafka\")."
+  [ip]
+  (str (:instance/provider ip) "/" (:instance/service ip)))
+
+(defn mark-preexisting
+  "`marks` ({\"<provider>/<service>\" #{service}}) with each instance of
+   `instances` ({id ip}) that `pre` ({instance-id [service]}) found running
+   outside every run marked. Marks only grow: a mark is never cleared, so
+   whichever run leaves last never removes what ran before the runs."
+  [marks instances pre]
+  (reduce (fn [m [iid svcs]]
+            (if-let [ip (get instances iid)]
+              (update m (preexisting-key ip) (fnil into (sorted-set)) svcs)
+              m))
+          (or marks {})
+          pre))
+
+(defn preexisting-of
+  "[service] of instance plan `ip` marked preexisting in `marks`; nil for a
+   private instance (its compose project is the run's own)."
+  [marks ip]
+  (when (and ip (:instance/share? ip))
+    (seq (get marks (preexisting-key ip)))))
 
 (defn whole-project?
   "True when release `step` of a private instance takes its whole compose
