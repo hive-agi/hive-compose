@@ -257,6 +257,43 @@ value the preset's services need.
   `allow_shared=true` goes ahead and reports what it overrode. The decision is
   the pure `hive-compose.promote.ownership/conflicts`.
 
+## Resource caps (stacks)
+
+A stack can be capped so one run never takes the host down. Every key is
+optional, and a config without them runs uncapped as before.
+
+```edn
+{:compose/default-resources {:mem "512m"}      ; any instance nobody caps
+ :compose/budget "12g"                         ; all of a stack's capped memory
+ :compose/host-reserve "4g"                    ; MemAvailable kept free
+ :compose/projects
+ {"infra" {:project/provides {"kafka" {:service "kafka" :resources {:mem "1g" :cpus 2}}
+                              "search" {:service "es" :resources :unbounded}}}
+  "shop"  {:project/needs {"kafka" {:resources {:mem "2g" :jvm? true}}}}}
+ :compose/stacks
+ [{:stack/id "shop" :stack/consumers ["shop"]
+   :stack/resources {"kafka" {:mem "3g"}} :stack/budget "6g" :stack/priority 1}]}
+```
+
+- Precedence per key: `:stack/resources`, then the Need, then the Provide, then
+  `:compose/default-resources`. `:unbounded` opts out: no cap is written and
+  the instance is not summed.
+- A shared instance takes the largest cap of its consumers. `compose plan`
+  prints each instance's cap, the total, and what sharing saves against one
+  private copy per consumer.
+- `stack-up` refuses with `:compose/over-budget` (`:basis` `:stack`, `:budget`
+  or `:host`, plus `:limit`, `:total-mem`, `:over` and `:instances`) before
+  anything starts. The host limit is MemAvailable minus `:compose/host-reserve`,
+  compared with what is not yet running.
+- A private instance gets `mem_limit` and `cpus` in its stack override. JVM
+  services (`:jvm? true`, or a detected java image) also get
+  `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75`, merged per flag, and the
+  service's own flags win. A shared instance runs from its own files, so its
+  cap is summed and admitted but not written.
+- Reaper pressure guard: while MemAvailable is below `:compose/host-reserve`,
+  each pass stops the idle, unclaimed run whose stack has the lowest
+  `:stack/priority`.
+
 ## Config
 
 `:compose/projects`, `:compose/default-ttl-minutes` (60),

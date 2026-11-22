@@ -139,6 +139,13 @@
   (-health [q]
     "Result<{:ready? true}>: the trace store answers, or why it does not."))
 
+(defprotocol IHostMemory
+  "The host's memory, so a stack plan can be admitted against what is free
+   and the reaper can relieve pressure (hc-16a). Stubbed in tests."
+  (-mem-available [m]
+    "Result<long>: MemAvailable in bytes (Linux /proc/meminfo), or why it
+     cannot be read. Never a throw."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
@@ -149,6 +156,21 @@
     "Result<{:volumes #{name} :ports #{port}}>: the docker volumes (their real
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
+
+(defprotocol ISuiteRunner
+  "Runs one suite runner to its end under its resource caps (hc-16b): a host
+   command inside a memory-capped systemd user scope (ulimit -v when no user
+   manager answers), a container with docker's memory and cpu flags. See
+   `hive-compose.promote.oom` for the data."
+  (-run! [r spec]
+    "Result<{:exit n-or-nil :started-at ms :finished-at ms :output [line]
+     :timed-out? bool :cap {:mode :systemd|:ulimit|:docker|:none :mem bytes?
+     :cpus n? :note s?} :oom Finding?}>: run `spec` (a runner spec, see
+     `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
+     :command, :dir, :env, :timeout-ms, :test-id, :image, :name, :mounts,
+     :network, :labels, plus :resources {:mem bytes :cpus n}) and wait for its
+     end. A runner that exits non-zero, is OOM-killed or times out is an ok
+     answer; an error only when it could not be started at all."))
 
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
