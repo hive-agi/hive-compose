@@ -3557,6 +3557,9 @@ components:
       - compose/api-bind-failed
       - compose/command-failed
       - compose/consumer-name-collision
+      - compose/data-exec-unsupported
+      - compose/data-runner-unsupported
+      - compose/data-step-failed
       - compose/dependency-cycle
       - compose/dispatch-threw
       - compose/env-collision
@@ -3575,8 +3578,12 @@ components:
       - compose/internal
       - compose/invalid-config
       - compose/invalid-consumer
+      - compose/invalid-data-lifecycle
+      - compose/invalid-data-state
+      - compose/invalid-data-step
       - compose/invalid-extra-envs
       - compose/invalid-param
+      - compose/invalid-phase
       - compose/invalid-range
       - compose/invalid-resolution
       - compose/invalid-result
@@ -3614,6 +3621,7 @@ components:
       - compose/run-exists
       - compose/runner-failed
       - compose/secret-unresolved
+      - compose/shared-reset-without-tenancy
       - compose/stack-down-incomplete
       - compose/stacks-unsupported
       - compose/swarm-failed
@@ -3622,6 +3630,7 @@ components:
       - compose/toxiproxy-unreachable
       - compose/unknown-command
       - compose/unknown-consumer
+      - compose/unknown-data-service
       - compose/unknown-instance
       - compose/unknown-profile
       - compose/unknown-project
@@ -3633,6 +3642,7 @@ components:
       - compose/unknown-test
       - compose/unknown-via
       - compose/unsupported-media-type
+      - compose/volume-removal-refused
       - secrets/unknown-backend
       - trace/bad-id
       - trace/bad-json

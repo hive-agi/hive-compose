@@ -71,6 +71,13 @@
    :compose/faults-invalid-toxic 400
    :compose/faults-unknown-toxic 400
    :trace/bad-id 400
+   :compose/invalid-data-lifecycle 400
+   :compose/invalid-data-step 400
+   :compose/invalid-data-state 400
+   :compose/invalid-phase 400
+   :compose/unknown-data-service 400
+   :compose/shared-reset-without-tenancy 400
+   :compose/volume-removal-refused 400
    :compose/unknown-command 404
    :compose/unknown-stack 404
    :compose/unknown-run 404
@@ -105,6 +112,7 @@
    :compose/stack-down-incomplete 502
    :compose/toxiproxy-failed 502
    :compose/runner-failed 502
+   :compose/data-step-failed 502
    :compose/toxiproxy-unreachable 502
    :trace/unreachable 502
    :trace/http-error 502
@@ -114,6 +122,8 @@
    :compose/no-compose-file 503
    :compose/program-needs-command 503
    :compose/stacks-unsupported 503
+   :compose/data-exec-unsupported 503
+   :compose/data-runner-unsupported 503
    :compose/no-trace-query 503
    :compose/instance-not-ready 503
    :trace/not-ready 503
