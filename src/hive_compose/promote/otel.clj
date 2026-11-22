@@ -92,7 +92,8 @@
   "The value of the hex digit at `i` of `s`, nil when there is none."
   [^String s i]
   (when (< i (count s))
-    (let [d (Character/digit (.charAt s (int i)) 16)]
+    (let [c (.charAt s (int i))
+          d (if (< (int c) 128) (Character/digit c 16) -1)]
       (when-not (neg? d) d))))
 
 (defn percent-decode
@@ -216,7 +217,7 @@
    from `side`: :container (the consumer's view network, alias `otel`) or
    :host (the published port on localhost)."
   [side protocol]
-  (str "http://" (if (= side :host) "localhost" service) ":"
+  (str "http://" (if (= side :host) "127.0.0.1" service) ":"
        (if (= protocol :http) (:otlp-http ports) (:otlp-grpc ports))))
 
 (defn- attr-key
@@ -240,7 +241,9 @@
     (when (seq dups)
       (fail (str "extra attributes name the same key twice: " (str/join ", " dups))
             {:keys (vec dups)}))
-    (merge (into {} extra)
+    ;; hive.* keys are hive-compose's alone: an extra one is dropped, so a
+    ;; spoofed hive.test.id can never be forced by the correlation layer.
+    (merge (into {} (remove (comp correlation-attribute? first)) extra)
            {"hive.run.id" (str run-id) "service.name" (str service)}
            (when (some? test-id) {"hive.test.id" (str test-id)}))))
 

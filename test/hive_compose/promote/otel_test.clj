@@ -55,7 +55,7 @@
     (is (= "grpc" (env "OTEL_EXPORTER_OTLP_PROTOCOL")))
     (is (= "http://otel:4317" (env "OTEL_EXPORTER_OTLP_ENDPOINT")))
     (is (= "hive.run.id=r01,service.name=s" (env "OTEL_RESOURCE_ATTRIBUTES"))))
-  (is (= "http://localhost:4318"
+  (is (= "http://127.0.0.1:4318"
          ((otel/otlp-env {:run-id "r01" :service "s" :protocol :http :side :host})
           "OTEL_EXPORTER_OTLP_ENDPOINT")))
   (is (= "http://x:1"
@@ -108,9 +108,16 @@
   (is (thrown? clojure.lang.ExceptionInfo (otel/render-resource-attributes {"a b" "1"})))
   (is (thrown? clojure.lang.ExceptionInfo (otel/render-resource-attributes {"" "1"})))
   (is (thrown? clojure.lang.ExceptionInfo (otel/render-resource-attributes {"a%2F" "1"})))
-  (is (= "a/b=1" (try (otel/render-resource-attributes {"a/b" "1"})
-                      (catch clojure.lang.ExceptionInfo _ "a/b=1")))
-      "`/` is not a token char: refused, never encoded"))
+  (is (thrown? clojure.lang.ExceptionInfo (otel/render-resource-attributes {"a/b" "1"}))
+      "`/` is not a token char: refused, never encoded")
+  (is (= "%٣٣" (otel/percent-decode "%٣٣")) "only ASCII hex digits form an escape"))
+
+(deftest extra-hive-attributes-are-dropped
+  (is (= {"hive.run.id" "r01" "service.name" "s" "x" "1"}
+         (otel/parse-resource-attributes
+          ((otel/otlp-env {:run-id "r01" :service "s"
+                           :extra-attrs {"hive.test.id" "spoof" "hive.other" "y" "x" "1"}})
+           "OTEL_RESOURCE_ATTRIBUTES")))))
 
 (deftest parse-tolerates-sdk-style-input
   (is (= {} (otel/parse-resource-attributes nil)))
