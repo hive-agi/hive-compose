@@ -207,7 +207,10 @@
   (let [stack-id (or (:stack opts) default-stack-id)
         projects (:compose/projects settings)
         input resolution
-        resolution (if (map? (:resolution/instances resolution))
+        ;; fill only a well-formed input: a malformed one is answered by the
+        ;; ResolvedResolution check below, never by an exception in the fill
+        resolution (if (and (m/validate schema/ResolvedResolution input)
+                            (m/validate schema/RunId run))
                      (fill-private-projects projects run resolution)
                      resolution)
         {:resolution/keys [instances bindings]} resolution]

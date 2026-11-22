@@ -208,7 +208,10 @@
    cross-talk. `:tenancy :scope` is :consumer (the default, `<run>.<consumer>.`:
    consumers never see each other's data) or :run (`<run>.`, one prefix for
    every consumer of the run, for a producer and a consumer of one topic;
-   runs stay isolated); config may write it as a string."
+   runs stay isolated); config may write it as a string. `:port` is the
+   container port the service answers on; a consumer needing the capability
+   `:via :toxiproxy` needs it (hc-12, the proxy's upstream is
+   `<service>:<port>`)."
   [:map
    [:service [:string {:min 1}]]
    [:version {:optional true} Version]
@@ -216,6 +219,7 @@
    [:tenancy {:optional true} [:map
                                [:env [:string {:min 1}]]
                                [:scope {:optional true} [:enum :consumer :run "consumer" "run"]]]]
+   [:port {:optional true} [:int {:min 1 :max 65535}]]
    [:description {:optional true} :string]])
 
 (def Need

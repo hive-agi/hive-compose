@@ -183,6 +183,33 @@
           "compose must see the same files to find the external networks")
       (is (= ["down" "--remove-orphans"] (take-last 2 argv))))))
 
+(deftest the-default-compose-file-precedes-the-override
+  (testing "pure: compose's own lookup order"
+    (is (= "compose.yaml" (cli/default-file (constantly true))))
+    (is (= "docker-compose.yml" (cli/default-file #{"docker-compose.yml" "x"})))
+    (is (= "compose.yml" (cli/default-file #{"compose.yml" "docker-compose.yaml"})) "compose.* before docker-compose.*")
+    (is (= "docker-compose.yaml" (cli/default-file #{"docker-compose.yml" "docker-compose.yaml"})))
+    (is (nil? (cli/default-file (constantly false)))))
+  (testing "argv: the base file, then the override, then up"
+    (is (= ["docker" "compose" "--project-directory" "/w/a" "-p" "a-r1x"
+            "-f" "compose.yml" "-f" "/s/a-r1x.override.json" "up" "-d" "app"]
+           (cli/up-project-argv {:project "a-r1x" :dir "/w/a" :files ["compose.yml"] :services ["app"]}
+                                "/s/a-r1x.override.json"))))
+  (testing "engine: a project dir with no compose file is a Result error, nothing runs"
+    (let [dir (tmp-dir) calls (atom [])
+          e (engine (atom #{}) {} calls dir)
+          res (port/-up-project! e {:project "a-r1x" :dir dir :services ["app"] :labels {"hive.run" "r1x"}})]
+      (is (= :compose/no-compose-file (:error res)))
+      (is (empty? @calls))))
+  (testing "engine: the found default file is named before the override"
+    (let [proj (tmp-dir) _ (spit (io/file proj "docker-compose.yml") "services: {}\n")
+          dir (tmp-dir) calls (atom [])
+          e (engine (atom #{}) {} calls dir)
+          _ (port/-up-project! e {:project "a-r1x" :dir proj :services ["app"] :labels {"hive.run" "r1x"}})
+          argv (first (last @calls))]
+      (is (= ["-f" "docker-compose.yml" "-f" (cli/override-path dir "a-r1x") "up"]
+             (take 5 (drop-while #(not= "-f" %) argv)))))))
+
 (deftest stack-dir-beside-the-state-file
   (is (= "/home/u/.local/state/hive-compose/stacks"
          (cli/stack-dir {:compose/state-file "/home/u/.local/state/hive-compose/state.edn"}))))
