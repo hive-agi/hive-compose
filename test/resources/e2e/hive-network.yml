@@ -1,0 +1,10 @@
+# Manual-run override: put a fixture project's default network on one shared,
+# pre-created docker network, so orders, billing, kafka and the suite resolve
+# each other by service name. hive-compose itself wires networks (and labels)
+# with its own override; the fixture compose files name no network.
+#
+#   docker compose -p orders -f orders/compose.yml -f hive-network.yml up -d
+networks:
+  default:
+    name: ${HIVE_NETWORK:-hive-e2e}
+    external: true
