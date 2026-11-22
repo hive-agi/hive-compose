@@ -122,16 +122,27 @@
   [res]
   (= :junit/unknown-root (:reason res)))
 
+(def mtime-slack-ms
+  "How much older than a run's start a report file may look and still be
+   read: file systems keep modification times coarsely."
+  2000)
+
 (defn read-reports
   "Result<Report> merging every report file under directory `dir` (a suite's
    :suite/reports-dir), sorted by path, each read in `format` (default
-   :auto). A file that cannot be read fails the whole, except that :auto
-   skips XML whose root is not JUnit (listed under :report/skipped-files); a
-   directory holding no report is `:report/none`."
+   :auto). With `since-ms`, files last modified before it (less
+   `mtime-slack-ms`) are left out: the leftovers of an earlier run in a
+   directory hive-compose does not own. A file that cannot be read fails the
+   whole, except that :auto skips XML whose root is not JUnit (listed under
+   :report/skipped-files); a directory holding no report is `:report/none`."
   ([dir] (read-reports dir :auto))
-  ([dir format]
+  ([dir format] (read-reports dir format nil))
+  ([dir format since-ms]
    (r/let-ok [files (r/try-effect* :report/unreadable
-                      (vec (sort-by str (filter report-file? (file-seq (io/file dir))))))]
+                      (vec (sort-by str (filter #(and (report-file? %)
+                                                      (or (nil? since-ms)
+                                                          (>= (.lastModified (io/file %)) (- since-ms mtime-slack-ms))))
+                                                (file-seq (io/file dir))))))]
      (loop [files files acc [] skipped []]
        (if-let [f (first files)]
          (let [res (read-report f format)]
@@ -143,3 +154,14 @@
            (r/err :report/none {:dir (str dir) :skipped-files skipped})
            (r/ok (cond-> (report/merge-reports acc)
                    (seq skipped) (assoc :report/skipped-files skipped)))))))))
+
+(defn clear-reports!
+  "Result<{:dir :removed n}>: every report file (.xml, .tap) under `dir`
+   deleted, so a runner's attempt is never read together with a previous
+   one's. Only report files go; nothing else in `dir` is touched. An absent
+   `dir` removes nothing. Use it on a directory hive-compose owns."
+  [dir]
+  (r/try-effect* :report/unclearable
+    (let [files (filter report-file? (file-seq (io/file dir)))]
+      (doseq [f files] (io/delete-file f true))
+      {:dir (str dir) :removed (count files)})))

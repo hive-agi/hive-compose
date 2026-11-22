@@ -59,3 +59,59 @@
    `tail` as the last lines of its log `log`."
   [rn program-id exit-code log tail]
   (swap! (:world rn) assoc-in [:dies program-id] {:exit-code exit-code :log log :tail tail}))
+
+;; ---------------------------------------------------------------------------
+;; ISuiteRunner (hc-8): scripted per test id `<suite>/<project>` (or per
+;; suite id), writing JUnit fixtures into the spec's reports dir.
+
+(defn junit
+  "JUnit XML with `passed` passing and `failed` failing cases of `suite`."
+  [suite passed failed]
+  (str "<testsuite name=\"" suite "\" tests=\"" (+ passed failed) "\" failures=\"" failed "\">"
+       (apply str (for [i (range passed)] (str "<testcase classname=\"c\" name=\"ok" i "\"/>")))
+       (apply str (for [i (range failed)] (str "<testcase classname=\"c\" name=\"bad" i "\"><failure message=\"x\"/></testcase>")))
+       "</testsuite>"))
+
+(defn- script-of [world spec]
+  (or (get-in @world [:scripts (:test-id spec)])
+      (get-in @world [:scripts (get-in spec [:cell :suite/id])])
+      {:exit 0 :passed 1 :failed 0}))
+
+(defn- run-suite! [world kind spec]
+  (swap! world update :runs conj (assoc spec ::kind kind))
+  (let [{:keys [exit passed failed error raw scrub]} (script-of world spec)
+        scrub-fn (fn [s] (reduce (fn [s [v r]] (clojure.string/replace s v r)) s scrub))
+        t (:clock (swap! world update :clock + 10))]
+    (if error
+      (r/err error {:exit nil :log-tail ["runner died"] :started-ms (- t 10) :ended-ms t})
+      (do
+        (when (or raw passed failed)
+          (let [dir (java.io.File. (str (:reports-dir spec)))]
+            (.mkdirs dir)
+            (spit (java.io.File. dir "junit.xml")
+                  (or raw (junit (get-in spec [:cell :suite/id]) (or passed 0) (or failed 0))))))
+        (r/ok (cond-> {:exit exit :started-ms (- t 10) :ended-ms t :log-tail [(str "exit " exit)]}
+                scrub (assoc :scrub scrub-fn)))))))
+
+(defn script!
+  "Replace the scripts of stub suite runner `sr`."
+  [sr scripts]
+  (swap! (:world sr) assoc :scripts scripts))
+
+(defrecord StubSuiteRunner [world]
+  port/ISuiteRunner
+  (-run-container! [_ spec] (run-suite! world :container spec))
+  (-run-command! [_ spec] (run-suite! world :command spec)))
+
+(defn suite-runner
+  "StubSuiteRunner over `scripts` ({test-id-or-suite-id {:exit n :passed n
+   :failed n} | {:error kw} | {:exit n :raw text}}, any with :scrub {value
+   rendering}, answered as the runner's :scrub fn); a script with neither
+   :passed, :failed nor :raw writes no report."
+  ([] (suite-runner {}))
+  ([scripts] (->StubSuiteRunner (atom {:scripts scripts :runs [] :clock 1000}))))
+
+(defn suite-runs
+  "Every RunnerSpec the stub ran, in order, with ::kind :container|:command."
+  [sr]
+  (:runs @(:world sr)))

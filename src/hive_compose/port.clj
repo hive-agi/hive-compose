@@ -212,3 +212,22 @@
     "Result<{:reset true}>: remove every toxic and enable every proxy.")
   (-list [c]
     "Result<{name Proxy}>: every proxy with its toxics."))
+
+(defprotocol ISuiteRunner
+  "Runs one suite x project cell (hc-8) to the end. A RunnerSpec is what
+   `hive-compose.promote.suite/runner-spec` answers: the runner, its env (a
+   value may be a secret reference, read only here, at spawn), the host
+   `:reports-dir` (created by the runner before it starts) and, for a
+   container, image, name, mounts, network, extra `:networks` and labels.
+
+   A test that fails is no runner error: a non-zero exit is an answer. The
+   error is for a runner that could not start or was cut off (a secret that
+   cannot be read, no docker, a timeout), and it carries what is known
+   (:exit nil, :log-tail)."
+  (-run-container! [r spec]
+    "Result<{:exit n :started-ms :ended-ms :log-tail [line]}>: run the
+     container of `spec` once, attached, on its network(s), its reports
+     directory mounted, labelled; it is removed afterwards.")
+  (-run-command! [r spec]
+    "Result<{:exit n :started-ms :ended-ms :log-tail [line]}>: run the host
+     command of `spec` in `:dir` with `:env`, bounded by `:timeout-ms`."))
