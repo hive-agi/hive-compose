@@ -93,14 +93,31 @@
   (let [leaf (str/join "." (keep blank->nil [(when (not= classname nm) classname) nm]))]
     (str/join "/" (keep blank->nil [suite leaf]))))
 
+;; Possessive throughout: no quantifier gives back what it took, so a long run
+;; of digits is read once (`\d+\.?\d*` was quadratic on a dotless run).
+(def ^:private seconds-re #"[+-]?+(?:\d++(?:\.\d*+)?+|\.\d++)(?:[eE][+-]?+\d++)?+")
+
+(defn- decimal-comma
+  "`s` with its comma read as a decimal separator (`0,123` is `0.123`), nil
+   when the comma could be a thousands separator instead (`1,234`: one to
+   three digits not starting with 0, then exactly three), which is not
+   supported, so no time is guessed. `s` without a comma is `s`."
+  [^String s]
+  (if-not (str/includes? s ",")
+    s
+    (when-let [[_ sign whole frac] (re-matches #"([+-]?+)(\d++),(\d++)" s)]
+      (when-not (and (re-matches #"[1-9]\d{0,2}" whole) (= 3 (count frac)))
+        (str sign whole "." frac)))))
+
 (defn parse-seconds
-  "A JUnit time attribute as seconds, nil when absent or unreadable. Tolerates
-   the thousands separators some writers put in (`1,234.5`)."
+  "A JUnit time attribute as seconds, nil when absent or unreadable. A comma
+   may be the decimal separator (`0,123` is 0.123); thousands separators are
+   not supported, so `1,234` and `1,234.5` are nil rather than a guess."
   [s]
-  (when-let [s (some-> s str/trim (str/replace "," "") blank->nil)]
-    (when (re-matches #"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?" s)
+  (when-let [s (some-> s str/trim blank->nil decimal-comma)]
+    (when (re-matches seconds-re s)
       (let [d (parse-double s)]
-        (when (Double/isFinite d) d)))))
+        (when (and d (Double/isFinite d)) d)))))
 
 (defn- children [el tag]
   (filter #(= tag (:tag %)) (:content el)))
@@ -167,13 +184,22 @@
    dropped, so no line costs more than a bounded, linear scan."
   65536)
 
-;; Every regex here is linear on its line: no nested or adjacent quantifiers
-;; over the same characters before a forced failure (see `tap-is-linear`).
-(def ^:private test-re #"^(not ok|ok)(?=\s|$)(?:\s+(\d+)(?=\s|$))?\s*(?:-\s*)?(.*)$")
-(def ^:private plan-re #"^1\.\.(\d{1,9})(?:\s*#.*)?$")
-(def ^:private bail-re #"^Bail out!\s*(.*)$")
-(def ^:private version-re #"(?i)^TAP version \d+$")
-(def ^:private directive-re #"(?i)#\s*(skip(?:ped)?|todo)(?=[\s:]|$)[\s:]*")
+(defn- capped-lines
+  "The lines of `text`, each cut to its first `max-line` characters."
+  [text]
+  (map #(if (> (count %) max-line) (subs % 0 max-line) %) (str/split-lines text)))
+
+;; Every regex here is linear on its line. Each quantifier is possessive, so
+;; none gives back what it took, and a line's tail is `(?s).*\z`: `.` takes
+;; the line terminators a plain `.` and `$` stop at (U+0085, U+2028, U+2029
+;; stay inside a line, since `str/split-lines` splits on \n only), so a
+;; whitespace run followed by one never backtracks. The `regexes-stay-linear`
+;; test holds them to it, through a bounded future.
+(def ^:private test-re #"(?s)^(not ok|ok)(?=\s|\z)(?:\s++(\d++)(?=\s|\z))?+\s*+(?:-\s*+)?+(.*)\z")
+(def ^:private plan-re #"(?s)^1\.\.(\d{1,9})(?:\s*+#.*)?+\z")
+(def ^:private bail-re #"(?s)^Bail out!\s*+(.*)\z")
+(def ^:private version-re #"(?i)^TAP version \d++\z")
+(def ^:private directive-re #"(?i)#\s*+(skip(?:ped)?|todo)(?=[\s:]|\z)[\s:]*+")
 
 (defn- indent [line]
   (count (re-find #"^ *" line)))
@@ -268,7 +294,7 @@
 (defn- yaml-seconds
   "duration_ms (node:test) of a YAML diagnostic block, in seconds."
   [yaml]
-  (when-let [ms (some->> yaml (re-find #"(?m)^\s*duration_ms:\s*([0-9.]+(?:[eE][+-]?\d+)?)\s*$") second parse-double)]
+  (when-let [ms (some->> yaml (re-find #"(?m)^[ \t]*+duration_ms:[ \t]*+([0-9.]++(?:[eE][+-]?+\d++)?+)[ \t]*+$") second parse-double)]
     (* 0.001 ms)))
 
 (defn- attach
@@ -283,25 +309,55 @@
             :comment (update-in p [:case :case/output] #(if % (str % "\n" text) text)))]
     (conj (pop points) p)))
 
+(def max-missing
+  "More tests than this missing from a plan reads as a broken plan line, not
+   as that many errors."
+  10000)
+
+(defn- implausible-plan? [plan points]
+  (and plan (> (- plan (count points)) max-missing)))
+
+(defn- missing
+  "An :error case per test number plan `plan` promised that never ran."
+  [plan points bail]
+  (when plan
+    (let [seen (set (map :num points))
+          why (if bail (str "Bail out! " bail) (str "not run: missing from plan 1.." plan))]
+      (for [i (range 1 (inc plan)) :when (not (seen i))]
+        (tap-case (str "test " i) :error why)))))
+
 (declare fold-level)
 
 (defn- subtests
-  "Leaf points of the deeper tokens `tokens`, folded at `d`."
-  [tokens d]
-  (:points (fold-level tokens d)))
+  "Points of the deeper tokens `tokens`, folded at `d`, and an :error point
+   per test the subtest's own plan promised that never ran, as at the top
+   level, so a subtest cut short fails its parent. `budget` (a volatile) is
+   how many such points every subtest of the parse may still add together; a
+   subtest plan overdrawing it reads as a broken plan line and throws
+   ::implausible-plan, which `parse-tap` answers as `:tap/implausible-plan`.
+   So the subtests of one parse add at most `max-missing` points between
+   them, however many there are and however deep."
+  [tokens d budget]
+  (let [{:keys [points plan]} (fold-level tokens d budget)
+        short (vec (take (inc @budget) (missing plan points nil)))]
+    (when (> (count short) @budget)
+      (throw (ex-info "subtest plan implausible" {::implausible-plan plan})))
+    (vswap! budget - (count short))
+    (into points (map (fn [c] {:num nil :case c :children []})) short)))
 
 (defn- fold-level
   "Fold the tokens of one level, `d` deep, into {:points [..] :plan n}.
    Deeper tokens are a subtest; TAP 14 prints it before the point that closes
-   it, which takes the subtest's points as :children."
-  [tokens d]
+   it, which takes the subtest's points as :children. `budget` bounds the
+   :error points the subtests' plans may add (see `subtests`)."
+  [tokens d budget]
   (loop [tokens tokens points [] plan nil pending [] n 0 open? false]
     (if-let [{:keys [kind] :as t} (first tokens)]
       (cond
         (and (> (:depth t) d) (not (#{:yaml :comment} kind)))
         (let [[deeper more] (split-with #(> (:depth %) d) tokens)
               deeper (vec deeper)]
-          (recur more points plan (into pending (subtests deeper (apply min (map :depth deeper)))) n false))
+          (recur more points plan (into pending (subtests deeper (apply min (map :depth deeper)) budget)) n false))
 
         (= :test kind)
         (let [p (assoc (test-point (:body t) (inc n)) :children pending)]
@@ -335,42 +391,24 @@
                 :else kids)))
           points))
 
-(def max-missing
-  "More tests than this missing from a plan reads as a broken plan line, not
-   as that many errors."
-  10000)
-
-(defn- implausible-plan? [plan points]
-  (and plan (> (- plan (count points)) max-missing)))
-
-(defn- missing
-  "An :error case per test number plan `plan` promised that never ran."
-  [plan points bail]
-  (when plan
-    (let [seen (set (map :num points))
-          why (if bail (str "Bail out! " bail) (str "not run: missing from plan 1.." plan))]
-      (for [i (range 1 (inc plan)) :when (not (seen i))]
-        (tap-case (str "test " i) :error why)))))
-
 (defn parse-tap
   "Result<Report> from TAP 13/14 text: a plan `1..N` before or after the
    tests, `ok`/`not ok` points with `# SKIP`/`# TODO` directives, a YAML
    diagnostic block kept raw as its point's message, trailing `#` comments as
    its output, subtests flattened into `parent/child` ids. A test the plan
-   promised and that never ran counts as :error; so does `Bail out!` without a
-   plan. Text with no plan, no test point and no bail-out, or a plan promising
+   promised and that never ran counts as :error, a subtest's plan included
+   (`parent/test N`); so does `Bail out!` without a plan. Text with no plan, no test point and no bail-out, or a plan promising
    more than `max-missing` tests beyond those that ran, is
    `:report/malformed`."
   [text]
   (if-not (string? text)
     (malformed :tap/not-text)
     (try
-      (let [lines (->> (str/split-lines (str/replace (str/replace-first text #"^\uFEFF" "") #"\r\n?" "\n"))
-                       (map #(if (> (count %) max-line) (subs % 0 max-line) %)))
+      (let [lines (capped-lines (str/replace (str/replace-first text #"^\uFEFF" "") #"\r\n?" "\n"))
             tokens (lex lines)
             [run [bail]] (split-with #(not= :bail (:kind %)) tokens)
             bail (some-> bail :reason str/trim)
-            {:keys [points plan]} (fold-level (vec run) 0)]
+            {:keys [points plan]} (fold-level (vec run) 0 (volatile! max-missing))]
         (cond
           (and (nil? plan) (empty? points) (nil? bail)) (malformed :tap/no-tests)
           (implausible-plan? plan points) (malformed :tap/implausible-plan :plan plan)
@@ -381,6 +419,10 @@
                                 [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))]))]
             (r/ok (cond-> (->report :tap cases)
                     bail (assoc :report/bail-out bail))))))
+      (catch clojure.lang.ExceptionInfo e
+        (if-let [plan (::implausible-plan (ex-data e))]
+          (malformed :tap/implausible-plan :plan plan)
+          (throw e)))
       (catch StackOverflowError _
         (malformed :tap/too-deep)))))
 
@@ -390,7 +432,9 @@
 
 (defn detect-format
   "The format of report `content`: :junit for XML, :tap when a line is a TAP
-   version, plan or test point, nil otherwise."
+   version, plan or test point, nil otherwise. Each line is read as
+   `parse-tap` reads it, cut to `max-line` characters, so no line costs more
+   than a bounded, linear scan."
   [content]
   (when (string? content)
     (let [s (str/triml (str/replace-first content "\uFEFF" ""))]
@@ -398,7 +442,7 @@
         (str/starts-with? s "<") :junit
         (some #(let [l (str/trim %)]
                  (or (re-matches version-re l) (re-matches plan-re l) (re-matches test-re l)))
-              (str/split-lines s))
+              (capped-lines s))
         :tap))))
 
 (defn merge-reports

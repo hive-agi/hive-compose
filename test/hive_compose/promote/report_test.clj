@@ -81,7 +81,8 @@
     (is (report/valid-report? rep))
     ;; the nearest named suite, not the path of suites
     (is (= ["inner/a" "outer/K.b" "outer" "loose"] (mapv :case/id (:report/cases rep))))
-    (is (= [nil 1234.5 nil nil] (mapv :case/time-s (:report/cases rep))))
+    (is (= [nil nil nil nil] (mapv :case/time-s (:report/cases rep)))
+        "a thousands separator is not guessed at: 1,234.5 reads as no time")
     (is (= :failed (:case/status (last (:report/cases rep)))) "a failure outranks a skip")
     (testing "a bare <testsuite> root"
       (is (= ["s/x"] (mapv :case/id (:report/cases (:ok (br/parse "<testsuite name='s'><testcase name='x'/></testsuite>")))))))))
@@ -183,14 +184,87 @@
 (defn- tap-cases [s]
   (mapv (juxt :case/id :case/status) (:report/cases (:ok (report/parse-tap s)))))
 
-(deftest review-regressions
-  (testing "regexes stay linear on long lines (ReDoS)"
-    (let [pad (apply str (repeat 60000 " "))
-          t0 (System/nanoTime)]
+(def ^:private linear-budget-ms
+  "Generous on purpose: each input below takes milliseconds when the parse is
+   linear and minutes when it is quadratic, so a loaded machine never flakes
+   it."
+  60000)
+
+(defn- bounded
+  "`(f)`, or ::timeout when it does not return within `linear-budget-ms`."
+  [f]
+  (let [fut (future (f))
+        v (deref fut linear-budget-ms ::timeout)]
+    (when (= ::timeout v) (future-cancel fut))
+    v))
+
+(deftest regexes-stay-linear
+  (let [pad (apply str (repeat 60000 " "))]
+    (testing "long lines (ReDoS)"
       (doseq [s [(str "ok 1 - a" pad "x") (str "ok 1 - a" pad "# x")
                  (str "not ok" pad "#" pad) (str "ok 1 - " (apply str (repeat 200000 "#")))]]
-        (is (r/ok? (report/parse-tap s))))
-      (is (< (/ (- (System/nanoTime) t0) 1e6) 2000.0))))
+        (is (r/ok? (bounded #(report/parse-tap s))))))
+    (testing "a whitespace run followed by a line terminator split-lines keeps"
+      (doseq [nl ["\u2028" "\u2029" "\u0085"]
+              s [(str "ok 1 -" pad nl "x") (str "not ok" pad nl "x") (str "ok 1 - a #" pad nl "x")
+                 (str "Bail out!" pad nl "x") (str "1..3" pad nl "x")]]
+        (is (not= ::timeout (bounded #(report/parse-tap s))) (pr-str (subs s 0 10) nl))
+        (is (not= ::timeout (bounded #(report/detect-format s))) (pr-str (subs s 0 10) nl)))
+      (is (= :tap (bounded #(report/detect-format (str "ok 1 -" pad "\u2028x")))))
+      (is (= [["\u0085x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u0085x"))))
+          "U+0085 is neither \\s nor whitespace to str/trim: the description keeps it")
+      (is (= [["x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u2028x"))))
+          "U+2028 is whitespace to str/trim, which drops it from the description"))
+    (testing "YAML: blank lines before a duration"
+      (let [yaml (str "ok 1 - a\n  ---\n" (apply str (repeat 20000 "  \n")) "  x: 1\n  ...\n1..1")]
+        (is (r/ok? (bounded #(report/parse-tap yaml))))))
+    (testing "a JUnit time that is a long run of digits"
+      (is (nil? (bounded #(report/parse-seconds (str (apply str (repeat 200000 "1")) "x"))))))
+    (testing "a 1 MB single line through :auto"
+      (let [mb (apply str (repeat (* 1024 1024) " "))]
+        (is (r/ok? (bounded #(br/parse (str "ok" mb "\u0085x")))))
+        (is (r/ok? (bounded #(br/parse (str "ok 1 - a" mb "\u2028x")))))
+        (is (= :format/unknown (:reason (bounded #(br/parse (str "zz" mb "\u2028x"))))))))))
+
+(deftest parse-seconds
+  (testing "a comma as the decimal separator"
+    (is (= 0.123 (report/parse-seconds "0,123")))
+    (is (= 12.5 (report/parse-seconds "12,5")))
+    (is (= 1.2345 (report/parse-seconds "1,2345"))))
+  (testing "thousands separators are not supported: nil, never a guess"
+    (is (nil? (report/parse-seconds "1,234")))
+    (is (nil? (report/parse-seconds "1,234.5")))
+    (is (nil? (report/parse-seconds "1,234,567")))
+    (is (nil? (report/parse-seconds "1,2.3"))))
+  (testing "plain and exponent forms"
+    (is (= 1.5 (report/parse-seconds " 1.5 ")))
+    (is (= 0.5 (report/parse-seconds ".5")))
+    (is (= 3.0 (report/parse-seconds "3.")))
+    (is (= 1500.0 (report/parse-seconds "1.5e3")))
+    (is (nil? (report/parse-seconds "1e999")))
+    (is (nil? (report/parse-seconds "NaN")))
+    (is (nil? (report/parse-seconds "")))
+    (is (nil? (report/parse-seconds nil)))))
+
+(deftest subtest-plan-shortfall
+  (testing "a test a subtest's plan promised and that never ran is an error under its parent"
+    (let [rep (:ok (report/parse-tap "    1..3\n    ok 1 - c\nnot ok 1 - p\n1..1"))]
+      (is (= {"p/c" :passed "p/test 2" :error "p/test 3" :error} (by-status rep)))
+      (is (= {:passed 1 :failed 0 :error 2 :skipped 0} (:report/totals rep)))))
+  (testing "nested two deep"
+    (is (= {"p/q/a" :passed "p/q/test 2" :error "p/b" :passed}
+           (by-status (:ok (report/parse-tap (str "        ok 1 - a\n        1..2\n    not ok 1 - q\n"
+                                                  "    ok 2 - b\n    1..2\nnot ok 1 - p\n1..1")))))))
+  (testing "a subtest plan promising far more than ran reads as broken"
+    (is (= :tap/implausible-plan
+           (:reason (bounded #(report/parse-tap "    1..99999999\n    ok 1 - c\nok 1 - p\n1..1")))))
+    (is (= :tap/implausible-plan
+           (:reason (bounded #(report/parse-tap
+                               (apply str (concat (repeat 3 "    1..6000\n    ok 1 - c\nok 1 - p\n")
+                                                  ["1..3"]))))))
+        "the shortfall budget is shared by every subtest of a parse")))
+
+(deftest review-regressions
   (testing "an unterminated YAML block never swallows later test points"
     (is (= [["a" :passed] ["b" :failed] ["c" :passed]]
            (tap-cases "ok 1 - a\n  ---\n  x: 1\nnot ok 2 - b\nok 3 - c\n1..3")))
