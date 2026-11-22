@@ -1,0 +1,33 @@
+# orders-suite as compose services: `suite` writes JUnit XML, `suite-tap`
+# (profile tap) writes TAP. Both run once and exit 1 on purpose (one case fails).
+# Reports land in ${REPORTS_DIR:-./reports} on the host.
+#
+#   docker compose -p suite-<run> run --rm suite
+#   docker compose -p suite-<run> --profile tap run --rm suite-tap
+x-suite-env: &suite-env
+  ORDERS_URL: ${ORDERS_URL:-http://orders:8080}
+  BILLING_URL: ${BILLING_URL:-http://billing:8080}
+  HIVE_RUN_ID: ${HIVE_RUN_ID:-}
+  TRACEPARENT: ${TRACEPARENT:-}
+  BAGGAGE: ${BAGGAGE:-}
+  INVOICE_WAIT_S: ${INVOICE_WAIT_S:-30}
+
+services:
+  suite:
+    build: .
+    image: hive-compose-e2e/suite:dev
+    environment:
+      <<: *suite-env
+      REPORT_FORMAT: junit
+    volumes:
+      - ${REPORTS_DIR:-./reports}:/reports
+
+  suite-tap:
+    build: .
+    image: hive-compose-e2e/suite:dev
+    profiles: [tap]
+    environment:
+      <<: *suite-env
+      REPORT_FORMAT: tap
+    volumes:
+      - ${REPORTS_DIR:-./reports}:/reports
