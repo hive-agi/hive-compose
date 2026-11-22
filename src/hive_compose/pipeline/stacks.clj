@@ -141,14 +141,19 @@
 
 (defn resolve-plan
   "Result<{:resolution :plan :wirings}> of stack `stack-id` for run `run-id`:
-   resolution (hc-3), StackPlan (hc-4) and Wirings (hc-5). Pure, no engine."
-  [ctx stack-id run-id]
-  (let [settings (:settings ctx)]
-    (r/let-ok [s (stack-config ctx stack-id)
-               res (capability/resolve-stack (:compose/projects settings) s)
-               sp (stack/stack-plan settings res run-id {:stack stack-id})
-               ws (wiring/wirings settings res run-id)]
-      (r/ok {:resolution res :plan sp :wirings ws}))))
+   resolution (hc-3), StackPlan (hc-4) and Wirings (hc-5). Pure, no engine.
+   `extra` ({consumer Needs}, optional) adds consumers that run no containers
+   of their own, such as a suite `suite:<id>` (hc-8): they are resolved and
+   wired, and the stack never starts them. nil or empty changes nothing."
+  ([ctx stack-id run-id] (resolve-plan ctx stack-id run-id nil))
+  ([ctx stack-id run-id extra]
+   (let [settings (:settings ctx)]
+     (r/let-ok [s (stack-config ctx stack-id)
+                res (capability/resolve-stack (:compose/projects settings) s
+                                              (cond-> {} (seq extra) (assoc :extra extra)))
+                sp (stack/stack-plan settings res run-id {:stack stack-id})
+                ws (wiring/wirings settings res run-id)]
+       (r/ok {:resolution res :plan sp :wirings ws})))))
 
 (defn- consumer-services
   "Result<[service]>: what consumer `c` runs: the services of its section
@@ -235,13 +240,14 @@
 
 (defn stack-up!
   "Result<{:run :stack :instances [..] :consumers [..] :networks [..]}>: run
-   stack `stack` (`opts` {:stack id :run id? :wait? (default true)}). The run
+   stack `stack` (`opts` {:stack id :run id? :wait? (default true) :extra
+   {consumer Needs}? (see `resolve-plan`)}). The run
    is recorded before anything starts, so a failure midway answers an error
    carrying `:run` that stack-down! releases."
-  [ctx {stack-id :stack run-id :run wait? :wait? :or {wait? true}}]
+  [ctx {stack-id :stack run-id :run wait? :wait? extra :extra :or {wait? true}}]
   (r/let-ok [engine (stack-engine ctx)
              rid (pick-run-id ctx stack-id run-id)
-             {sp0 :plan ws :wirings} (resolve-plan ctx stack-id rid)
+             {sp0 :plan ws :wirings} (resolve-plan ctx stack-id rid extra)
              sp (with-needs engine (:settings ctx) sp0)
              pre (preexisting engine (:settings ctx) sp (live-plans ctx))]
     (let [t (now ctx)
@@ -361,9 +367,9 @@
 (defn plan
   "Result<{:diff :text}>: hc-4 plan-diff of stack `stack-id` against what
    runs now (by compose project label), and its rendering."
-  [ctx {stack-id :stack run-id :run}]
+  [ctx {stack-id :stack run-id :run extra :extra}]
   (r/let-ok [engine (stack-engine ctx)
-             {sp :plan} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")))
+             {sp :plan} (resolve-plan ctx stack-id (or run-id (run/run-id stack-id "000000")) extra)
              running (all-ok (fn [cp] (r/map-ok (project-health engine cp)
                                                 (fn [h] (for [[s {:keys [state]}] h :when (= "running" state)]
                                                           {:project cp :service s}))))
