@@ -21,6 +21,27 @@
       (is (= "b" (:current (sync/merge-state base base (assoc base :current "b")))))
       (is (= "c" (:current (sync/merge-state base (assoc base :current "c") base)))))))
 
+(deftest stack-runs-merge-like-entries-and-stay-optional
+  (let [base {:active {} :current nil}]
+    (is (not (contains? (sync/merge-state base base base) :stacks)) "an old state file gains no key")
+    (is (= {"r1x" (entry 2)}
+           (:stacks (sync/merge-state base base (assoc base :stacks {"r1x" (entry 2)}))))
+        "theirs started a run")
+    (let [b (assoc base :stacks {"r1x" (entry 1 "a" 1)})]
+      (is (= #{"a" "b"}
+             (set (keys (get-in (sync/merge-state b (assoc b :stacks {"r1x" (entry 4 "a" 4)})
+                                                  (assoc b :stacks {"r1x" (entry 3 "a" 1 "b" 3)}))
+                                [:stacks "r1x" :claims]))))
+          "claims of a run from both sides survive")
+      (is (= {} (:stacks (sync/merge-state b (assoc b :stacks {}) b))) "mine took the run down"))))
+
+(deftest preexistence-marks-only-grow
+  (let [b {:active {} :current nil :preexisting {"infra/kafka" #{"kafka"}}}]
+    (is (= {"infra/kafka" #{"kafka"} "infra/pg" #{"db"}}
+           (:preexisting (sync/merge-state b (dissoc b :preexisting)
+                                           (assoc-in b [:preexisting "infra/pg"] #{"db"}))))
+        "a side without the key never removes a mark")))
+
 (deftest both-sides-changed-an-entry
   (let [base {:active {"a" (entry 1 "x" 1)}}
         mine {:active {"a" (entry 5 "x" 5)}}

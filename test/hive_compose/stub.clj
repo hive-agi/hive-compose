@@ -112,7 +112,8 @@
             (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
-    (r/ok {:out "log"}))
+    (or (fault world :logs)
+        (r/ok {:out (get-in @world [:logs (profile/project p)] "log")})))
 
   port/IDependencyGraph
   ;; As `compose config --format json [targets]`: the targets' closure when
@@ -174,6 +175,147 @@
               running (get-in @world [:running project] #{})]
           (r/ok (select-keys (get-in @world [:load project] {}) running))))))
 
+;; ---------------------------------------------------------------------------
+;; IStackEngine: networks and labelled containers.
+;;
+;; World keys: :networks {name {:labels {k v} :members {container [alias]}}},
+;; :containers {name {:project :service :labels :state :health :networks
+;; #{name}}}, :health {[project service] :healthy|:unhealthy|:starting|:none}
+;; (default :healthy) set with `health!`. A container is `<project>-<svc>-1`.
+
+(defn- container-name [project svc] (str project "-" svc "-1"))
+
+(defn- has-labels? [want labels]
+  (every? (fn [[k v]] (= v (get labels k))) want))
+
+(defn- missing-network [world spec]
+  (when-let [n (first (remove (or (:networks @world) {}) (:networks spec)))]
+    (r/err :compose/command-failed {:exit 1 :stderr (str "network " n " declared as external, but could not be found\n")})))
+
+(defn- unhealthy [world spec]
+  (when (:wait? spec)
+    (when-let [s (first (filter #(#{:unhealthy :starting} (get-in @world [:health [(:project spec) %]]))
+                                (:services spec)))]
+      (r/err :compose/command-failed {:exit 1 :stderr (str "container " (container-name (:project spec) s)
+                                                           " is unhealthy\n")}))))
+
+(extend-type StubEngine
+  port/IStackEngine
+  (-network-create! [{:keys [world]} network labels]
+    (record! world [:network-create network labels])
+    (or (fault world :network-create)
+        (if (get-in @world [:networks network])
+          (r/ok {:network network :created? false})
+          (do (swap! world assoc-in [:networks network] {:labels (into {} labels) :members {}})
+              (r/ok {:network network :created? true})))))
+  (-network-rm! [{:keys [world]} network]
+    (record! world [:network-rm network])
+    (or (fault world :network-rm)
+        (if-let [{:keys [members]} (get-in @world [:networks network])]
+          (do (swap! world (fn [w]
+                             (-> (reduce (fn [w c] (update-in w [:containers c :networks] disj network))
+                                         w (keys members))
+                                 (update :networks dissoc network))))
+              (r/ok {:network network :removed? true :disconnected (vec (sort (keys members)))}))
+          (r/ok {:network network :removed? false :disconnected []}))))
+  (-network-connect! [{:keys [world]} network {:keys [project service]} aliases]
+    (record! world [:network-connect network project service (vec aliases)])
+    (or (fault world :network-connect)
+        (let [c (container-name project service)]
+          (cond
+            (not (get-in @world [:networks network]))
+            (r/err :compose/command-failed {:exit 1 :stderr (str "network " network " not found\n")})
+            (not (get-in @world [:containers c]))
+            (r/err :compose/no-container {:project project :service service :network network})
+            :else
+            (do (swap! world #(-> %
+                                  (assoc-in [:networks network :members c] (vec aliases))
+                                  (update-in [:containers c :networks] (fnil conj #{}) network)))
+                (r/ok {:network network :containers [c]}))))))
+  (-up-project! [{:keys [world]} spec]
+    (record! world [:up-project (:project spec) (vec (:services spec))
+                    (select-keys spec [:labels :networks :wait? :container-env :files])])
+    (if (empty? (:services spec))
+      (r/ok {:out "" :skipped :no-services})
+      (or (fault world :up-project)
+          (missing-network world spec)
+          ;; as compose: `up` starts the depends_on of what it names (unless
+          ;; :no-deps?); the model is the one of the project the files define.
+          (let [{:keys [project labels networks]} spec
+                ;; the files define the model: that of the project the dir names
+                model (or (get-in @world [:projects project])
+                          (get-in @world [:projects (profile/default-project (:dir spec))])
+                          {})
+                services (if (or (:no-deps? spec) (empty? model))
+                           (vec (:services spec))
+                           (closure model (filter model (:services spec))))
+                services (vec (distinct (concat services (remove model (:services spec)))))]
+            (swap! world
+                   (fn [w]
+                     (-> (reduce (fn [w s]
+                                   (let [c (container-name project s)
+                                         nets (set networks)
+                                         w (reduce #(assoc-in %1 [:networks %2 :members c] [s]) w nets)]
+                                     (assoc-in w [:containers c]
+                                               {:project project :service s
+                                                :labels (merge {"com.docker.compose.project" project
+                                                                "com.docker.compose.service" s}
+                                                               labels)
+                                                :state "running"
+                                                :health (get-in w [:health [project s]] :healthy)
+                                                :networks nets})))
+                                 w services)
+                         (update-in [:running project] (fnil into #{}) services))))
+            (or (unhealthy world spec)
+                (r/ok {:out ""}))))))
+  (-down-project! [{:keys [world]} spec]
+    (record! world [:down-project (:project spec) (if (:all? spec) :all (vec (:services spec)))])
+    (or (fault world :down-project)
+        (let [{:keys [project]} spec
+              gone (if (:all? spec)
+                     (set (or (get-in @world [:running project]) #{}))
+                     (set (:services spec)))
+              names (set (map #(container-name project %) gone))]
+          (swap! world (fn [w]
+                         (-> w
+                             (update :containers #(apply dissoc % names))
+                             (update :networks (fn [ns] (into {} (for [[n m] ns]
+                                                                   [n (update m :members #(apply dissoc % names))]))))
+                             (update-in [:running project] #(reduce disj (or % #{}) gone)))))
+          (r/ok {:out ""}))))
+  (-running-labelled [{:keys [world]} labels]
+    (or (fault world :running-labelled)
+        (r/ok (vec (sort-by :name
+                            (for [[nm c] (:containers @world)
+                                  :when (has-labels? labels (:labels c))]
+                              (assoc (select-keys c [:project :service :labels :state :health]) :name nm)))))))
+  (-networks-labelled [{:keys [world]} labels]
+    (or (fault world :networks-labelled)
+        (r/ok (vec (sort-by :name
+                            (for [[nm n] (:networks @world)
+                                  :when (has-labels? labels (:labels n))]
+                              {:name nm :labels (:labels n)})))))))
+
+(defn health!
+  "Make the container of `service` in compose project `project` report `h`
+   (:healthy :unhealthy :starting :none); `up --wait` fails on :unhealthy or
+   :starting, as compose's does on a timeout."
+  [e project service h]
+  (swap! (:world e) (fn [w]
+                      (cond-> (assoc-in w [:health [project service]] h)
+                        (get-in w [:containers (container-name project service)])
+                        (assoc-in [:containers (container-name project service) :health] h)))))
+
+(defn networks
+  "{name {:labels :members {container [alias]}}} of the stub world."
+  [e]
+  (:networks @(:world e) {}))
+
+(defn containers
+  "{name {:project :service :labels :state :health :networks}} of the stub world."
+  [e]
+  (:containers @(:world e) {}))
+
 (defn engine
   "StubEngine over `closures` ({preset-id [service]}), `running`
    ({project #{service}}) and compose `projects`
@@ -206,6 +348,11 @@
   "Make `-dependencies` answer `g` for `project`, whatever the model says."
   [e project g]
   (swap! (:world e) assoc-in [:graphs project] g))
+
+(defn logs!
+  "Make `-logs` of compose project `project` answer `text` (as `compose logs` prints it)."
+  [e project text]
+  (swap! (:world e) assoc-in [:logs project] text))
 
 (defn holds!
   "Make the services of `project` mount volumes and publish ports `m`
