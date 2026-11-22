@@ -224,6 +224,127 @@ releases it.
 project's `:project/env` from the addon config, so repeat in `:profile/env` every
 value the preset's services need.
 
+## Stacks, suites and why
+
+Sections run one compose project's `depends_on` closure. A **stack** works
+one level higher. Projects declare which **capabilities** they provide and
+need, and one call brings up every dependency across compose projects.
+**Suites** test that stack, and when a test fails, **why** gives the reason
+from telemetry.
+
+### Capabilities and stacks
+
+```clojure
+{:compose/projects
+ {"kafka"   {:project/dir "~/w/kafka"
+             :project/provides {"kafka" {:service "kafka" :version "3.9"
+                                         :env {"KAFKA_BOOTSTRAP" "kafka:9092"}
+                                         :tenancy {:env "TOPIC_PREFIX" :scope :run}}}}
+  "orders"  {:project/dir "~/w/orders"
+             :project/needs {"kafka" {:version "^3"} "otel" {}}}
+  "billing" {:project/dir "~/w/billing"
+             :project/needs {"kafka" {:version "^3"} "otel" {}}}
+  "audit"   {:project/dir "~/w/billing"
+             :project/needs {"kafka" {:version "^3" :share? false} "otel" {}}}}
+ :compose/stacks {"shop" {:stack/id "shop" :stack/consumers ["orders" "billing" "audit"]}}}
+```
+
+- **Union sharing.** A pure resolver (`promote.capability`) maps every need
+  to a provider. Compatible version ranges of several consumers share one
+  instance, which runs under the provider's own compose project, the same
+  container a section `up` of that project runs. Here `orders` and `billing`
+  get one Kafka.
+- **Opt-out.** `:share? false` gives a consumer its own private instance,
+  `-p <provider>-<consumer>-<run>`, which nobody else sees. Here `audit` gets
+  its own Kafka.
+- **Wiring.** Every consumer joins only its own view network,
+  `hive-<run>-<consumer>`. The instances it binds join that network under
+  their service names, so a provider's `:env` (`kafka:9092`) is right as
+  written. Each consumer receives:
+  - the providers' env;
+  - `HIVE_RUN_ID`;
+  - the OTLP variables;
+  - a tenancy prefix, so consumers of a shared broker do not cross-talk.
+    By default it is per consumer, `<run>.<consumer>.`. With
+    `:tenancy {:scope :run}`, every consumer of the run gets `<run>.`, which
+    a producer and a consumer of one topic need.
+- **Telemetry is always there.** The built-in `otel` capability
+  (`resources/hive-compose/otel`, grafana/otel-lgtm) is wired to every
+  consumer: `OTEL_EXPORTER_OTLP_ENDPOINT` points at `otel`, and
+  `OTEL_RESOURCE_ATTRIBUTES` carries `hive.run.id`.
+- **Runs.** A run is recorded before anything starts, and its containers
+  and networks carry the labels `hive.run`, `hive.stack`, `hive.instance`
+  and `hive.consumer`. Instances come up in dependency order: each is
+  `up --wait`ed, and its dependents start only once it is healthy.
+  `stack-down` releases a shared instance only when no other live run or
+  active section still needs it (a refcount), and never removes volumes.
+
+The stack ops are `hive-compose.pipeline.stacks/stack-up!`, `stack-down!`,
+`stack-status` and `plan` (a terraform-plan style diff: what is shared,
+private, already running). Agents claim a run with `target=stack:<run>`, and
+the reaper treats runs as it treats sections.
+
+### Suites
+
+A suite is a test runner in any language: a container `:suite/image`, or a
+host `:suite/command`. hive-compose never ships code into it. The contract is
+protocols only:
+- in: env vars, `TRACEPARENT` and `BAGGAGE` (`test.id=<suite>/<project>`),
+  OTLP;
+- out: JUnit XML or TAP in its reports directory, and its exit code.
+
+```clojure
+:compose/suites {"orders-suite" {:suite/image "acme/orders-suite:1"
+                                 :suite/projects ["orders"]
+                                 :suite/env {"ORDERS_URL" "http://orders:8080"}
+                                 :suite/report-format :junit}}
+```
+
+`compose test suites=X,Y projects=A,B` works in four steps:
+1. It expands the suite x project matrix.
+2. It brings up the minimal union stack the cells need. Given `run=<id>`, it
+   reuses a live run instead.
+3. It runs every cell, each correlated by run id and test id.
+4. It folds the reports into one summary per cell, case and project.
+
+### why
+
+`compose why test=<case>` explains a failed case in one call. The bundle it
+answers holds:
+- the case and its cell;
+- the traces that carry its `test.id`, read from Tempo through the
+  `ITraceQuery` port;
+- the failing span with its service and status message, plus the span path
+  from the root;
+- the container log lines from the case's time window;
+- the run's plan.
+
+The failing span is the deepest error span that carries a message. otelhttp
+blanks the message of a 5xx server span, so a service records the cause on
+a child span (`orders validate: sku boom rejected`). Failed stacks stay up
+for inspection, and the reaper TTL still applies.
+
+### Why this shape
+
+- **Capabilities, not service names.** Projects never name each other's
+  containers, so a provider can be swapped, versioned or made private
+  without touching its consumers.
+- **Isolation through compose.** A shared instance runs under its
+  provider's project name and a private one under a per-run project, with
+  one network per consumer. Docker DNS is then never ambiguous, and nothing
+  new has to be built.
+- **Protocols over SDKs.** Env vars, health checks, OTLP, W3C trace context
+  and JUnit/TAP are understood by every language and every runner. That
+  makes the e2e polyglot, as the Go and Node fixtures show.
+
+The proof is `test/hive_compose/stack_e2e_test.clj` (`clojure -M:integration`)
+over the fixtures in `test/resources/e2e`. It shows:
+- A (Go `orders`) and B (Node `billing`) share one Kafka;
+- C (a second `billing`) opts out and gets a private Kafka, and never sees
+  A's orders;
+- otel is wired to all three;
+- the stack goes down without leaving a network behind.
+
 ## Safety
 
 - Only sections the addon started or adopted are ever reaped. Adoption covers
