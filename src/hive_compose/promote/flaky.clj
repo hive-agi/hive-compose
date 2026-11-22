@@ -57,32 +57,36 @@
         :else (str x)))
 
 (defn run-outcomes
-  "The CaseOutcome rows of run result `run`, recorded at `at` (epoch ms)
-   unless the run carries its own `:run/at`.
+  "The CaseOutcome rows of run result `run`, recorded at its own time
+   (`:run/at`, else `:finished-at`, else `:started-at`) or at `at` (epoch ms)
+   when it carries none.
 
    `run` is the run result hc-8's suite runner answers:
-     {:run/id RunId :suite/id s :project p :exit n :run/sha sha?
+     {:run/id RunId :suite/id s :project p :exit n-or-nil :status s?
+      :run/sha sha? :started-at ms? :finished-at ms?
       :report {:report/format :junit|:tap
                :report/cases [{:case/id \"<suite>/<classname>.<name>\"
                                :case/status :passed|:failed|:error|:skipped
                                :case/time-s seconds-or-nil ..} ..]}}
    Only the keys above are read. One row per case, plus one for the runner
-   itself, case `<suite>/(run)`: :error when it exited non-zero with no case
-   in its report (it died before writing it), else :passed. So a runner that
-   dies shows in the history, and one that recovers reads :fixed instead of
-   staying a regression. A run with no case and no exit code records nothing."
+   itself, case `<suite>/(run)`: :error when its report holds no case and it
+   did not exit 0 (it exited non-zero, or was killed or timed out, exit nil,
+   before writing it), else :passed. So a runner that dies shows in the
+   history, and one that recovers reads :fixed instead of staying a
+   regression. A run with no case and neither an `:exit` nor a `:status` key
+   records nothing."
   [run at]
   (let [suite (id-str (:suite/id run))
         base (cond-> {:run/id (id-str (:run/id run))
                       :suite/id suite
-                      :at (or (:run/at run) at)}
+                      :at (or (:run/at run) (:finished-at run) (:started-at run) at)}
                (some? (:project run)) (assoc :project (id-str (:project run)))
                (some? (:run/sha run)) (assoc :run/sha (str (:run/sha run)))
                ;; hc-16b: a run OOM-killed at its cap marks every row it records
                (some? (:oom run)) (assoc :case/oom? true))
         cases (get-in run [:report :report/cases])
         exit (:exit run)
-        died? (and (number? exit) (not (zero? exit)) (empty? cases))
+        died? (and (empty? cases) (not (and (number? exit) (zero? exit))))
         runner (assoc base :case/id (str suite "/(run)")
                       :case/status (if died? :error :passed))]
     (cond-> (mapv (fn [c]
@@ -91,7 +95,7 @@
                                    :case/status (keyword (:case/status c)))
                       (some? (:case/time-s c)) (assoc :case/time-s (:case/time-s c))))
                   cases)
-      (or (seq cases) (number? exit)) (conj runner))))
+      (or (seq cases) (contains? run :exit) (contains? run :status)) (conj runner))))
 
 ;; ---------------------------------------------------------------------------
 ;; one case

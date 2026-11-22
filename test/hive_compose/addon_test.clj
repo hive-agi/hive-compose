@@ -44,6 +44,38 @@
       (is (.isShutdown ^java.util.concurrent.ExecutorService sched))
       (is (= :down (:status (addon/health a)))))))
 
+(deftest stack-commands-drive-runs-and-persist-them
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"kafka" {"kafka" {}} "shop" {"api" {}}})
+        cfg (assoc (config dir engine)
+                   :compose/projects {"kafka" {:project/id "kafka" :project/dir "/w/kafka"
+                                               :project/provides {"kafka" {:service "kafka"}}}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"
+                                              :project/needs {"kafka" {}}}}
+                   :compose/stacks {"shop" {:stack/id "shop" :stack/consumers ["shop"]}})
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (let [up (call a {"command" "stack-up" "stack" "shop" "run" "shoprun1"})]
+        (is (not (:error? up)) (pr-str up))
+        (is (= "shoprun1" (:run (:body up)))))
+      (is (contains? (:stacks (edn/read-string (slurp (io/file dir "state.edn")))) "shoprun1")
+          "persisted beside :active")
+      (is (= ["shoprun1"] (map :run (:stacks (:body (call a {"command" "stack-status"}))))))
+      (is (string? (:text (:body (call a {"command" "plan" "stack" "shop"})))))
+      (is (not (:error? (call a {"command" "claim" "target" "stack:shoprun1" "agent" "ling-1"}))))
+      (testing "a restart keeps the run"
+        (addon/shutdown! a)
+        (addon/initialize! a {})
+        (is (= ["shoprun1"] (map :run (:stacks (:body (call a {"command" "stack-status"})))))))
+      (is (not (:error? (call a {"command" "release" "target" "stack:shoprun1" "agent" "ling-1"}))))
+      (let [down (call a {"command" "stack-down" "run" "shoprun1"})]
+        (is (not (:error? down)) (pr-str down)))
+      (is (= #{} (stub/running engine "kafka")))
+      (is (empty? (:stacks (edn/read-string (slurp (io/file dir "state.edn"))))))
+      (is (:error? (call a {"command" "stack-up" "stack" "nope"})))
+      (finally (addon/shutdown! a)))))
+
 (deftest tool-drives-profiles-and-persists-state
   (let [dir (temp-dir)
         engine (stub/engine {"api" ["api" "db"] "blog" ["ghost"]})
@@ -98,6 +130,8 @@
         (is (not error?))
         (is (= ["api/T.flap" "api/(run)"] (mapv :case (:cases body))))
         (is (= "flaky" (:class (first (:cases body))))))
+      (is (= 1 (count (:cases (:body (call a {"command" "flaky" "suite" "api" "limit" 0})))))
+          "a limit below 1 still answers one case")
       (is (= 0 (:total (:body (call a {"command" "flaky" "project" "blog"})))))
       (finally (addon/shutdown! a)))))
 

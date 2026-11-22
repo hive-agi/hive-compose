@@ -126,6 +126,17 @@
                        (for [i (range 3 6)] {:run/id (str "ok" i) :suite/id "api" :exit 0 :run/at i}))
           rows (mapcat #(flaky/run-outcomes % 0) runs)]
       (is (= :fixed (:class (flaky/case-report cfg rows))))))
+  (testing "a runner killed or timed out (exit nil, no case) is one :error row"
+    (is (= [{:run/id "r004" :suite/id "api" :at 7 :case/id "api/(run)" :case/status :error}]
+           (flaky/run-outcomes {:run/id "r004" :suite/id "api" :exit nil :report nil} 7)))
+    (is (= [{:run/id "r005" :suite/id "api" :at 7 :case/id "api/(run)" :case/status :error}]
+           (flaky/run-outcomes {:run/id "r005" :suite/id "api" :status :error} 7))
+        "a :status key alone is enough to record the runner"))
+  (testing "a clean exit with no case passes"
+    (is (= [:passed] (mapv :case/status (flaky/run-outcomes {:run/id "r006" :suite/id "api" :exit 0} 7)))))
+  (testing "the run's own time wins over the record time"
+    (is (= [9] (mapv :at (flaky/run-outcomes {:run/id "r007" :suite/id "api" :exit 0 :finished-at 9 :started-at 8} 7))))
+    (is (= [8] (mapv :at (flaky/run-outcomes {:run/id "r008" :suite/id "api" :exit 0 :started-at 8} 7)))))
   (testing "a run with no case and no exit code records nothing"
     (is (= [] (flaky/run-outcomes {:run/id "r003" :suite/id "api"} 7)))))
 

@@ -21,8 +21,12 @@
             [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
             [hive-compose.boundary.history :as history]
+            [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.flaky :as flaky]
             [hive-compose.pipeline.ops :as ops]
+            [hive-compose.pipeline.stacks :as stacks]
+            [hive-compose.pipeline.why :as why]
+            [hive-compose.adapter.tempo :as tempo]
             [hive-compose.promote.config :as config]
             [hive-compose.promote.env :as env]
             [hive-compose.port :as port]
@@ -36,7 +40,8 @@
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
-            [hive-addon.host :as addon-host])
+            [hive-addon.host :as addon-host]
+            [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -45,6 +50,11 @@
 (def addon-id-value "hive.compose")
 
 (defn- now-ms [] (System/currentTimeMillis))
+
+(def default-tempo-url
+  "Where `why` reads traces when `:compose/tempo-url` names none: the otel
+   provider's Tempo port as published on the host."
+  "http://127.0.0.1:3200")
 
 (defn- daemon-scheduler ^ScheduledExecutorService []
   (Executors/newSingleThreadScheduledExecutor
@@ -105,7 +115,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]
@@ -121,9 +131,16 @@
                   (history/file-history (:compose/history-file settings)))
      :settings settings
      :state state
+     :faults (atom {})
+     :toxiproxy (:compose/toxiproxy cfg)
      :now (or (:compose/now cfg) now-ms)
      :save! (or (:compose/save! cfg) (fn [_] (sync!)))
-     :sync! (when-not (:compose/save! cfg) sync!)}))
+     :sync! (when-not (:compose/save! cfg) sync!)
+     ;; hc-10 why: the trace store the otel provider runs (Tempo on its host port)
+     :trace-query (or (:compose/trace-query cfg)
+                      (tempo/make-query {:base-url (or (:compose/tempo-url cfg) default-tempo-url)}))
+     :state-dir (:compose/runs-dir cfg)
+     :note! (:compose/why-note! cfg)}))
 
 ;; ---------------------------------------------------------------------------
 ;; reaper
@@ -144,7 +161,10 @@
               observed (swarm/observe! ctx)
               reaped (ops/reap! ctx)
               _ (swarm/announce-reaped! ctx (:reaped reaped))
-              pass (cond-> (assoc reaped :observed observed) (seq adopted) (assoc :adopted adopted))]
+              stack-runs (:reaped (stacks/reap! ctx))
+              pass (cond-> (assoc reaped :observed observed)
+                     (seq adopted) (assoc :adopted adopted)
+                     (seq stack-runs) (assoc :stacks-reaped stack-runs))]
           (swap! state assoc :adopted? true :last-pass (assoc pass :at ((:now ctx))))
           pass)
         (catch Throwable t
@@ -189,7 +209,13 @@
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
    "flaky" "test cases ranked by intermittent failure across recorded suite runs, each :flaky, :regression (failing since a named run and sha), :fixed or :stable. suite; project; limit (default 20)"
-   "reload" "re-read the config"))
+   "faults" "fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer, attributes {name number}, stream upstream|downstream, toxicity 0..1, name}"
+   "reload" "re-read the config"
+   "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
+   "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
+   "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
+   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
+   "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"))
 
 (def commands
   (vec (keys command-help)))
@@ -228,6 +254,15 @@
   [params]
   (some-> (or (param params "agent") (param params "agent_id")) str))
 
+(defn- stack-opts
+  "The options of `stack-up`/`stack-down`/`stack-status`/`plan` from the tool
+   params: stack, run, wait (stack-up waits by default)."
+  [params]
+  (cond-> {}
+    (param params "stack") (assoc :stack (str (param params "stack")))
+    (param params "run") (assoc :run (str (param params "run")))
+    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
+
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
    nREPLs (:announced, when a notice went out)."
@@ -236,6 +271,21 @@
     (let [n (swarm/announce-up! ctx (get-in res [:ok :profile]))]
       (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
     res))
+
+(defn- faults-request
+  "Result<request> of the `faults` command's params: run, op, proxy and toxic
+   ({type attributes stream toxicity name}, keys as JSON gives them)."
+  [params]
+  (let [toxic (param params "toxic")]
+    (if (and (some? toxic) (not (map? toxic)))
+      (r/err :compose/invalid-param {:param "toxic" :hint "an object {type, attributes, stream, toxicity, name}"})
+      (r/ok {:run (some-> (param params "run") str)
+             :op (some-> (param params "op") str)
+             :proxy (some-> (param params "proxy") str)
+             :toxic (when toxic
+                      (let [t (into {} (map (fn [[k v]] [(keyword (name k)) v])) toxic)]
+                        (cond-> t
+                          (map? (:attributes t)) (update :attributes #(into {} (map (fn [[k v]] [(name k) v])) %)))))}))))
 
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
@@ -265,10 +315,21 @@
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
         "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
-        "claim" (on-subject #(swarm/claim! ctx % (agent-param params)
-                                            {:note (some-> (param params "note") str)}))
-        "release" (on-subject #(swarm/release-claim! ctx % (agent-param params)
-                                                     {:stop? (flag params "stop")}))
+        "claim" (if-let [run (stacks/claim-run tgt)]
+                  (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
+                  (on-subject #(swarm/claim! ctx % (agent-param params)
+                                              {:note (some-> (param params "note") str)})))
+        "release" (if-let [run (stacks/claim-run tgt)]
+                    (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
+                    (on-subject #(swarm/release-claim! ctx % (agent-param params)
+                                                       {:stop? (flag params "stop")})))
+        "stack-up" (stacks/stack-up! ctx (stack-opts params))
+        "stack-down" (stacks/stack-down! ctx (stack-opts params))
+        "stack-status" (stacks/stack-status ctx (stack-opts params))
+        "plan" (stacks/plan ctx (stack-opts params))
+        "why" (r/map-ok (why/why! ctx {:test (some-> (param params "test") str)
+                                       :run (some-> (param params "run") str)})
+                        #(dissoc % :why/markdown))
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
@@ -289,9 +350,10 @@
                              {:suite (some-> (param params "suite") str)
                               :project (some-> (param params "project") str)}
                              (let [l (param params "limit")]
-                               (cond (number? l) (long l)
-                                     (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
-                                     :else 20)))
+                               (max 1 (cond (number? l) (long l)
+                                            (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
+                                            :else 20))))
+        "faults" (r/bind (faults-request params) #(faults/faults! ctx %))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
                                          :hint "command=help lists what each does"})))))
@@ -317,6 +379,8 @@
                      "starting its own JVM; nrepl path=<file> answers which port drives that file. The reaper keeps "
                      "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
+                     "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
+                     "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -335,7 +399,13 @@
                               "note" {:type "string" :description "[claim] what the agent works on"}
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
-                              "tail" {:type "integer" :description "[logs] lines per service (default 100)"}}
+                              "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
+                              "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
+                              "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
+                              "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
+                              "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
+                              "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}
                  :required ["command"]}
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
