@@ -26,9 +26,9 @@ tags:
 - name: swarm
   description: existing claim / nREPL routing commands
 - name: stacks
-  description: stack runs, fault injection and failure explanation (hc-4/6/10/12)
+  description: stack runs, fault injection, failure explanation and flaky ranking (hc-4/6/10/12/13)
 - name: stacks (planned)
-  description: hc-8/13 placeholders
+  description: hc-8 placeholder (test)
 - name: meta
   description: health and this document
 security: []
@@ -906,6 +906,56 @@ paths:
           $ref: '#/components/responses/Unavailable'
         '502':
           $ref: '#/components/responses/EngineFailed'
+  /v1/flaky:
+    post:
+      operationId: flaky
+      summary: 'test cases ranked by intermittent failure across recorded suite runs, each :flaky, :regression (failing
+        since '
+      description: test cases ranked by intermittent failure across recorded suite runs, each :flaky, :regression
+        (failing since a named run and sha), :fixed or :stable. suite; project; limit (default 20)
+      tags:
+      - stacks
+      x-hive-call-op: flaky
+      x-mcp:
+        tool: compose
+        command: flaky
+      x-mutates: false
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Req_flaky'
+      responses:
+        '200':
+          description: Result ok
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Ok'
+                - type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/FlakyResult'
+                  required:
+                  - value
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
   /v1/faults:
     post:
       operationId: faults
@@ -1288,43 +1338,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-  /v1/flaky:
-    post:
-      operationId: flaky
-      summary: Rank tests by intermittent failure across runs, so a flake is told apart from a regression
-      description: Rank tests by intermittent failure across runs, so a flake is told apart from a regression.
-      tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-13-flaky
-      x-hive-call-op: flaky
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/Req_flaky'
-      responses:
-        '200':
-          description: Result ok
-          content:
-            application/json:
-              schema:
-                allOf:
-                - $ref: '#/components/schemas/Ok'
-                - type: object
-                  properties:
-                    value:
-                      $ref: '#/components/schemas/Res_flaky'
-                  required:
-                  - value
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
   /v1/health:
     get:
       operationId: health
@@ -1572,7 +1585,7 @@ components:
       - started-at
       - last-touch
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Active @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Active @ origin/staging'
     ActiveMap:
       type: object
       additionalProperties:
@@ -1787,7 +1800,7 @@ components:
         - started-at
         - last-touch
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/ActiveMap @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/ActiveMap @ origin/staging'
     Activity:
       type: array
       items:
@@ -1798,7 +1811,12 @@ components:
         - cpu
       uniqueItems: true
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Activity @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Activity @ origin/staging'
+    CapabilityId:
+      type: string
+      pattern: ^[a-z0-9][a-z0-9_.-]*\z
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/CapabilityId @ origin/staging'
     Claim:
       type: object
       properties:
@@ -1814,7 +1832,12 @@ components:
       - since
       - seen
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Claim @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Claim @ origin/staging'
+    ConsumerId:
+      type: string
+      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/ConsumerId @ origin/staging'
     Env:
       type: object
       additionalProperties:
@@ -1829,7 +1852,7 @@ components:
           - pass
           additionalProperties: false
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Env @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Env @ origin/staging'
     EnvValue:
       anyOf:
       - type: string
@@ -1842,7 +1865,7 @@ components:
         - pass
         additionalProperties: false
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/EnvValue @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/EnvValue @ origin/staging'
     IdleAction:
       type: string
       enum:
@@ -1850,7 +1873,137 @@ components:
       - down
       - none
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/IdleAction @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/IdleAction @ origin/staging'
+    Instance:
+      allOf:
+      - type: object
+        properties:
+          id:
+            type: string
+            minLength: 1
+          capability:
+            type: string
+            pattern: ^[a-z0-9][a-z0-9_.-]*\z
+          provider:
+            type: string
+            minLength: 1
+          service:
+            type: string
+            minLength: 1
+          version:
+            type: string
+            pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+          share?:
+            type: boolean
+          consumers:
+            type: array
+            items:
+              type: string
+              pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
+            minItems: 1
+          aliases:
+            type: array
+            items:
+              type: string
+              minLength: 1
+            minItems: 1
+          compose-project:
+            type: string
+            pattern: ^[a-z0-9][a-z0-9_-]*\z
+        required:
+        - id
+        - capability
+        - provider
+        - service
+        - share?
+        - consumers
+        - aliases
+      - {}
+      - {}
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Instance @ origin/staging'
+    Need:
+      type: object
+      properties:
+        version:
+          type: string
+          pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+            +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+        share?:
+          type: boolean
+        provider:
+          type: string
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+        services:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        via:
+          type: string
+        resources:
+          anyOf:
+          - const: unbounded
+          - type: object
+            properties:
+              mem:
+                anyOf:
+                - type: integer
+                  minimum: 1
+                - type: string
+                  pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+              cpus:
+                allOf:
+                - type: number
+                - type: number
+                  exclusiveMinimum: 0
+              jvm?:
+                type: boolean
+            additionalProperties: false
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Need @ origin/staging'
+    Needs:
+      type: object
+      additionalProperties:
+        type: object
+        properties:
+          version:
+            type: string
+            pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+              +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+          share?:
+            type: boolean
+          provider:
+            type: string
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
+          services:
+            type: array
+            items:
+              type: string
+              minLength: 1
+          via:
+            type: string
+          resources:
+            anyOf:
+            - const: unbounded
+            - type: object
+              properties:
+                mem:
+                  anyOf:
+                  - type: integer
+                    minimum: 1
+                  - type: string
+                    pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                cpus:
+                  allOf:
+                  - type: number
+                  - type: number
+                    exclusiveMinimum: 0
+                jvm?:
+                  type: boolean
+              additionalProperties: false
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Needs @ origin/staging'
     Profile:
       type: object
       properties:
@@ -1974,12 +2127,12 @@ components:
       - id
       - dir
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Profile @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Profile @ origin/staging'
     ProfileId:
       type: string
       pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/ProfileId @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/ProfileId @ origin/staging'
     Program:
       type: object
       properties:
@@ -2034,7 +2187,7 @@ components:
       - id
       - dir
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Program @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Program @ origin/staging'
     Project:
       type: object
       properties:
@@ -2243,7 +2396,127 @@ components:
       - id
       - dir
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Project @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Project @ origin/staging'
+    Provide:
+      type: object
+      properties:
+        service:
+          type: string
+          minLength: 1
+        version:
+          type: string
+          pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+        env:
+          type: object
+          additionalProperties:
+            anyOf:
+            - type: string
+            - type: object
+              properties:
+                pass:
+                  type: string
+                  minLength: 1
+              required:
+              - pass
+              additionalProperties: false
+        tenancy:
+          type: object
+          properties:
+            env:
+              type: string
+              minLength: 1
+          required:
+          - env
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        resources:
+          anyOf:
+          - const: unbounded
+          - type: object
+            properties:
+              mem:
+                anyOf:
+                - type: integer
+                  minimum: 1
+                - type: string
+                  pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+              cpus:
+                allOf:
+                - type: number
+                - type: number
+                  exclusiveMinimum: 0
+              jvm?:
+                type: boolean
+            additionalProperties: false
+        description:
+          type: string
+      required:
+      - service
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Provide @ origin/staging'
+    Provides:
+      type: object
+      additionalProperties:
+        type: object
+        properties:
+          service:
+            type: string
+            minLength: 1
+          version:
+            type: string
+            pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+          env:
+            type: object
+            additionalProperties:
+              anyOf:
+              - type: string
+              - type: object
+                properties:
+                  pass:
+                    type: string
+                    minLength: 1
+                required:
+                - pass
+                additionalProperties: false
+          tenancy:
+            type: object
+            properties:
+              env:
+                type: string
+                minLength: 1
+            required:
+            - env
+          port:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          resources:
+            anyOf:
+            - const: unbounded
+            - type: object
+              properties:
+                mem:
+                  anyOf:
+                  - type: integer
+                    minimum: 1
+                  - type: string
+                    pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                cpus:
+                  allOf:
+                  - type: number
+                  - type: number
+                    exclusiveMinimum: 0
+                jvm?:
+                  type: boolean
+              additionalProperties: false
+          description:
+            type: string
+        required:
+        - service
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Provides @ origin/staging'
     Release:
       type: object
       properties:
@@ -2267,7 +2540,103 @@ components:
       - action
       - services
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Release @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Release @ origin/staging'
+    ReportFormat:
+      type: string
+      enum:
+      - junit
+      - tap
+      - auto
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/ReportFormat @ origin/staging'
+    Resolution:
+      type: object
+      properties:
+        instances:
+          type: object
+          additionalProperties:
+            allOf:
+            - type: object
+              properties:
+                id:
+                  type: string
+                  minLength: 1
+                capability:
+                  type: string
+                  pattern: ^[a-z0-9][a-z0-9_.-]*\z
+                provider:
+                  type: string
+                  minLength: 1
+                service:
+                  type: string
+                  minLength: 1
+                version:
+                  type: string
+                  pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+                share?:
+                  type: boolean
+                consumers:
+                  type: array
+                  items:
+                    type: string
+                    pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
+                  minItems: 1
+                aliases:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                  minItems: 1
+                compose-project:
+                  type: string
+                  pattern: ^[a-z0-9][a-z0-9_-]*\z
+              required:
+              - id
+              - capability
+              - provider
+              - service
+              - share?
+              - consumers
+              - aliases
+            - {}
+            - {}
+        bindings:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: string
+      required:
+      - instances
+      - bindings
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Resolution @ origin/staging'
+    Resources:
+      anyOf:
+      - const: unbounded
+      - type: object
+        properties:
+          mem:
+            anyOf:
+            - type: integer
+              minimum: 1
+            - type: string
+              pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+          cpus:
+            allOf:
+            - type: number
+            - type: number
+              exclusiveMinimum: 0
+          jvm?:
+            type: boolean
+        additionalProperties: false
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Resources @ origin/staging'
+    RunId:
+      type: string
+      pattern: ^[a-z0-9]{3,40}\z
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/RunId @ origin/staging'
     Running:
       type: object
       properties:
@@ -2292,7 +2661,7 @@ components:
       - dir
       - started-at
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Running @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/Running @ origin/staging'
     SecretRef:
       type: object
       properties:
@@ -2303,7 +2672,7 @@ components:
       - pass
       additionalProperties: false
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/SecretRef @ origin/staging db09adc'
+      x-malli: 'malli: hive-compose.schema/SecretRef @ origin/staging'
     Settings:
       type: object
       properties:
@@ -2695,6 +3064,28 @@ components:
         program-grace-ms:
           type: integer
           minimum: 0
+        history-file:
+          type: string
+          minLength: 1
+        flaky:
+          type: object
+          properties:
+            window:
+              type: integer
+              minimum: 2
+            min-runs:
+              type: integer
+              minimum: 1
+            flip-rate:
+              allOf:
+              - type: number
+              - type: number
+                minimum: 0
+              - type: number
+                maximum: 1
+            streak:
+              type: integer
+              minimum: 1
         stacks:
           type: object
           additionalProperties:
@@ -2951,190 +3342,18 @@ components:
       - claim-ttl-minutes
       - orphan-ttl-minutes
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Settings @ origin/staging db09adc'
-    Usage:
-      type: object
-      properties:
-        at:
-          type: integer
-        in-use?:
-          type: boolean
-        by:
-          type: array
-          items:
-            type: object
-            properties: {}
-        sources:
-          type: array
-          items:
-            type: string
-      required:
-      - at
-      - in-use?
-      - by
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Usage @ origin/staging db09adc'
-    CapabilityId:
-      type: string
-      pattern: ^[a-z0-9][a-z0-9_.-]*$
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/CapabilityId @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Version:
-      type: string
-      pattern: ^[0-9]+(\.[0-9]+){0,2}([-+][0-9A-Za-z.-]+)?$
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Version @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    VersionRange:
-      type: string
-      pattern: ^(\*|[~^]?[0-9]+(\.[0-9]+){0,2}|(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2}( +(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2})*)$
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/VersionRange @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    RunId:
-      type: string
-      pattern: ^[a-z0-9][a-z0-9-]{2,39}$
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/RunId @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    ConsumerId:
-      type: string
-      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*$
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/ConsumerId @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Provide:
-      type: object
-      properties:
-        service:
-          type: string
-          minLength: 1
-        version:
-          type: string
-          pattern: ^[0-9]+(\.[0-9]+){0,2}([-+][0-9A-Za-z.-]+)?$
-        env:
-          type: object
-          additionalProperties:
-            anyOf:
-            - type: string
-            - type: object
-              properties:
-                pass:
-                  type: string
-                  minLength: 1
-              required:
-              - pass
-              additionalProperties: false
-        tenancy:
-          type: object
-          properties:
-            env:
-              type: string
-              minLength: 1
-          required:
-          - env
-        description:
-          type: string
-      required:
-      - service
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Provide @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Need:
-      type: object
-      properties:
-        version:
-          type: string
-          pattern: ^(\*|[~^]?[0-9]+(\.[0-9]+){0,2}|(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2}( +(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2})*)$
-        share?:
-          type: boolean
-        provider:
-          type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
-        services:
-          type: array
-          items:
-            type: string
-            minLength: 1
-        via:
-          type: string
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Need @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Provides:
-      type: object
-      additionalProperties:
-        type: object
-        properties:
-          service:
-            type: string
-            minLength: 1
-          version:
-            type: string
-            pattern: ^[0-9]+(\.[0-9]+){0,2}([-+][0-9A-Za-z.-]+)?$
-          env:
-            type: object
-            additionalProperties:
-              anyOf:
-              - type: string
-              - type: object
-                properties:
-                  pass:
-                    type: string
-                    minLength: 1
-                required:
-                - pass
-                additionalProperties: false
-          tenancy:
-            type: object
-            properties:
-              env:
-                type: string
-                minLength: 1
-            required:
-            - env
-          description:
-            type: string
-        required:
-        - service
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Provides @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Needs:
-      type: object
-      additionalProperties:
-        type: object
-        properties:
-          version:
-            type: string
-            pattern: ^(\*|[~^]?[0-9]+(\.[0-9]+){0,2}|(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2}( +(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2})*)$
-          share?:
-            type: boolean
-          provider:
-            type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
-          services:
-            type: array
-            items:
-              type: string
-              minLength: 1
-          via:
-            type: string
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Needs @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
+      x-malli: 'malli: hive-compose.schema/Settings @ origin/staging'
     Stack:
       type: object
       properties:
         id:
           type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
         consumers:
           type: array
           items:
             type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*$
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
           minItems: 1
         needs:
           type: object
@@ -3143,12 +3362,13 @@ components:
             properties:
               version:
                 type: string
-                pattern: ^(\*|[~^]?[0-9]+(\.[0-9]+){0,2}|(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2}( +(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2})*)$
+                pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                  +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
               share?:
                 type: boolean
               provider:
                 type: string
-                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
               services:
                 type: array
                 items:
@@ -3156,191 +3376,68 @@ components:
                   minLength: 1
               via:
                 type: string
+              resources:
+                anyOf:
+                - const: unbounded
+                - type: object
+                  properties:
+                    mem:
+                      anyOf:
+                      - type: integer
+                        minimum: 1
+                      - type: string
+                        pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                    cpus:
+                      allOf:
+                      - type: number
+                      - type: number
+                        exclusiveMinimum: 0
+                    jvm?:
+                      type: boolean
+                  additionalProperties: false
+        resources:
+          type: object
+          additionalProperties:
+            anyOf:
+            - const: unbounded
+            - type: object
+              properties:
+                mem:
+                  anyOf:
+                  - type: integer
+                    minimum: 1
+                  - type: string
+                    pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                cpus:
+                  allOf:
+                  - type: number
+                  - type: number
+                    exclusiveMinimum: 0
+                jvm?:
+                  type: boolean
+              additionalProperties: false
+        budget:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: string
+            pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+        priority:
+          type: integer
         description:
           type: string
       required:
       - id
       - consumers
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Stack @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Instance:
-      type: object
-      properties:
-        id:
-          type: string
-          minLength: 1
-        capability:
-          type: string
-          pattern: ^[a-z0-9][a-z0-9_.-]*$
-        provider:
-          type: string
-          minLength: 1
-        service:
-          type: string
-          minLength: 1
-        version:
-          type: string
-          pattern: ^[0-9]+(\.[0-9]+){0,2}([-+][0-9A-Za-z.-]+)?$
-        share?:
-          type: boolean
-        consumers:
-          type: array
-          items:
-            type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*$
-          minItems: 1
-        aliases:
-          type: array
-          items:
-            type: string
-            minLength: 1
-          minItems: 1
-        compose-project:
-          type: string
-          pattern: ^[a-z0-9][a-z0-9_-]*$
-      required:
-      - id
-      - capability
-      - provider
-      - service
-      - share?
-      - consumers
-      - aliases
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Instance @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Resolution:
-      type: object
-      properties:
-        instances:
-          type: object
-          additionalProperties:
-            type: object
-            properties:
-              id:
-                type: string
-                minLength: 1
-              capability:
-                type: string
-                pattern: ^[a-z0-9][a-z0-9_.-]*$
-              provider:
-                type: string
-                minLength: 1
-              service:
-                type: string
-                minLength: 1
-              version:
-                type: string
-                pattern: ^[0-9]+(\.[0-9]+){0,2}([-+][0-9A-Za-z.-]+)?$
-              share?:
-                type: boolean
-              consumers:
-                type: array
-                items:
-                  type: string
-                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*$
-                minItems: 1
-              aliases:
-                type: array
-                items:
-                  type: string
-                  minLength: 1
-                minItems: 1
-              compose-project:
-                type: string
-                pattern: ^[a-z0-9][a-z0-9_-]*$
-            required:
-            - id
-            - capability
-            - provider
-            - service
-            - share?
-            - consumers
-            - aliases
-        bindings:
-          type: object
-          additionalProperties:
-            type: object
-            additionalProperties:
-              type: string
-      required:
-      - instances
-      - bindings
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Resolution @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    Wiring:
-      type: object
-      properties:
-        consumer:
-          type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*$
-        run:
-          type: string
-          pattern: ^[a-z0-9][a-z0-9-]{2,39}$
-        network:
-          type: string
-          minLength: 1
-        attach:
-          type: array
-          items:
-            type: object
-            properties:
-              instance:
-                type: string
-                minLength: 1
-              aliases:
-                type: array
-                items:
-                  type: string
-                  minLength: 1
-                minItems: 1
-            required:
-            - instance
-            - aliases
-        env:
-          type: object
-          additionalProperties:
-            anyOf:
-            - type: string
-            - type: object
-              properties:
-                pass:
-                  type: string
-                  minLength: 1
-              required:
-              - pass
-              additionalProperties: false
-        prefix:
-          type: string
-          minLength: 1
-      required:
-      - consumer
-      - run
-      - network
-      - attach
-      - env
-      - prefix
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/Wiring @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
-    ReportFormat:
-      type: string
-      enum:
-      - junit
-      - tap
-      - auto
-      x-source: generated
-      x-malli: 'malli: hive-compose.schema/ReportFormat @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
+      x-malli: 'malli: hive-compose.schema/Stack @ origin/staging'
     Suite:
       allOf:
       - type: object
         properties:
           id:
             type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
           image:
             type: string
             minLength: 1
@@ -3363,12 +3460,13 @@ components:
               properties:
                 version:
                   type: string
-                  pattern: ^(\*|[~^]?[0-9]+(\.[0-9]+){0,2}|(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2}( +(>=|<=|>|<|=)[0-9]+(\.[0-9]+){0,2})*)$
+                  pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+                    +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
                 share?:
                   type: boolean
                 provider:
                   type: string
-                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
+                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z
                 services:
                   type: array
                   items:
@@ -3376,6 +3474,25 @@ components:
                     minLength: 1
                 via:
                   type: string
+                resources:
+                  anyOf:
+                  - const: unbounded
+                  - type: object
+                    properties:
+                      mem:
+                        anyOf:
+                        - type: integer
+                          minimum: 1
+                        - type: string
+                          pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                      cpus:
+                        allOf:
+                        - type: number
+                        - type: number
+                          exclusiveMinimum: 0
+                      jvm?:
+                        type: boolean
+                    additionalProperties: false
           projects:
             type: array
             items:
@@ -3407,14 +3524,128 @@ components:
           timeout-ms:
             type: integer
             minimum: 1000
+          resources:
+            anyOf:
+            - const: unbounded
+            - type: object
+              properties:
+                mem:
+                  anyOf:
+                  - type: integer
+                    minimum: 1
+                  - type: string
+                    pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+                cpus:
+                  allOf:
+                  - type: number
+                  - type: number
+                    exclusiveMinimum: 0
+                jvm?:
+                  type: boolean
+              additionalProperties: false
           description:
             type: string
         required:
         - id
       - {}
       x-source: generated
-      x-malli: 'malli: hive-compose.schema/Suite @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)'
-      x-status: planned
+      x-malli: 'malli: hive-compose.schema/Suite @ origin/staging'
+    Usage:
+      type: object
+      properties:
+        at:
+          type: integer
+        in-use?:
+          type: boolean
+        by:
+          type: array
+          items:
+            type: object
+            properties: {}
+        sources:
+          type: array
+          items:
+            type: string
+      required:
+      - at
+      - in-use?
+      - by
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Usage @ origin/staging'
+    Version:
+      type: string
+      pattern: ^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?\z
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Version @ origin/staging'
+    VersionRange:
+      type: string
+      pattern: '^(?:\*|[~^]?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?|(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?(?:
+        +(?:>=|<=|>|<|=)[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.+-]+)?)*)\z'
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/VersionRange @ origin/staging'
+    Wiring:
+      allOf:
+      - type: object
+        properties:
+          consumer:
+            type: string
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/:-]*\z
+          run:
+            type: string
+            pattern: ^[a-z0-9]{3,40}\z
+          network:
+            type: string
+            pattern: ^hive-[a-z0-9]{3,40}-[a-z0-9][a-z0-9-]*\z
+          services:
+            type: array
+            items:
+              type: string
+              minLength: 1
+            minItems: 1
+          attach:
+            type: array
+            items:
+              type: object
+              properties:
+                instance:
+                  type: string
+                  minLength: 1
+                aliases:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                  minItems: 1
+              required:
+              - instance
+              - aliases
+          env:
+            type: object
+            additionalProperties:
+              anyOf:
+              - type: string
+              - type: object
+                properties:
+                  pass:
+                    type: string
+                    minLength: 1
+                required:
+                - pass
+                additionalProperties: false
+          prefix:
+            type: string
+            minLength: 1
+        required:
+        - consumer
+        - run
+        - network
+        - attach
+        - env
+        - prefix
+      - {}
+      - {}
+      x-source: generated
+      x-malli: 'malli: hive-compose.schema/Wiring @ origin/staging'
     ComposeRequest:
       type: object
       properties:
@@ -3433,7 +3664,10 @@ components:
         project:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
-            routes'
+            routes; [flaky] only runs against this project'
+        suite:
+          type: string
+          description: '[flaky] only cases of this suite'
         recreate:
           type: boolean
           description: '[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting
@@ -3451,9 +3685,12 @@ components:
         note:
           type: string
           description: '[claim] what the agent works on'
+        limit:
+          type: integer
+          description: '[flaky] how many ranked cases (default 20)'
         wait:
           type: boolean
-          description: '[up|switch] wait until the started services are healthy'
+          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
@@ -3549,12 +3786,12 @@ components:
     ErrorCategory:
       type: string
       x-source: generated
-      x-from: 'every (r/err :ns/name ..) literal under src/ (doc/api/gen/assemble.py); HTTP status per category:
-        hive-compose.api/status-by-category'
+      x-from: 'hive-compose.api/source-categories over src/ (via gen.clj); HTTP status per category: hive-compose.api/status-by-category'
       enum:
       - compose/alias-clash
       - compose/alias-shadows-service
       - compose/api-bind-failed
+      - compose/bundle-unwritable
       - compose/command-failed
       - compose/consumer-name-collision
       - compose/data-exec-unsupported
@@ -3562,6 +3799,7 @@ components:
       - compose/data-step-failed
       - compose/dependency-cycle
       - compose/dispatch-threw
+      - compose/empty-matrix
       - compose/env-collision
       - compose/faults-alias-clash
       - compose/faults-invalid-toxic
@@ -3572,6 +3810,8 @@ components:
       - compose/faults-unknown-toxic
       - compose/forbidden-origin
       - compose/held-by-another-section
+      - compose/history-unreadable
+      - compose/history-unwritable
       - compose/inconsistent-resolution
       - compose/instance-not-ready
       - compose/instance-unhealthy
@@ -3588,15 +3828,21 @@ components:
       - compose/invalid-resolution
       - compose/invalid-result
       - compose/invalid-run
+      - compose/invalid-run-id
       - compose/invalid-stack
+      - compose/invalid-trace-id
       - compose/invalid-version
       - compose/invalid-wiring
+      - compose/lock-unreadable
+      - compose/lock-unwritable
+      - compose/log-unwritable
       - compose/meminfo-unreadable
       - compose/method-not-allowed
       - compose/missing-param
       - compose/name-collision
       - compose/no-compose-file
       - compose/no-container
+      - compose/no-history
       - compose/no-projects
       - compose/no-results
       - compose/no-runs
@@ -3611,27 +3857,39 @@ components:
       - compose/orphan-check-failed
       - compose/orphans-hold-resources
       - compose/otlp-attributes-ref
+      - compose/otlp-env-failed
       - compose/otlp-pair-broken
       - compose/over-budget
+      - compose/override-unwritable
       - compose/ownership-check-failed
       - compose/payload-too-large
       - compose/proc-unreadable
+      - compose/profiles-unreadable
       - compose/program-needs-command
+      - compose/program-stop-failed
+      - compose/program-unreadable
       - compose/release-threw
+      - compose/result-run-mismatch
+      - compose/result-unreadable
+      - compose/result-unwritable
       - compose/run-exists
       - compose/runner-failed
       - compose/secret-unresolved
       - compose/shared-reset-without-tenancy
       - compose/stack-down-incomplete
       - compose/stacks-unsupported
+      - compose/state-unreadable
+      - compose/state-unwritable
       - compose/swarm-failed
       - compose/toxiproxy-failed
       - compose/toxiproxy-proxy-conflict
+      - compose/toxiproxy-unparseable
       - compose/toxiproxy-unreachable
       - compose/unknown-command
       - compose/unknown-consumer
       - compose/unknown-data-service
       - compose/unknown-instance
+      - compose/unknown-names
       - compose/unknown-profile
       - compose/unknown-project
       - compose/unknown-provider
@@ -3641,6 +3899,7 @@ components:
       - compose/unknown-target
       - compose/unknown-test
       - compose/unknown-via
+      - compose/unparseable
       - compose/unsupported-media-type
       - compose/volume-removal-refused
       - secrets/unknown-backend
@@ -4680,6 +4939,12 @@ components:
       additionalProperties: true
       description: 'pipeline.stacks/plan: what stack-up would start, share or find running'
       x-source: hand
+    FlakyResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.flaky/flaky: test cases ranked by intermittent failure, each flaky, regression, fixed
+        or stable'
+      x-source: hand
     WhyResult:
       type: object
       additionalProperties: true
@@ -4734,10 +4999,10 @@ components:
             or a,b'
         wait:
           type: boolean
-          description: '[up|switch] wait until the started services are healthy'
+          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4772,10 +5037,10 @@ components:
             or a,b'
         wait:
           type: boolean
-          description: '[up|switch] wait until the started services are healthy'
+          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4793,7 +5058,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4811,7 +5076,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4847,7 +5112,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4862,14 +5127,14 @@ components:
         project:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
-            routes'
+            routes; [flaky] only runs against this project'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_ps:
       type: object
       properties:
@@ -4882,7 +5147,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4903,7 +5168,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4931,7 +5196,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4959,7 +5224,7 @@ components:
             or a,b'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
       x-requires-one-of:
       - target
       - profile
@@ -4979,10 +5244,10 @@ components:
         project:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
-            routes'
+            routes; [flaky] only runs against this project'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_reap:
       type: object
       additionalProperties: true
@@ -4998,6 +5263,22 @@ components:
       additionalProperties: true
       description: takes no params
       x-source: generated
+    Req_flaky:
+      type: object
+      properties:
+        limit:
+          type: integer
+          description: '[flaky] how many ranked cases (default 20)'
+        project:
+          type: string
+          description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
+            routes; [flaky] only runs against this project'
+        suite:
+          type: string
+          description: '[flaky] only cases of this suite'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_faults:
       type: object
       properties:
@@ -5021,7 +5302,7 @@ components:
           description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_reload:
       type: object
       additionalProperties: true
@@ -5039,10 +5320,10 @@ components:
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
         wait:
           type: boolean
-          description: '[up|switch] wait until the started services are healthy'
+          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_stack-down:
       type: object
       properties:
@@ -5055,7 +5336,7 @@ components:
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_stack-status:
       type: object
       properties:
@@ -5068,7 +5349,7 @@ components:
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_plan:
       type: object
       properties:
@@ -5081,7 +5362,7 @@ components:
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Req_why:
       type: object
       properties:
@@ -5094,7 +5375,7 @@ components:
           description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
       additionalProperties: false
       x-source: generated
-      x-params-from: the [cmd|..] prefixes of the tool's param descriptions
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
     Report:
       type: object
       properties:
@@ -5184,44 +5465,6 @@ components:
                 type: integer
               report:
                 $ref: '#/components/schemas/Report'
-            x-source: hand
-      x-source: hand
-      x-status: planned
-    Req_flaky:
-      type: object
-      properties:
-        suite:
-          type: string
-        limit:
-          type: integer
-        since:
-          type: string
-      x-source: hand
-      x-status: planned
-      x-params-from: plan step description
-    Res_flaky:
-      type: object
-      properties:
-        tests:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: string
-              runs:
-                type: integer
-              failures:
-                type: integer
-              flips:
-                type: integer
-              score:
-                type: number
-              verdict:
-                enum:
-                - flaky
-                - regression
-                - stable
             x-source: hand
       x-source: hand
       x-status: planned

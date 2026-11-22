@@ -46,20 +46,22 @@
     (doseq [c (keys api/status-by-category)]
       (is (contains? enum (api/category-str c)) (str c)))
     (is (every? #(re-find #"^[a-z-]+/[a-z-]+$" %) enum) "every category is qualified")
-    (testing "every category the source can answer (r/err :ns/name ..) is in the enum"
-      (let [in-src (into (sorted-set)
-                         (comp (filter #(re-find #"\.clj$" (str %)))
-                               (mapcat #(re-seq #"\(r/err :([a-z-]+/[a-z-]+)" (slurp %)))
-                               (map second))
-                         (file-seq (io/file "src")))]
+    (testing "the enum is exactly the categories the source can answer (api/source-categories)"
+      (let [in-src (api/source-categories "src")]
         (is (seq in-src))
-        (is (= #{} (apply disj in-src enum)) "missing from ErrorCategory")))))
+        (is (= #{} (apply disj in-src enum)) "missing from ErrorCategory")
+        (is (= #{} (apply disj enum in-src)) "in ErrorCategory but answered by no source")))))
 
 (deftest request-params-are-the-tools-params
   (let [tool-params (set (keys (get-in (addon/tool (addon/make-addon)) [:inputSchema :properties])))]
     (doseq [c addon/commands
             p (keys (get-in @spec ["components" "schemas" (str "Req_" c) "properties"]))]
-      (is (contains? (conj tool-params "agent_id") p) (str c " " p)))))
+      (is (contains? (conj tool-params "agent_id") p) (str c " " p))))
+  (testing "Req_<command> declares exactly addon/command-params, the set the API enforces"
+    (is (= (set addon/commands) (set (keys addon/command-params))))
+    (doseq [[c ps] addon/command-params]
+      (is (= ps (set (keys (get-in @spec ["components" "schemas" (str "Req_" c) "properties"])))) c)
+      (is (or (empty? ps) (false? (get-in @spec ["components" "schemas" (str "Req_" c) "additionalProperties"]))) c))))
 
 (def ^:private registry (delay (SchemaRegistry/withDefaultDialect SpecificationVersion/DRAFT_2020_12)))
 

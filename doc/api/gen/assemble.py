@@ -2,7 +2,6 @@
 """Assemble resources/hive_compose/openapi.yaml (hc-14; served at GET /v1/openapi.yaml) from:
 
   GENERATED  staging.components.generated.json  malli.json-schema of hive-compose.schema @ origin/staging
-  GENERATED  hc2.components.generated.json      malli.json-schema of the hc-2 stack schemas (uncommitted worktree)
   GENERATED  staging.tool.generated.json        the MCP tool's live :inputSchema + command-help
   HAND       RESPONSES / ERRORS / PLANNED below, read off pipeline/ops.clj, pipeline/swarm.clj,
              pipeline/restart.clj, pipeline/orphans.clj, pipeline/ownership.clj, promote/plan.clj
@@ -13,13 +12,12 @@ import json, re, copy, yaml, pathlib
 
 HERE = pathlib.Path(__file__).parent
 gen = json.load(open(HERE / "staging.components.generated.json"))
-gen_hc2 = json.load(open(HERE / "hc2.components.generated.json"))
 tool = json.load(open(HERE / "staging.tool.generated.json"))
 
-STACK_NAMES = ["CapabilityId", "Version", "VersionRange", "RunId", "ConsumerId", "Provide", "Need",
+STACK_NAMES = ["CapabilityId", "Version", "VersionRange", "RunId", "ConsumerId", "Resources", "Provide", "Need",
                "Provides", "Needs", "Stack", "Instance", "Resolution", "Wiring", "ReportFormat", "Suite"]
 
-def G(name, src="malli: hive-compose.schema/%s @ origin/staging db09adc", table=gen):
+def G(name, src="malli: hive-compose.schema/%s @ origin/staging", table=gen):
     s = copy.deepcopy(table[name])
     s["x-source"] = "generated"
     s["x-malli"] = src % name if "%s" in src else src
@@ -42,17 +40,10 @@ components = {}
 # ---------------------------------------------------------------- generated value objects
 for n in gen: components[n] = G(n)
 for n in STACK_NAMES:
-    components[n] = G(n, "malli: hive-compose.schema/%s @ worktree hc-2-schema (feat/hc-2-stack-schema, UNCOMMITTED)", gen_hc2)
-    components[n]["x-status"] = "planned"
+    components[n] = G(n, "malli: hive-compose.schema/%s @ origin/staging")
 
 # ---------------------------------------------------------------- request: generated from the tool inputSchema
 props = tool["inputSchema"]["properties"]
-applies = {}  # command -> [param]
-for p, spec in props.items():
-    if p == "command": continue
-    for m in re.finditer(r"\[([a-z|_-]+)\]", spec.get("description", "")):
-        for c in m.group(1).split("|"):
-            applies.setdefault(c, []).append(p)
 req_props = {}
 for p, spec in props.items():
     if p == "command": continue
@@ -71,14 +62,12 @@ components["ComposeRequest"] = {
 
 SUBJECT = ["up", "switch", "down", "stop", "restart", "ps", "logs", "claim", "release"]
 def request_for(cmd):
-    ps = sorted(set(applies.get(cmd, [])) | ({"target", "profile"} if cmd in SUBJECT + ["touch"] else set())
-                | ({"agent_id"} if cmd in ("claim", "release") else set())
-                | ({"wait"} if cmd == "stack-up" else set()))  # addon/stack-opts reads wait; its description says [up|switch]
+    ps = tool["command-params"][cmd]  # hive-compose.addon/command-params: what the API enforces
     if not ps:
         return {"type": "object", "additionalProperties": True, "description": "takes no params", "x-source": "generated"}
     s = {"type": "object", "properties": {p: copy.deepcopy(req_props[p]) for p in ps},
          "additionalProperties": False, "x-source": "generated",
-         "x-params-from": "the [cmd|..] prefixes of the tool's param descriptions"}
+         "x-params-from": "hive-compose.addon/command-params (the API refuses any other key)"}
     if cmd in SUBJECT:
         # Not anyOf [{required:[target]},{required:[profile]}]: openapi-typescript 7.13 turns each
         # required-only branch into `unknown`, collapsing the whole body type (NOTES issue 1).
@@ -100,11 +89,9 @@ components["ErrorEnvelope"] = obj({
     desc="hive-cabi/v1 failure envelope. Every other key of the r/err map rides alongside (param, profile, known, stderr ...).")
 # Derived, never listed: every literal (r/err :ns/name ..) under src/, the same scan
 # openapi_contract_test runs, so a category added in source shows up here on the next run.
-SRC = HERE.parent.parent.parent / "src"
-CATEGORIES = sorted({c for f in SRC.rglob("*.clj") for c in re.findall(r"\(r/err :([a-z-]+/[a-z-]+)", f.read_text())})
 components["ErrorCategory"] = {"type": "string", "x-source": "generated",
-  "x-from": "every (r/err :ns/name ..) literal under src/ (doc/api/gen/assemble.py); HTTP status per category: hive-compose.api/status-by-category",
-  "enum": CATEGORIES}
+  "x-from": "hive-compose.api/source-categories over src/ (via gen.clj); HTTP status per category: hive-compose.api/status-by-category",
+  "enum": tool["categories"]}
 
 # ---------------------------------------------------------------- hand-written response rows
 components["ProgramReport"] = obj({"id": S, "pid": I, "log": S, "dir": S, "kind": S, "started-at": I, "nrepl-port": I,
@@ -193,7 +180,8 @@ RESULT = {"help": "HelpResult", "status": "StatusResult", "targets": "TargetsRes
           "who": "WhoResult", "nrepl": "NreplResult", "reap": "ReaperPass", "adopt": "AdoptResult",
           "projects": "ProjectsResult", "reload": "ReloadResult",
           "faults": "FaultsResult", "stack-up": "StackUpResult", "stack-down": "StackDownResult",
-          "stack-status": "StackStatusResult", "plan": "PlanResult", "why": "WhyResult"}
+          "stack-status": "StackStatusResult", "plan": "PlanResult", "why": "WhyResult",
+          "flaky": "FlakyResult"}
 # Commands staging added after phase 1 (hc-4/6/10/12). Their result maps are built in
 # pipeline/stacks.clj, pipeline/why.clj and pipeline/faults.clj with no malli schema yet, so
 # they are typed open here rather than hand-copied (NOTES: response shapes drift).
@@ -203,8 +191,9 @@ components["StackUpResult"] = open_result("pipeline.stacks/stack-up!: the run, i
 components["StackDownResult"] = open_result("pipeline.stacks/stack-down!: what was taken down and what was kept")
 components["StackStatusResult"] = open_result("pipeline.stacks/stack-status: stack runs with their instances' and consumers' containers")
 components["PlanResult"] = open_result("pipeline.stacks/plan: what stack-up would start, share or find running")
+components["FlakyResult"] = open_result("pipeline.flaky/flaky: test cases ranked by intermittent failure, each flaky, regression, fixed or stable")
 components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
-STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why"}
+STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why", "flaky"}
 MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload",
            "faults", "stack-up", "stack-down", "why"}
 assert set(RESULT) == set(tool["commands"]), set(tool["commands"]) ^ set(RESULT)
@@ -253,9 +242,6 @@ PLANNED = [
   ("test", "test", "hc-8-suites", "Expand suites x projects to the minimal union stack, run each runner (container or command) with TRACEPARENT and baggage test.id, collect exit code plus JUnit XML or TAP.",
    {"suites": arr(S), "projects": arr(S), "run": ref("RunId")},
    obj({"run": ref("RunId"), "cells": arr(obj({"suite": S, "project": S, "exit": I, "report": ref("Report")}))})),
-  ("flaky", "flaky", "hc-13-flaky", "Rank tests by intermittent failure across runs, so a flake is told apart from a regression.",
-   {"suite": S, "limit": I, "since": S},
-   obj({"tests": arr(obj({"id": S, "runs": I, "failures": I, "flips": I, "score": N, "verdict": {"enum": ["flaky", "regression", "stable"]}}))})),
 ]
 
 components["Report"] = dict(obj({"format": {"enum": ["junit", "tap"]},
@@ -297,8 +283,8 @@ doc = {
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base",
   "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "0", "description": ":compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)"}}}],
   "tags": [{"name": "sections", "description": "existing section commands"}, {"name": "swarm", "description": "existing claim / nREPL routing commands"},
-           {"name": "stacks", "description": "stack runs, fault injection and failure explanation (hc-4/6/10/12)"},
-           {"name": "stacks (planned)", "description": "hc-8/13 placeholders"},
+           {"name": "stacks", "description": "stack runs, fault injection, failure explanation and flaky ranking (hc-4/6/10/12/13)"},
+           {"name": "stacks (planned)", "description": "hc-8 placeholder (test)"},
            {"name": "meta", "description": "health and this document"}],
   "security": [],
   "x-trust-model": "No authentication. The server binds a loopback address only and refuses browser traffic (Host must be a loopback name, "

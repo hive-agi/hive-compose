@@ -398,7 +398,7 @@
                               "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
-                              "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
+                              "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
@@ -421,6 +421,29 @@
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
 
+(def ^:private subject-commands
+  "Commands that resolve a section from target or profile (ops/subject)."
+  #{"up" "switch" "down" "stop" "restart" "touch" "ps" "logs" "claim" "release"})
+
+(def command-params
+  "{command #{param}}: the params each command reads, the one source the
+   control API rejects unknown params by and the spec's Req_<command>
+   schemas are generated from. Read off the [cmd|..] prefix of each param's
+   description in the tool's inputSchema, plus target and profile for the
+   commands that resolve a section and agent_id (stamped by the MCP host)
+   for claim and release."
+  (let [props (dissoc (get-in (tool nil) [:inputSchema :properties]) "command")
+        by-desc (apply merge-with into {}
+                       (for [[p {:keys [description]}] props
+                             [_ cs] (re-seq #"\[([a-z|_-]+)\]" (str description))
+                             c (str/split cs #"\|")]
+                         {c #{p}}))]
+    (into (sorted-map)
+          (for [c commands]
+            [c (cond-> (get by-desc c #{})
+                 (subject-commands c) (into #{"target" "profile"})
+                 (#{"claim" "release"} c) (conj "agent_id"))]))))
+
 ;; ---------------------------------------------------------------------------
 ;; lifecycle
 
@@ -433,6 +456,7 @@
     (when enabled?
       (let [deps {:dispatch (fn [command params] (dispatch a command params))
                   :commands commands
+                  :params command-params
                   :declared (get-in (tool a) [:inputSchema :properties])
                   :health (fn [] (addon/health a))
                   :spec api/spec-text}

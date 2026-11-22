@@ -53,14 +53,14 @@ Every schema carries `x-source: generated|hand`.
 
 **Generated:**
 - All 16 value objects of `hive-compose.schema` @ staging, via `malli.json-schema/transform`: ProfileId, IdleAction, SecretRef, EnvValue, Env, Program, Running, Activity, Profile, Claim, Usage, Active, ActiveMap, Project, Settings, Release. Each carries `x-malli`.
-- 15 stack schemas from the **uncommitted** hc-2 worktree (`feat/hc-2-stack-schema`), marked `x-status: planned`: CapabilityId, Version, VersionRange, RunId, ConsumerId, Provide, Need, Provides, Needs, Stack, Instance, Resolution, Wiring, ReportFormat, Suite.
-- `ComposeRequest` and every `Req_<command>`, from the tool's live :inputSchema. Which params a command reads comes from the `[up|switch|..]` prefixes of the param descriptions. `env` is typed as `$ref Env` because `addon/checked-options` validates the call against `schema/Env`. The tool itself declares only `{type: object}`.
+- 16 stack schemas of `hive-compose.schema` @ staging (hc-2 has merged): CapabilityId, Version, VersionRange, RunId, ConsumerId, Resources, Provide, Need, Provides, Needs, Stack, Instance, Resolution, Wiring, ReportFormat, Suite.
+- `ComposeRequest` and every `Req_<command>`, from the tool's live :inputSchema. Which params a command reads is `hive-compose.addon/command-params` (the `[up|switch|..]` prefixes of the param descriptions, plus target/profile for the section commands and agent_id for claim/release), emitted by gen.clj. The API enforces the same table: a key outside it is 400 compose/invalid-param naming the param and the known ones, so a typo such as `runn` on stack-down is refused instead of dropped. The command check runs first, so /v1/bogus is 404 whatever its body. `openapi_contract_test` checks Req_<command> properties == command-params. `env` is typed as `$ref Env` because `addon/checked-options` validates the call against `schema/Env`. The tool itself declares only `{type: object}`.
 - Operation `summary`/`description`, from `addon/command-help`.
 
 **Hand-written** from the pipeline code:
 - All response payloads: StatusResult/StatusRow, UpResult (also switch, with `released`), DownResult/StepReport, RestartResult, TouchResult, PsResult, LogsResult, ClaimResult, ReleaseResult, WhoResult, NreplResult/Route, ProjectsResult, ReloadResult, ReaperPass/ObserveReport, ProgramReport/ProgramRow, TargetsResult, ProgramsResult, HelpResult, AdoptResult. These are functions building maps with `cond->`, not malli schemas, so nothing could be generated.
 - The envelope (`Ok`, `ErrorEnvelope`) and the HTTP status mapping (`api/status-by-category`).
-- `ErrorCategory` is generated: assemble.py collects every `(r/err :ns/name ..)` literal under `src/`. `openapi_contract_test` checks the enum against the same scan, and `api_test` checks that `status-by-category` maps every category in it, so neither can drift from the code.
+- `ErrorCategory` is generated from `hive-compose.api/source-categories`: every category under `src/` written as the first arg of `r/err`, `r/try-effect*` or `r/try-effect-throwable*`, the category arg of `read-edn` or `parsed`, or a keyword under `:error`. gen.clj emits it, `openapi_contract_test` checks the enum equals the same scan, and `api_test` checks that `status-by-category` maps every category in it, so neither can drift from the code. A category built some other way (from a variable) is not seen; keep categories literal.
 - The planned paths and the `Report` schema.
 
 ## Design
@@ -102,9 +102,8 @@ hc-lane-edge suggested "without the ns or with a/b style". I chose without the n
 | path | op | plan step | params |
 |---|---|---|---|
 | `/v1/test` | `test` | hc-8 | `{suites, projects, run?}`, a matrix of `Report` |
-| `/v1/flaky` | `flaky` | hc-13 | `{suite?, limit?, since?}`, ranking by flips |
 
-`/v1/stack-up`, `/v1/stack-down`, `/v1/stack-status`, `/v1/plan`, `/v1/why` and `/v1/faults` were placeholders here. They are live since staging merged hc-4/6/10/12. Their `Req_` schemas are generated from the tool's params like every other command (faults: `run, op, proxy, toxic`). Their results are typed open (`FaultsResult`, `StackUpResult`, ...) until those maps get malli schemas.
+`/v1/stack-up`, `/v1/stack-down`, `/v1/stack-status`, `/v1/plan`, `/v1/why`, `/v1/faults` and `/v1/flaky` were placeholders here. They are live since staging merged hc-4/6/10/12/13. Their `Req_` schemas are generated from the tool's params like every other command (faults: `run, op, proxy, toxic`). Their results are typed open (`FaultsResult`, `StackUpResult`, ...) until those maps get malli schemas.
 
 The stack params are hc-lane-core's provisional hc-6 params (hivemind, via hc-lane-edge). The response shapes of the planned paths are my guesses from the plan text, apart from Report (from hc-8, relayed). hc-10, hc-12 and hc-13 shapes are unverified against their branches (hc10-trace, hc-13-flaky worktrees have uncommitted or empty work).
 

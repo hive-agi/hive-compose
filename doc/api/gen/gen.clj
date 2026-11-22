@@ -11,7 +11,10 @@
             [clojure.data.json :as json]))
 
 (def names '[ProfileId IdleAction SecretRef EnvValue Env Program Running Activity
-             Profile Claim Usage Active ActiveMap Project Settings Release])
+             Profile Claim Usage Active ActiveMap Project Settings Release
+             ;; stack value objects (hc-2, merged)
+             CapabilityId Version VersionRange RunId ConsumerId Resources Provide Need
+             Provides Needs Stack Instance Resolution Wiring ReportFormat Suite])
 
 (defn- write [file x]
   ;; malli 0.20 leaves :re patterns as java.util.regex.Pattern: render as source.
@@ -34,7 +37,13 @@
              {:inputSchema (:inputSchema tool)
               :description (:description tool)
               :commands @(requiring-resolve 'hive-compose.addon/commands)
-              :command-help @(requiring-resolve 'hive-compose.addon/command-help)}))
+              :command-help @(requiring-resolve 'hive-compose.addon/command-help)
+              ;; the params each command reads: what the API enforces and Req_<command> declares
+              :command-params (into (sorted-map)
+                                    (map (fn [[c ps]] [c (vec (sort ps))]))
+                                    @(requiring-resolve 'hive-compose.addon/command-params))
+              ;; every category the source answers: the ErrorCategory enum
+              :categories (vec ((requiring-resolve 'hive-compose.api/source-categories) "../../../src"))}))
     ;; How the MCP tool's data.json write-str renders keywords, sets and
     ;; namespaced keys: the wire shape every response actually has.
     (write (str prefix "datajson-probe.json")

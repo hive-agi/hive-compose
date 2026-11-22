@@ -33,7 +33,7 @@
 (def planned
   "Path segment -> hive_call op of the paths the spec marks x-status planned
    (plan 20261122140443-09c5c225). Answered 501 until they are implemented."
-  {"test" "test" "flaky" "flaky"})
+  {"test" "test"})
 
 (def status-by-category
   "HTTP status of a Result error category. Every category the source answers
@@ -71,6 +71,10 @@
    :compose/faults-invalid-toxic 400
    :compose/faults-unknown-toxic 400
    :trace/bad-id 400
+   :compose/invalid-run-id 400
+   :compose/invalid-trace-id 400
+   :compose/unknown-names 400
+   :compose/empty-matrix 400
    :compose/invalid-data-lifecycle 400
    :compose/invalid-data-step 400
    :compose/invalid-data-state 400
@@ -112,6 +116,8 @@
    :compose/stack-down-incomplete 502
    :compose/toxiproxy-failed 502
    :compose/runner-failed 502
+   :compose/unparseable 502
+   :compose/toxiproxy-unparseable 502
    :compose/data-step-failed 502
    :compose/toxiproxy-unreachable 502
    :trace/unreachable 502
@@ -119,6 +125,8 @@
    :trace/bad-json 502
    :compose/not-initialized 503
    :compose/invalid-config 503
+   :compose/profiles-unreadable 503
+   :compose/no-history 503
    :compose/no-compose-file 503
    :compose/program-needs-command 503
    :compose/stacks-unsupported 503
@@ -139,7 +147,46 @@
    :compose/ownership-check-failed 500
    :compose/proc-unreadable 500
    :compose/meminfo-unreadable 500
-   :compose/api-bind-failed 500})
+   :compose/api-bind-failed 500
+   :compose/state-unreadable 500
+   :compose/state-unwritable 500
+   :compose/lock-unreadable 500
+   :compose/lock-unwritable 500
+   :compose/result-unreadable 500
+   :compose/result-unwritable 500
+   :compose/result-run-mismatch 500
+   :compose/bundle-unwritable 500
+   :compose/history-unreadable 500
+   :compose/history-unwritable 500
+   :compose/log-unwritable 500
+   :compose/program-unreadable 500
+   :compose/program-stop-failed 500
+   :compose/override-unwritable 500
+   :compose/otlp-env-failed 500})
+
+(def ^:private category-forms
+  "Where a Result category is written in source: the first arg of r/err,
+   r/try-effect* and r/try-effect-throwable*, the category arg of read-edn
+   (boundary/files) and of parsed (adapter/cli), and a keyword assoc'd under
+   :error. One pattern per spelling, one capture group each."
+  [#"\((?:r/err|r/try-effect\*|r/try-effect-throwable\*)\s+:([a-z-]+/[a-z-]+)"
+   #"\(read-edn\s+\S+\s+:([a-z-]+/[a-z-]+)"
+   #":error\s+:([a-z-]+/[a-z-]+)"
+   #"\(parsed\s+\(run[^\n]*\n?\s*:([a-z-]+/[a-z-]+)"])
+
+(defn source-categories
+  "Sorted set of every category (ns/name strings) the .clj files under `root`
+   can answer, by `category-forms`. Build and test time only: the spec's
+   ErrorCategory enum (doc/api/gen) and the drift tests over
+   `status-by-category` are this one scan, so they cannot disagree."
+  [root]
+  (into (sorted-set)
+        (for [f (file-seq (io/file root))
+              :when (re-find #"\.clj$" (str f))
+              :let [text (slurp f)]
+              re category-forms
+              [_ c] (re-seq re text)]
+          c)))
 
 (defn http-status
   "200 for an ok Result, else the status of its category (500 when unmapped)."
@@ -195,12 +242,11 @@
         (r/err :compose/invalid-param {:param "body"
                                        :hint "the body is a JSON object of the command's params"})))))
 
-(defn call
-  "Result of `command` with `params` through `dispatch` ((command params) ->
-   Result, the MCP tool's contract). A planned op answers not-implemented and a
-   command not in `commands` unknown-command, both before dispatch, so they do
-   not depend on the addon's lifecycle. A throw is answered, never propagated."
-  [{:keys [dispatch commands]} command params]
+(defn known-op
+  "Result<command>: `command` when `commands` (deps) holds it, else
+   not-implemented for a planned op and unknown-command for anything else.
+   Checked before the body, so /v1/bogus is 404 whatever it is sent."
+  [{:keys [commands]} command]
   (cond
     (contains? planned command)
     (r/err :compose/not-implemented {:op (get planned command)
@@ -210,12 +256,21 @@
     (r/err :compose/unknown-command {:command command :known (vec commands)
                                      :hint "POST /v1/help lists what each does"})
 
-    :else
-    (try (dispatch command params)
-         (catch Throwable t
-           ;; class and message only: an ex-info's data could carry env values
-           (r/err :compose/dispatch-threw {:command command :class (.getName (class t))
-                                           :message (ex-message t)})))))
+    :else (r/ok command)))
+
+(defn call
+  "Result of `command` with `params` through `dispatch` ((command params) ->
+   Result, the MCP tool's contract), after `known-op`, so a planned or unknown
+   op does not depend on the addon's lifecycle. A throw is answered, never
+   propagated."
+  [{:keys [dispatch] :as deps} command params]
+  (r/bind (known-op deps command)
+          (fn [_]
+            (try (dispatch command params)
+                 (catch Throwable t
+                   ;; class and message only: an ex-info's data could carry env values
+                   (r/err :compose/dispatch-threw {:command command :class (.getName (class t))
+                                                   :message (ex-message t)}))))))
 
 (defn- type-ok?
   "Whether JSON value `v` fits JSON Schema type `t` as the tool reads it
@@ -229,17 +284,25 @@
     true))
 
 (defn check-params
-  "Result<params>: `params` when every one the tool declares (`declared`, the
+  "Result<params>: `params` when every key is one `command` reads (`known`,
+   addon/command-params) and every one the tool declares (`declared`, the
    tool's inputSchema properties, string names to {:type ..}) has that JSON
-   type, else an invalid-param naming the first that does not. Params the
-   tool does not declare pass through, as on MCP."
-  [declared params]
-  (if-let [[k t] (first (for [[k v] (sort-by key params)
-                              :let [t (get-in declared [k :type])]
-                              :when (and t (some? v) (not (type-ok? t v)))]
-                          [k t]))]
-    (r/err :compose/invalid-param {:param k :hint (str "expected " t)})
-    (r/ok params)))
+   type, else an invalid-param naming the first that is not. An unknown key
+   is refused rather than dropped: a typo (runn for run) on stack-down would
+   otherwise take down every run of the stack. A nil `known` (no table)
+   checks types only."
+  ([declared params] (check-params declared nil params))
+  ([declared known params]
+   (let [ks (sort (keys params))]
+     (if-let [k (when known (first (remove known ks)))]
+       (r/err :compose/invalid-param {:param k :known (vec (sort known))
+                                      :hint (str "not a param of this command")})
+       (if-let [[k t] (first (for [k ks
+                                   :let [v (get params k) t (get-in declared [k :type])]
+                                   :when (and t (some? v) (not (type-ok? t v)))]
+                               [k t]))]
+         (r/err :compose/invalid-param {:param k :hint (str "expected " t)})
+         (r/ok params))))))
 
 (defn- host-part
   "The host of a Host header or an Origin URL, lower-cased, port dropped;
@@ -315,14 +378,17 @@
       (respond (r/err :compose/method-not-allowed {:method method :allow "POST"}) {"Allow" "POST"})
 
       :else
-      (respond (r/bind (r/bind (parse-params body) #(check-params (:declared deps) %))
-                       #(call deps seg %))))))
+      (respond (r/let-ok [_ (known-op deps seg)
+                          params (parse-params body)
+                          params (check-params (:declared deps) (some-> (:params deps) (get seg)) params)]
+                 (call deps seg params))))))
 
 (defn route
   "{:status :headers :body} for one request {:method :path :headers :body}
    (:headers lower-cased names; :body the request text, nil when it was too
    large). `deps`: :dispatch and :commands (see `call`), :declared (the tool's
-   inputSchema properties, see `check-params`), :health (0-arity, the addon
+   inputSchema properties) and :params (addon/command-params; absent: no
+   unknown-param check), see `check-params`, :health (0-arity, the addon
    health map) and :spec (0-arity, the spec text). Never throws: a throw is
    answered as the envelope of compose/internal."
   [deps req]

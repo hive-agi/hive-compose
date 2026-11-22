@@ -13,6 +13,7 @@
 (defn- deps [dispatch]
   {:dispatch dispatch :commands ["help" "status" "up" "logs"]
    :declared {"tail" {:type "integer"} "env" {:type "object"} "wait" {:type "boolean"} "target" {:type "string"}}
+   :params {"help" #{} "status" #{} "up" #{"target" "wait"} "logs" #{"target" "tail" "env" "wait"}}
    :health (constantly {:status :ok}) :spec (constantly "openapi: 3.1.0\n")})
 
 (def ^:private local {"host" "127.0.0.1:7781" "content-type" "application/json"})
@@ -57,13 +58,12 @@
     (is (= code (api/http-status (r/err cat {}))) (str cat))))
 
 (deftest every-category-the-source-answers-has-a-status
-  ;; derived from src/, so a new (r/err :ns/name ..) cannot ship unmapped
-  (let [in-src (into (sorted-set)
-                     (comp (filter #(re-find #"\.clj$" (str %)))
-                           (mapcat #(re-seq #"\(r/err :([a-z-]+/[a-z-]+)" (slurp %)))
-                           (map (comp keyword second)))
-                     (file-seq (io/file "src")))]
+  ;; derived from src/, so a new category cannot ship unmapped
+  (let [in-src (into (sorted-set) (map keyword) (api/source-categories "src"))]
     (is (seq in-src))
+    (testing "the scan sees every spelling, not only r/err literals"
+      (is (every? in-src [:compose/toxiproxy-unparseable :compose/profiles-unreadable
+                          :compose/lock-unwritable :compose/result-run-mismatch :compose/unparseable])))
     (is (= #{} (apply disj in-src (keys api/status-by-category))) "categories with no HTTP status")
     (is (every? #{400 403 404 405 409 413 415 500 501 502 503} (vals api/status-by-category)))))
 
@@ -86,15 +86,31 @@
         (is (= 400 (:status res)) b)
         (is (= "compose/invalid-param" (get (body res) "error")) b))))
   (let [d (deps (fn [_ p] (r/ok p)))]
-    (is (= 200 (:status (api/route d (req "POST" "/v1/up" "{\"wait\":\"true\",\"tail\":5,\"extra\":[1]}"))))
-        "\"true\" is a boolean as on MCP; an undeclared param passes through")))
+    (is (= 200 (:status (api/route d (req "POST" "/v1/up" "{\"wait\":\"true\",\"target\":\"a\"}"))))
+        "\"true\" is a boolean as on MCP")))
+
+(deftest an-unknown-param-is-400-naming-the-known-ones
+  (let [d (deps (fn [_ _] (throw (ex-info "must not run" {}))))
+        res (api/route d (req "POST" "/v1/up" "{\"target\":\"a\",\"tail\":5}"))]
+    (is (= 400 (:status res)))
+    (is (= {"error" "compose/invalid-param" "param" "tail" "known" ["target" "wait"]}
+           (select-keys (body res) ["error" "param" "known"]))
+        "tail is a logs param, not an up one"))
+  (testing "a typo on a destructive op is refused, not dropped"
+    (let [d (assoc (deps (fn [_ _] (throw (ex-info "must not run" {}))))
+                   :commands ["stack-down"] :params {"stack-down" #{"stack" "run"}})]
+      (is (= "runn" (get (body (api/route d (req "POST" "/v1/stack-down" "{\"stack\":\"s\",\"runn\":\"abc\"}"))) "param")))))
+  (testing "an unknown command is 404 whatever its body"
+    (let [d (deps (fn [_ _] (throw (ex-info "must not run" {}))))]
+      (is (= 404 (:status (api/route d (req "POST" "/v1/bogus" "{\"x\":1}")))))
+      (is (= 404 (:status (api/route d (req "POST" "/v1/bogus" "{\"tail\":\"many\"}"))))))))
 
 (deftest refusals-and-unknowns-never-reach-dispatch
   (let [d (deps (fn [_ _] (throw (ex-info "must not run" {}))))]
     (is (= 404 (:status (api/route d (req "POST" "/v1/bogus" "{}")))))
     (is (= "compose/unknown-command" (get (body (api/route d (req "POST" "/v1/bogus" "{}"))) "error")))
-    (is (= 501 (:status (api/route d (req "POST" "/v1/flaky" "{}")))))
-    (is (= "flaky" (get (body (api/route d (req "POST" "/v1/flaky" "{}"))) "op")))
+    (is (= 501 (:status (api/route d (req "POST" "/v1/test" "{}")))))
+    (is (= "test" (get (body (api/route d (req "POST" "/v1/test" "{}"))) "op")))
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "[1,2]")))))
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "{not json")))))
     (is (= 405 (:status (api/route d (req "GET" "/v1/up" "")))))
