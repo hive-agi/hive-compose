@@ -306,6 +306,147 @@
     (is (empty? (:stacks @(:state c))))))
 
 ;; ---------------------------------------------------------------------------
+;; concurrency: interleavings forced through the stub's call hook. A thread is
+;; parked inside one engine call; the other op is started and the parked one
+;; is let go only once that op either finished (it ran concurrently: the
+;; defect) or is blocked on the stack lock (it waits: the fix). Never a sleep
+;; deciding the outcome, so each test answers the same on every run.
+
+(def ^:private deadline-ms 10000)
+
+(defn- await-until
+  "Poll `pred` every 2 ms until true; fail loudly after the deadline."
+  [what pred]
+  (let [end (+ (System/currentTimeMillis) deadline-ms)]
+    (loop []
+      (cond (pred) true
+            (> (System/currentTimeMillis) end) (throw (ex-info (str "timed out waiting for " what) {}))
+            :else (do (Thread/sleep 2) (recur))))))
+
+(defn- blocked? [^Thread t]
+  ;; `locking` waits in monitorenter: BLOCKED, three polls in a row
+  (every? (fn [_] (Thread/sleep 5) (= Thread$State/BLOCKED (.getState t))) (range 3)))
+
+(defn- spawn
+  "[future thread-promise]: `f` on a fresh thread."
+  [f]
+  (let [t (promise)]
+    [(future (deliver t (Thread/currentThread)) (f)) t]))
+
+(defn- finished-or-waiting
+  "Until op `fut` (on thread promise `t`) finished or waits on the lock."
+  [fut t]
+  (await-until "the second op to finish or block" #(or (realized? fut) (and (realized? t) (blocked? @t)))))
+
+(defn- park-at!
+  "Hook engine of `c`: the first call matching `pred` parks its thread.
+   Answers {:at promise (delivered when parked) :go promise (deliver to resume)}."
+  [c pred]
+  (let [at (promise) go (promise) once (atom false)]
+    (stub/on-call! (e c) (fn [call]
+                           (when (and (pred call) (compare-and-set! once false true))
+                             (deliver at call)
+                             (deref go deadline-ms nil))))
+    {:at at :go go}))
+
+(defn- kafka-release? [call]
+  (and (= :down-project (first call)) (= "kafka" (second call))))
+
+(deftest a-down-racing-an-up-never-stops-what-the-up-binds
+  ;; A's down plans "release kafka" (nobody else binds it), then B comes up on
+  ;; kafka; A must not then stop the kafka B is bound to
+  (let [c (ctx)
+        a (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])
+        {:keys [at go]} (park-at! c kafka-release?)
+        [down _] (spawn #(stacks/stack-down! c {:run a}))
+        _ (is (some? (deref at deadline-ms nil)) "A's down reached its kafka release")
+        [up t] (spawn #(stacks/stack-up! c {:stack "billing"}))]
+    (finished-or-waiting up t)
+    (deliver go true)
+    (let [d (deref down deadline-ms ::timeout) u (deref up deadline-ms ::timeout)
+          b (get-in u [:ok :run])]
+      (stub/on-call! (e c) nil)
+      (is (r/ok? d) (pr-str d))
+      (is (r/ok? u) (pr-str u))
+      (is (= :up (get-in @(:state c) [:stacks b :status])))
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "B is up with its kafka running")
+      (is (= [b] (keys (:stacks @(:state c))))))))
+
+(deftest two-ups-of-one-run-id-one-wins
+  ;; both pass the id check before either records the run: one must fail
+  ;; with :compose/run-exists and leave the winner's entry alone
+  (let [c (ctx)
+        arrived (atom #{})
+        threads (atom [])
+        _ (stub/on-call! (e c) (fn [[m]]
+                                 (when (= :closure m)
+                                   (let [me (Thread/currentThread)
+                                         [old] (swap-vals! arrived conj me)]
+                                     (when-not (contains? old me)
+                                       (await-until "the other up to probe or block"
+                                                    #(or (= 2 (count @arrived))
+                                                         (some (fn [^Thread t] (and (not= t me) (blocked? t)))
+                                                               @threads))))))))
+        up! (fn [sid] (fn [] (swap! threads conj (Thread/currentThread))
+                        (stacks/stack-up! c {:stack sid :run "xrun"})))
+        f1 (future ((up! "shop")))
+        f2 (future ((up! "billing")))
+        rs [(deref f1 deadline-ms ::timeout) (deref f2 deadline-ms ::timeout)]
+        win (first (filter r/ok? rs))
+        entry (get-in @(:state c) [:stacks "xrun"])]
+    (stub/on-call! (e c) nil)
+    (is (= 1 (count (filter r/ok? rs))) (pr-str rs))
+    (is (= [:compose/run-exists] (keep :error rs)))
+    (is (= (get-in win [:ok :stack]) (:stack/id entry)) "the entry is the winner's")
+    (is (= :up (:status entry)))
+    (is (= (set (map :consumer (get-in win [:ok :consumers]))) (set (keys (:consumers entry))))
+        "the winner's consumers, intact")))
+
+(deftest a-vanished-world-service-is-owned-by-the-next-run
+  (let [c (ctx {"kafka" #{"kafka" "zookeeper"}})
+        r1 (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
+    (stacks/stack-down! c {:run r1})
+    (is (= {"kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))) "marked, spared")
+    (port/-down-project! (e c) {:project "kafka" :all? true})
+    (testing "the next up finds it gone: it starts it and drops the marks"
+      (let [r2 (get-in (stacks/stack-up! c {:stack "billing"}) [:ok :run])]
+        (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")))
+        (is (empty? (get (:preexisting @(:state c)) "kafka")))
+        (testing "and its down releases it"
+          (let [down (stacks/stack-down! c {:run r2})]
+            (is (r/ok? down))
+            (is (= #{} (stub/running (e c) "kafka")))
+            (is (= [{:instance "kafka/kafka" :project "kafka" :services ["kafka" "zookeeper"]}]
+                   (get-in down [:ok :runs 0 :released])))))))))
+
+(deftest a-mark-held-by-another-run-or-still-running-stays
+  (let [c (ctx {"kafka" #{"kafka" "zookeeper"}})
+        _ (stacks/stack-up! c {:stack "billing"})
+        _ (stacks/stack-up! c {:stack "shop"})]
+    (is (= {"kafka" #{"kafka" "zookeeper"}} (:preexisting @(:state c))) "running: B1, never dropped")
+    (stacks/stack-down! c {:stack "shop"})
+    (stacks/stack-down! c {:stack "billing"})
+    (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "what ran before any run is never stopped")))
+
+(deftest a-reap-racing-an-up-is-serialized
+  (let [c (ctx)
+        a (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])
+        _ (swap! (:clock c) + (* 61 minute))
+        {:keys [at go]} (park-at! c kafka-release?)
+        [reap _] (spawn #(stacks/reap! c))
+        _ (is (some? (deref at deadline-ms nil)) "the reap reached its kafka release")
+        [up t] (spawn #(stacks/stack-up! c {:stack "billing"}))]
+    (finished-or-waiting up t)
+    (deliver go true)
+    (let [rp (deref reap deadline-ms ::timeout) u (deref up deadline-ms ::timeout)
+          b (get-in u [:ok :run])]
+      (stub/on-call! (e c) nil)
+      (is (= [{:run a :ok? true}] (:reaped rp)))
+      (is (r/ok? u) (pr-str u))
+      (is (= [b] (keys (:stacks @(:state c)))))
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "the reap never stopped B's kafka"))))
+
+;; ---------------------------------------------------------------------------
 ;; properties
 
 (def gen-op

@@ -11,7 +11,8 @@
 
    Config: see `hive-compose.promote.config`. `:compose/engine` injects an
    IComposeEngine in place of the docker CLI, `:compose/runner` an
-   IProgramRunner in place of the host one, `:compose/resolver` the
+   IProgramRunner in place of the host one, `:compose/history` an
+   IFlakeHistory in place of the history file, `:compose/resolver` the
    {scheme ISecretBackend} env references are read through in place of `pass`."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
@@ -19,7 +20,9 @@
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
+            [hive-compose.boundary.history :as history]
             [hive-compose.pipeline.faults :as faults]
+            [hive-compose.pipeline.flaky :as flaky]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.pipeline.why :as why]
@@ -34,10 +37,14 @@
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
             [hive-compose.adapter.procnet :as procnet]
+            [hive-compose.adapter.meminfo :as meminfo]
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
-            [hive-addon.host :as addon-host])
+            [hive-addon.host :as addon-host]
+            [hive-compose.api :as api]
+            [hive-compose.adapter.http :as http]
+            [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -123,6 +130,11 @@
      :processes (if (contains? cfg :compose/process-table)
                   (:compose/process-table cfg)
                   (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
+     :host-memory (if (contains? cfg :compose/host-memory)
+                    (:compose/host-memory cfg)
+                    (meminfo/make-host-memory))
+     :history (or (:compose/history cfg)
+                  (history/file-history (:compose/history-file settings)))
      :settings settings
      :state state
      :faults (atom {})
@@ -202,6 +214,7 @@
    "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
+   "flaky" "test cases ranked by intermittent failure across recorded suite runs, each :flaky, :regression (failing since a named run and sha), :fixed or :stable. suite; project; limit (default 20)"
    "faults" "fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer, attributes {name number}, stream upstream|downstream, toxicity 0..1, name}"
    "reload" "re-read the config"
    "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
@@ -280,7 +293,11 @@
                         (cond-> t
                           (map? (:attributes t)) (update :attributes #(into {} (map (fn [[k v]] [(name k) v])) %)))))}))))
 
-(defn- dispatch [a command params]
+(defn dispatch
+  "Result of `command` with `params` (the tool's params, string or keyword
+   keys) on addon `a`: the one dispatch both transports run, the MCP `compose`
+   tool (`tool`) and the control API (`hive-compose.api`)."
+  [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
@@ -303,7 +320,8 @@
                                                   :errors (:errors @(:state a))})
       :else
       (case command
-        "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
+        "status" (r/ok (cond-> (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+                         (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
@@ -316,6 +334,8 @@
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
                     (on-subject #(swarm/release-claim! ctx % (agent-param params)
                                                        {:stop? (flag params "stop")})))
+        ;; stack-up/stack-down/claim/release and the reaper's stacks/reap! take
+        ;; the one stack lock of ctx's state (stacks/serialized): never concurrent
         "stack-up" (stacks/stack-up! ctx (stack-opts params))
         "stack-down" (stacks/stack-down! ctx (stack-opts params))
         "stack-status" (stacks/stack-status ctx (stack-opts params))
@@ -339,6 +359,13 @@
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
+        "flaky" (flaky/flaky ctx
+                             {:suite (some-> (param params "suite") str)
+                              :project (some-> (param params "project") str)}
+                             (let [l (param params "limit")]
+                               (max 1 (cond (number? l) (long l)
+                                            (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
+                                            :else 20))))
         "faults" (r/bind (faults-request params) #(faults/faults! ctx %))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
@@ -373,12 +400,14 @@
                               "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
-                              "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
+                              "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
-                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes"}
+                              "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
+                              "suite" {:type "string" :description "[flaky] only cases of this suite"}
+                              "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
                               "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
                               "note" {:type "string" :description "[claim] what the agent works on"}
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
@@ -394,8 +423,54 @@
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
 
+(def ^:private subject-commands
+  "Commands that resolve a section from target or profile (ops/subject)."
+  #{"up" "switch" "down" "stop" "restart" "touch" "ps" "logs" "claim" "release"})
+
+(def command-params
+  "{command #{param}}: the params each command reads, the one source the
+   control API rejects unknown params by and the spec's Req_<command>
+   schemas are generated from. Read off the [cmd|..] prefix of each param's
+   description in the tool's inputSchema, plus target and profile for the
+   commands that resolve a section and agent_id (stamped by the MCP host)
+   for claim and release."
+  (let [props (dissoc (get-in (tool nil) [:inputSchema :properties]) "command")
+        by-desc (apply merge-with into {}
+                       (for [[p {:keys [description]}] props
+                             [_ cs] (re-seq #"\[([a-z|_-]+)\]" (str description))
+                             c (str/split cs #"\|")]
+                         {c #{p}}))]
+    (into (sorted-map)
+          (for [c commands]
+            [c (cond-> (get by-desc c #{})
+                 (subject-commands c) (into #{"target" "profile"})
+                 (#{"claim" "release"} c) (conj "agent_id"))]))))
+
 ;; ---------------------------------------------------------------------------
 ;; lifecycle
+
+(defn- start-api!
+  "Serve the control API when `:compose/api` enables it. The bound address
+   (or why it failed: the addon still starts) lands in the state's :api, which
+   `status` answers; the server itself under :api-server."
+  [a cfg]
+  (let [{:keys [enabled?] :as acfg} (api/config cfg)]
+    (when enabled?
+      (let [deps {:dispatch (fn [command params] (dispatch a command params))
+                  :commands commands
+                  :params command-params
+                  :declared (get-in (tool a) [:inputSchema :properties])
+                  :health (fn [] (addon/health a))
+                  :spec api/spec-text}
+            res (http/start! acfg #(api/route deps %))]
+        (if (r/ok? res)
+          (swap! (:state a) assoc :api-server (:ok res) :api (select-keys (:ok res) [:host :port :url]))
+          ;; the keyword: MCP writes it bare, the API qualifies it, as every category
+          (swap! (:state a) assoc :api {:error (:error res) :detail (dissoc res :error)}))))))
+
+(defn- stop-api! [{:keys [state]}]
+  (when-let [s (:api-server @state)] (http/stop! s))
+  (swap! state dissoc :api-server :api))
 
 (defn- start! [a cfg settings]
   (let [{:keys [state]} a
@@ -413,10 +488,12 @@
                              (long (or (:compose/initial-delay-ms cfg) 5000))
                              (long (* 1000 tick))
                              TimeUnit/MILLISECONDS)
+    (start-api! a cfg)
     {:success? true :errors []
-     :metadata {:profiles (count (:compose/profiles settings))
-                :active (count (:active @(:state ctx)))
-                :tick-seconds tick}}))
+     :metadata (cond-> {:profiles (count (:compose/profiles settings))
+                        :active (count (:active @(:state ctx)))
+                        :tick-seconds tick}
+                 (:api @state) (assoc :api (:api @state)))}))
 
 (defn reload!
   "Re-read the addon config block declared now and the profiles file into the
@@ -430,8 +507,9 @@
    with until recreated)."
   [{:keys [state seed]}]
   (locking state
-    (let [{:keys [runtime-config declared ctx]} @state
+    (let [{:keys [runtime-config declared ctx] old-cfg :cfg} @state
           {:keys [cfg source]} (merged-config seed runtime-config declared)
+          api-changed? (not= (api/config old-cfg) (api/config cfg))
           old (:settings ctx)]
       (r/let-ok [settings (build-settings cfg)]
         (let [fresh (build-ctx cfg settings {})
@@ -445,6 +523,8 @@
                          :changed diff
                          :sections sections
                          :not-reloaded (cond-> ["env and files of running containers: they apply when the containers are recreated (up after the change, restart recreate=true)"]
+                                         api-changed?
+                                         (conj "the control API (:compose/api): it is rebound at the next initialize!")
                                          (seq (:restart-required diff))
                                          (conj (str "settings applied at the next initialize!: "
                                                     (str/join ", " (map name (:restart-required diff))))))}
@@ -467,8 +547,9 @@
                 (swap! state assoc :lifecycle :error :errors [(ex-message e)])
                 {:success? false :errors [(ex-message e)]}))))))))
 
-(defn- shutdown-addon! [{:keys [state]}]
+(defn- shutdown-addon! [{:keys [state] :as a}]
   (locking state
+    (stop-api! a)
     (when-let [^ScheduledExecutorService sched (:scheduler @state)]
       (.shutdownNow sched))
     (swap! state #(-> % (dissoc :scheduler :ctx) (assoc :lifecycle :stopped))))
@@ -510,7 +591,12 @@
                           (if-let [ctx (:ctx @state)]
                             (swarm/nrepl ctx {:path path})
                             (r/err :compose/not-initialized)))
-     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))}))
+     :compose/who (fn [] (if-let [ctx (:ctx @state)] (swarm/who ctx) (r/err :compose/not-initialized)))
+     ;; hc-8's suite runner records each run result here (see pipeline.flaky).
+     :compose/record-run! (fn [run]
+                            (if-let [ctx (:ctx @state)]
+                              (flaky/record-run! ctx run)
+                              (r/err :compose/not-initialized)))}))
 
 (defn make-addon
   "Uninitialized IAddon. No thread, file or container is touched."

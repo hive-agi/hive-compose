@@ -1,7 +1,7 @@
 (ns hive-compose.e2e-fixtures-test
   "The e2e fixture images build. A guard for test/resources/e2e, which the
   stack e2e proof (hc-11) mounts: the Go `orders` service, the Node `billing`
-  service and the sh+curl suite runner. Integration only: it needs a docker
+  service, the sh+curl suite runner and the S13 memory hog (hc-16c). Integration only: it needs a docker
   daemon, and skips cleanly (one passing assertion, a printed reason) without one."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as sh]
@@ -17,7 +17,8 @@
   "Fixture directory -> the tag its compose.yml names."
   [["orders" "hive-compose-e2e/orders:dev"]
    ["billing" "hive-compose-e2e/billing:dev"]
-   ["suite" "hive-compose-e2e/suite:dev"]])
+   ["suite" "hive-compose-e2e/suite:dev"]
+   ["hog" "hive-compose-e2e/hog:dev"]])
 
 (defn- docker-available? []
   (try (zero? (:exit (sh/sh "docker" "info" "--format" "{{.ServerVersion}}")))

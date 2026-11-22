@@ -114,6 +114,27 @@
       (is (nil? (:adopted (sut/tick! a))) "adoption runs once")
       (finally (addon/shutdown! a)))))
 
+(deftest flaky-ranks-runs-recorded-through-the-hook
+  (let [dir (temp-dir)
+        a (sut/make-addon (config dir (stub/engine {})))
+        record! (:compose/record-run! (addon/hooks a))]
+    (is (= :compose/not-initialized (:error (record! {:run/id "run-0" :suite/id "api"}))))
+    (addon/initialize! a {})
+    (try
+      (doseq [[i s] (map-indexed vector [:passed :failed :passed :failed])]
+        (is (= 2 (:appended (:ok (record! {:run/id (str "run" i) :suite/id "api" :project "shop"
+                                           :exit 0
+                                           :report {:report/cases [{:case/id "api/T.flap" :case/status s}]}}))))))
+      (is (.exists (io/file dir "flake-history.ednl")) "the history lives beside the state file")
+      (let [{:keys [error? body]} (call a {"command" "flaky" "suite" "api" "limit" 5})]
+        (is (not error?))
+        (is (= ["api/T.flap" "api/(run)"] (mapv :case (:cases body))))
+        (is (= "flaky" (:class (first (:cases body))))))
+      (is (= 1 (count (:cases (:body (call a {"command" "flaky" "suite" "api" "limit" 0})))))
+          "a limit below 1 still answers one case")
+      (is (= 0 (:total (:body (call a {"command" "flaky" "project" "blog"})))))
+      (finally (addon/shutdown! a)))))
+
 (deftest reload-reads-the-config-declared-now
   (testing "an addon block edited after init (config A -> B) is what reload! runs on"
     (let [dir (temp-dir)

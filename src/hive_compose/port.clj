@@ -157,6 +157,27 @@
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
 
+(defprotocol IServiceImages
+  "Optional engine capability: what services of a project run, so a stack
+   can tell a JVM image and keep its own JVM flags (hc-16a). An engine
+   without it is treated as knowing nothing: only `:jvm? true` injects."
+  (-service-facts [e profile services]
+    "Result<{service {:image string :java-tool-options string? :mem-limit
+     MemSize?}}>: the image each of `services` runs, the JAVA_TOOL_OPTIONS
+     and the memory limit its compose file sets."))
+
+(defprotocol IFlakeHistory
+  "Append-only history of test case outcomes across runs (CaseOutcome rows,
+   see `hive-compose.schema`), read by `hive-compose.promote.flaky`."
+  (-append! [h rows]
+    "Result<{:appended n}>: add `rows` to the history. Rows are never
+     rewritten or removed; appending a run again adds its rows again (the
+     reader keeps one per run). Empty `rows` is a no-op.")
+  (-history [h query]
+    "Result<[row]>: every row recorded, in append order, narrowed by `query`
+     {:suite s :project p} (a nil or absent key matches any). An absent
+     history is []."))
+
 (defprotocol ISuiteRunner
   "Runs one suite runner to its end under its resource caps (hc-16b): a host
    command inside a memory-capped systemd user scope (ulimit -v when no user
@@ -213,6 +234,27 @@
      :unhealthy :starting :none.")
   (-networks-labelled [e labels]
     "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
+
+(defprotocol IDataExec
+  "Optional engine capability: run a data command (migrate, seed, reset)
+   inside a running container of a stack instance (hc-9). Never removes a
+   container or a volume."
+  (-exec! [e target argv opts]
+    "Result<{:exit 0 :out}>: `docker exec` of `argv` in the running container of
+     `target` ({:project compose-project :service svc}), with `opts` {:env
+     {VAR EnvValue} :timeout-ms n}; secret references in :env are read only
+     now. A non-zero exit is :compose/command-failed carrying :exit and
+     :stderr; no running container is :compose/no-container."))
+
+(defprotocol ICommandRunner
+  "Optional runner capability: run a host command to completion (hc-9 data
+   commands declared as `:command`), unlike `IProgramRunner/-start!`, which
+   detaches a long-lived program."
+  (-run-command! [r argv opts]
+    "Result<{:exit 0 :out}>: run `argv` with `opts` {:dir path :env {VAR
+     EnvValue} :timeout-ms n} and wait for it; secret references in :env are
+     read only now. A non-zero exit is :compose/command-failed carrying :exit
+     and :stderr."))
 
 (defprotocol IToxiproxyClient
   "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is

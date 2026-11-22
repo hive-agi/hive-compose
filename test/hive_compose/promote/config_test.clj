@@ -13,6 +13,17 @@
     (is (= (str home "/w/shop") (get-in s [:compose/profiles "api" :profile/dir])))
     (is (= (str home "/.local/state/hive-compose/state.edn") (:compose/state-file s)))))
 
+(deftest flake-history-settings-are-additive
+  (let [s (:ok (config/settings {} nil home))]
+    (is (= (str home "/.local/state/hive-compose/flake-history.ednl") (:compose/history-file s)))
+    (is (not (contains? s :compose/flaky)) "no thresholds unless configured"))
+  (let [s (:ok (config/settings {:compose/state-file "/st/state.edn"
+                                 :compose/flaky {:window 10}} nil home))]
+    (is (= "/st/flake-history.ednl" (:compose/history-file s)))
+    (is (= {:window 10} (:compose/flaky s))))
+  (is (= "/h/x.ednl" (:compose/history-file (:ok (config/settings {:compose/history-file "/h/x.ednl"} nil home)))))
+  (is (= :compose/invalid-config (:error (config/settings {:compose/flaky {:window 0}} nil home)))))
+
 (deftest map-shaped-profiles-take-their-key-as-id
   (let [s (:ok (config/settings {} {:api {:profile/dir "/w"}} home))]
     (is (= "api" (get-in s [:compose/profiles "api" :profile/id])))))
