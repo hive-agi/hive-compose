@@ -205,12 +205,15 @@
    `kafka:9092` stays right for shared and private instances alike.
    `:tenancy` names the env var a consumer's namespace prefix (topics,
    schemas, buckets) is passed in, so consumers of a shared instance do not
-   cross-talk."
+   cross-talk. `:port` is the container port the service answers on; a
+   consumer needing the capability `:via :toxiproxy` needs it (hc-12, the
+   proxy's upstream is `<service>:<port>`)."
   [:map
    [:service [:string {:min 1}]]
    [:version {:optional true} Version]
    [:env {:optional true} Env]
    [:tenancy {:optional true} [:map [:env [:string {:min 1}]]]]
+   [:port {:optional true} [:int {:min 1 :max 65535}]]
    [:description {:optional true} :string]])
 
 (def Need
@@ -283,6 +286,28 @@
    [:resolution/instances [:map-of :string Instance]]
    [:resolution/bindings [:map-of ConsumerId [:map-of CapabilityId :string]]]])
 
+(def ResolvedInstance
+  "An Instance as the run-independent resolver answers it: a private one may
+   lack `:instance/compose-project`, which the stack plan (knowing the run)
+   fills with `private-project` before validating against Instance."
+  [:map
+   [:instance/id [:string {:min 1}]]
+   [:instance/capability CapabilityId]
+   [:instance/provider [:string {:min 1}]]
+   [:instance/service [:string {:min 1}]]
+   [:instance/version {:optional true} Version]
+   [:instance/share? :boolean]
+   [:instance/consumers [:vector {:min 1} ConsumerId]]
+   [:instance/aliases [:vector {:min 1} [:string {:min 1}]]]
+   [:instance/compose-project {:optional true} ComposeProjectName]])
+
+(def ResolvedResolution
+  "The input of hive-compose.promote.stack/stack-plan: a Resolution of
+   ResolvedInstances (run-free)."
+  [:map
+   [:resolution/instances [:map-of :string ResolvedInstance]]
+   [:resolution/bindings [:map-of ConsumerId [:map-of CapabilityId :string]]]])
+
 (def Wiring
   "How one consumer is connected in a run. Its view network
    `view-network` is the only network outside its own compose project it
@@ -312,6 +337,72 @@
     (fn [w] (let [att (:wiring/attach w)]
               (and (distinct-items? (map :instance att))
                    (distinct-items? (mapcat :aliases att)))))]])
+
+(def ViewNetwork
+  "A consumer's view network name `hive-<run>-<consumer>`, slugged
+   (hive-compose.promote.names/view-network)."
+  [:re #"^hive-[a-z0-9][a-z0-9-]*-[a-z0-9][a-z0-9-]*$"])
+
+(def StackId [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"])
+
+(def Labels
+  "Docker labels, name to value (see `docker-labels`)."
+  [:map-of [:string {:min 1}] [:string {:min 1}]])
+
+(def Attach
+  "One instance joining a view network under its original service names."
+  [:map
+   [:instance [:string {:min 1}]]
+   [:aliases [:vector {:min 1} [:string {:min 1}]]]])
+
+(def InstancePlan
+  "An Instance as the stack plan runs it: always under a compose project, the
+   services `up` names (`:instance/needs` may widen it to their depends_on
+   closure once the engine knows it), the labels on what it creates, the view
+   networks it joins (one per consumer) and the instances of other providers
+   it must start after."
+  [:and Instance
+   [:map
+    [:instance/compose-project [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+    [:instance/services [:vector {:min 1} [:string {:min 1}]]]
+    [:instance/needs {:optional true} [:vector [:string {:min 1}]]]
+    [:instance/labels Labels]
+    [:instance/networks [:vector ViewNetwork]]
+    [:instance/depends-on [:vector [:string {:min 1}]]]]])
+
+(def ConsumerPlan
+  "How one consumer is placed in a run: the ONLY network it attaches to, the
+   instances that join it and under which aliases, and which instance answers
+   each capability it needs."
+  [:map
+   [:consumer/id ConsumerId]
+   [:consumer/network ViewNetwork]
+   [:consumer/labels Labels]
+   [:consumer/attach [:vector Attach]]
+   [:consumer/bindings [:map-of CapabilityId [:string {:min 1}]]]
+   [:consumer/provider-of {:optional true} [:vector [:string {:min 1}]]]])
+
+(def StartStep
+  [:map
+   [:step/kind [:enum :instance :consumer]]
+   [:step/id [:string {:min 1}]]])
+
+(def StackPlan
+  "What hive-compose.promote.stack/stack-plan answers for a Resolution in a
+   run: instances by id, consumers by id, every view network, and the start
+   order (every instance after the instances of other providers its provider
+   is bound to, every consumer after all instances)."
+  [:map
+   [:stack/id StackId]
+   [:stack/run RunId]
+   [:stack/instances [:map-of :string InstancePlan]]
+   [:stack/consumers [:map-of ConsumerId ConsumerPlan]]
+   [:stack/networks [:vector ViewNetwork]]
+   [:stack/start-order [:vector StartStep]]])
+
+(def Lock
+  "Image digests a stack ran with, by instance id."
+  [:map-of [:string {:min 1}] [:map [:image [:string {:min 1}]] [:digest [:string {:min 1}]]]])
 
 (def ReportFormat
   "How a suite reports test cases: JUnit XML, TAP, or :auto (by extension)."
