@@ -60,9 +60,27 @@
   (testing "what an active section holds is not marked either"
     (is (= {"infra" #{"zookeeper"}}
            (run/mark-preexisting {} {"infra" #{"kafka" "zookeeper"}} {} "r1" {"infra" #{"kafka"}}))))
-  (testing "marks only grow"
+  (testing "marking never removes a mark"
     (is (= {"infra" #{"kafka" "x"}} (run/mark-preexisting {"infra" #{"x"}} {"infra" #{"kafka"}} {} "r1" {})))
     (is (= {"infra" #{"x"}} (run/mark-preexisting {"infra" #{"x"}} {} {} "r1" {})))))
+
+(deftest reconciling-marks
+  (let [marks {"infra" #{"kafka" "zookeeper"} "pg" #{"db"}}
+        probed #{["infra" "kafka"] ["infra" "zookeeper"]}]
+    (testing "a probed mark that no longer runs is dropped, the empty provider with it"
+      (is (= {"pg" #{"db"}} (run/reconcile-preexisting marks probed {} {} "r1"))))
+    (testing "a probed mark still running stays: B1, the world's service is never taken"
+      (is (= {"infra" #{"kafka"} "pg" #{"db"}}
+             (run/reconcile-preexisting marks probed {"infra" #{"kafka"}} {} "r1"))))
+    (testing "a mark outside the probe stays"
+      (is (= marks (run/reconcile-preexisting marks #{} {} {} "r1"))))
+    (testing "a mark another live run holds stays, whatever the probe saw"
+      (let [other {:stack/instances {"infra/kafka" {:instance/compose-project "infra"
+                                                    :instance/services ["kafka"] :instance/needs ["zookeeper"]}}}]
+        (is (= marks (run/reconcile-preexisting marks probed {} {"r0" other} "r1")))
+        (is (= {"pg" #{"db"}} (run/reconcile-preexisting marks probed {} {"r1" other} "r1"))
+            "this run's own entry holds nothing yet")))
+    (is (= {} (run/reconcile-preexisting nil probed {} {} "r1")))))
 
 (deftest sparing
   (is (= {:services ["b"] :kept {"a" [[:preexisting]]}}

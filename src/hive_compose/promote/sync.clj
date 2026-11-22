@@ -45,6 +45,23 @@
       (seq claims) (assoc :claims claims)
       (empty? claims) (dissoc :claims))))
 
+(defn- merge-marks
+  "Preexistence marks ({provider #{service}}) by service against `base`: a
+   mark in base stays only while both sides keep it (a run that saw it gone
+   dropped it, and that removal sticks); a mark not in base stays when
+   either side added it. A side without the key (an older file) counts as
+   unchanged, so it never removes a mark."
+  [base mine theirs]
+  (let [b (or base {}) m (or mine b) t (or theirs b)]
+    (into {}
+          (keep (fn [p]
+                  (let [bs (set (get b p)) ms (set (get m p)) ts (set (get t p))
+                        v (into (sorted-set)
+                                (filter #(if (bs %) (and (ms %) (ts %)) (or (ms %) (ts %))))
+                                (concat bs ms ts))]
+                    (when (seq v) [p v]))))
+          (distinct (concat (keys b) (keys m) (keys t))))))
+
 (defn merge-state
   "The persisted state from `base` (last synced), `mine` (this instance) and
    `theirs` (the file now). Each is {:active {..} :current id-or-nil}."
@@ -55,6 +72,7 @@
       ;; stack runs (hc-6), merged like active entries; absent when no side has any
       (some :stacks [base mine theirs])
       (assoc :stacks (merge3 (:stacks base) (:stacks mine) (:stacks theirs) merge-entry))
-      ;; preexistence marks only grow: the union of every side, never a removal
+      ;; preexistence marks by service: an addition from either side lands, a
+      ;; reconciled removal (a run saw the service gone) sticks
       (some :preexisting [base mine theirs])
-      (assoc :preexisting (merge-with into (:preexisting base) (:preexisting mine) (:preexisting theirs))))))
+      (assoc :preexisting (merge-marks (:preexisting base) (:preexisting mine) (:preexisting theirs))))))
