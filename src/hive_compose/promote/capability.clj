@@ -113,7 +113,7 @@
   "The numbers just above every version agreeing with `parts` up to index `i`."
   [parts i]
   (let [p (pad parts)]
-    (conj (subvec p 0 i) (inc (nth p i)))))
+    (conj (subvec p 0 i) (inc' (nth p i)))))
 
 (defn- block
   "[>= low, < next] over every version agreeing with `v` up to index `i`. A
@@ -164,7 +164,7 @@
    overflowing number, is :compose/invalid-range."
   [s]
   (let [s (or s "*")
-        tokens (when (string? s) (str/split s #" +"))
+        tokens (when (string? s) (str/split s #" +" -1))
         clauses (map parse-clause tokens)
         cmp? #(re-matches #"(>=|<=|>|<|=)[0-9].*" %)]
     (if (or (not (string? s))
