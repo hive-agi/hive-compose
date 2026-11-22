@@ -155,6 +155,13 @@
             (Thread/sleep 1000)
             (recur))))))
 
+(defn- networks-of
+  "#{network} container `c` is attached to."
+  [c]
+  (set (remove str/blank? (str/split (str (:out (sh/sh "docker" "inspect" "--format"
+                                                       "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}" c)))
+                                     #"\s+"))))
+
 (defn- run-networks [engine run]
   (mapv :name (:ok (port/-networks-labelled engine {"hive.run" run}))))
 
@@ -213,14 +220,18 @@
                   (is (seq (containers engine {"hive.run" run "hive.consumer" c}))
                       (str c " runs as a consumer of the run, labelled with it")))))
             (testing "otel is wired to every consumer"
-              (doseq [[cp svc] [[(str tag "orders-" run) "orders"]
-                                [(str tag "billing-" run) "billing"]
-                                [(str tag "billingc-" run) "billing"]]]
+              (doseq [[cp svc consumer] [[(str tag "orders-" run) "orders" "orders"]
+                                         [(str tag "billing-" run) "billing" "billing"]
+                                         [(str tag "billingc-" run) "billing" "billing-c"]]]
                 (let [c (container-of engine cp svc)
                       ;; inspect, not exec: the orders image is distroless (no `env` binary)
                       {:keys [out]} (sh/sh "docker" "inspect" "--format" "{{range .Config.Env}}{{println .}}{{end}}" c)
                       env (into {} (keep #(let [[k v] (str/split % #"=" 2)] (when v [k v]))) (str/split-lines out))]
-                  (is (= "http://otel:4318" (get env "OTEL_EXPORTER_OTLP_ENDPOINT")) cp)
+                  (is (= "http://otel:4318" (get env "OTEL_EXPORTER_OTLP_ENDPOINT"))
+                      (str cp ": the consumer's own OTLP/HTTP pair replaced the injected gRPC one as a unit"))
+                  (is (contains? (networks-of (container-of engine (str tag "otel") "otel"))
+                                 (str "hive-" run "-" consumer))
+                      (str cp ": otel joins its view network"))
                   (is (= run (get env "HIVE_RUN_ID")) cp)
                   (is (str/includes? (str (get env "OTEL_RESOURCE_ATTRIBUTES")) "service.name=") cp)
                   (is (str/includes? (str (get env "OTEL_RESOURCE_ATTRIBUTES")) (str "hive.run.id=" run)) cp)
@@ -238,7 +249,17 @@
                     "B invoices A's order")
                 (let [c (request "GET" (str "http://127.0.0.1:" billing-c "/invoices") nil)]
                   (is (= 200 (:status c)))
-                  (is (= "[]" (str/trim (str (:body c)))) "C, on its private kafka, sees no invoice of A's orders"))))))
+                  (is (= "[]" (str/trim (str (:body c)))) "C, on its private kafka, sees no invoice of A's orders"))
+                (testing "C is isolated by network, not only by luck of a consumer group"
+                  (let [c-net (str "hive-" run "-billing-c")
+                        c-box (container-of engine (str tag "billingc-" run) "billing")
+                        shared-kafka (container-of engine kafka-cp "kafka")
+                        private-kafka (:name (first (containers engine {"hive.run" run "hive.instance" "kafka/kafka@billing-c"})))]
+                    (is (= #{c-net} (networks-of c-box)) "C attaches to its own view network alone")
+                    (is (not (contains? (networks-of shared-kafka) c-net)) "the shared kafka never joins C's network")
+                    (is (contains? (networks-of private-kafka) c-net) "C's private kafka does")
+                    (is (not (contains? (networks-of private-kafka) (str "hive-" run "-billing")))
+                        "and the private kafka never joins B's network")))))))
         (let [down (stacks/stack-down! ctx {:run run})]
           (is (r/ok? down) (pr-str down))
           (testing "down leaves nothing of the run"

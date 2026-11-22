@@ -240,6 +240,8 @@ from telemetry.
              :project/provides {"kafka" {:service "kafka" :version "3.9"
                                          :env {"KAFKA_BOOTSTRAP" "kafka:9092"}
                                          :tenancy {:env "TOPIC_PREFIX" :scope :run}}}}
+  "otel"    {:project/dir "<hive-compose>/resources/hive-compose/otel"
+             :project/provides {"otel" {:service "otel" :version "0.41.1"}}}
   "orders"  {:project/dir "~/w/orders"
              :project/needs {"kafka" {:version "^3"} "otel" {}}}
   "billing" {:project/dir "~/w/billing"
@@ -268,10 +270,15 @@ from telemetry.
     By default it is per consumer, `<run>.<consumer>.`. With
     `:tenancy {:scope :run}`, every consumer of the run gets `<run>.`, which
     a producer and a consumer of one topic need.
-- **Telemetry is always there.** The built-in `otel` capability
-  (`resources/hive-compose/otel`, grafana/otel-lgtm) is wired to every
-  consumer: `OTEL_EXPORTER_OTLP_ENDPOINT` points at `otel`, and
-  `OTEL_RESOURCE_ATTRIBUTES` carries `hive.run.id`.
+- **Telemetry by need.** hive-compose ships the `otel` compose fragment
+  (`resources/hive-compose/otel`, grafana/otel-lgtm). Configure it as a
+  project that provides `otel`, as above. A consumer, or the stack itself
+  through `:stack/needs`, that needs `otel` gets `OTEL_EXPORTER_OTLP_ENDPOINT`
+  pointing at the `otel` alias on its view network, `OTEL_SERVICE_NAME`, and
+  `OTEL_RESOURCE_ATTRIBUTES` carrying `hive.run.id`. A consumer that needs
+  no `otel` gets no endpoint that nobody answers. A consumer whose SDK
+  speaks OTLP/HTTP sets the endpoint and protocol pair in its own env,
+  which replaces the injected gRPC pair as one unit.
 - **Runs.** A run is recorded before anything starts, and its containers
   and networks carry the labels `hive.run`, `hive.stack`, `hive.instance`
   and `hive.consumer`. Instances come up in dependency order: each is
@@ -309,7 +316,8 @@ protocols only:
 
 ### why
 
-`compose why test=<case>` explains a failed case in one call. The bundle it
+(hc-10, branch `feat/hc10-why`, lands with it.) `compose why test=<case>`
+explains a failed case in one call. The bundle it
 answers holds:
 - the case and its cell;
 - the traces that carry its `test.id`, read from Tempo through the
