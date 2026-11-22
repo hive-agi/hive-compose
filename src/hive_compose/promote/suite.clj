@@ -233,21 +233,27 @@
   "The runner env, built in layers: `wiring` (the suite consumer's endpoints),
    then `otlp`, then `suite-env`, then `correlation`, forced on top.
    OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_PROTOCOL are one unit
-   (`otel/exporter-pair`): a layer that names either one replaces both. When
-   the suite sets OTEL_RESOURCE_ATTRIBUTES as well, `merge-ra` (fn [base over],
-   default `otel/merge-resource-attributes`) keeps both, the injected
-   attributes winning per key."
-  [{:keys [wiring otlp suite-env correlation merge-ra]}]
+   (`otel/exporter-pair`): a layer that names either one replaces both.
+   OTEL_RESOURCE_ATTRIBUTES is merged per key through `merge-ra` (fn [base
+   over], default `otel/merge-resource-attributes`) in the same order, wiring
+   < otlp < suite. On top of that the `hive.*` correlation keys of the otlp
+   attributes are forced, and `hive.run.id=<run>` always is: only those win
+   over the suite, which may still set service.name and its own attributes."
+  [{:keys [wiring otlp suite-env correlation merge-ra run]}]
   (let [merge-ra (or merge-ra otel/merge-resource-attributes)
         pair otel/exporter-pair
         over (fn [lower upper]
                (merge (if (some #(contains? upper %) pair) (apply dissoc lower pair) lower)
                       upper))
         env (-> (over wiring otlp) (over suite-env) (merge correlation))
-        ours (get otlp resource-attributes)
-        theirs (get suite-env resource-attributes)]
-    (cond-> env
-      (string? ours) (assoc resource-attributes (if (string? theirs) (merge-ra theirs ours) ours)))))
+        ras (keep #(let [v (get % resource-attributes)] (when (string? v) v)) [wiring otlp suite-env])
+        forced (otel/render-resource-attributes
+                (cond-> (into {} (filter (comp otel/correlation-attribute? key))
+                              (otel/parse-resource-attributes (get otlp resource-attributes)))
+                  run (assoc "hive.run.id" run)))]
+    (if (seq ras)
+      (assoc env resource-attributes (reduce merge-ra (concat ras [forced])))
+      env)))
 
 (defn- join-path [dir path]
   (cond
@@ -273,11 +279,15 @@
      {:runner :container :image :command? :env :mounts [{:host :container}]
       :network (the view network of the project under test) :labels :name}
    Any other suite gives a host command {:runner :command :command :dir? :env}.
-   Both carry :cell :run :test-id :trace-id :reports-dir (the host directory
-   to read reports from) and :report-format, plus :timeout-ms when the suite
-   sets one. A command's reports go to its `:suite/reports-dir` (relative to
-   `:suite/dir`) when it names one, else to the reports dir under the state
-   dir."
+   A container of a suite with `:suite/needs` also joins the view network of
+   `suite:<id>` (:extra-networks), where the suite's own instances answer.
+   Both carry :cell :run :test-id :trace-id :reports-dir and :report-format,
+   plus :timeout-ms when the suite sets one. :reports-dir is always the
+   cell's own `<state-dir>/runs/<run>/<suite>/<project>/reports`, so no two
+   cells share one. A command that names `:suite/reports-dir` (relative to
+   `:suite/dir`) also carries it as :collect-from: the pipeline empties it
+   before the cell and moves what the runner leaves there into :reports-dir
+   after. An env holding half the OTLP pair is :compose/otlp-pair-broken."
   [{:keys [suites run state-dir id-source wiring-env] :as ctx} cell]
   (let [sid (:suite/id cell)
         project (:project cell)
@@ -300,10 +310,9 @@
             container? (some? image)
             state-reports (reports-dir state-dir run cell)
             declared (:suite/reports-dir suite)
-            host-reports (if container?
-                           state-reports
-                           (or (some->> declared (join-path (:suite/dir suite))) state-reports))
-            runner-reports (if container? (or declared container-reports-dir) host-reports)
+            collect-from (when-not container? (some->> declared (join-path (:suite/dir suite))))
+            runner-reports (if container? (or declared container-reports-dir) state-reports)
+            suite-net (when (seq (:suite/needs suite)) (schema/view-network run (suite-consumer sid)))
             tid (test-id cell)]
         (r/let-ok [tp (traceparent id-source)
                    otlp-vars (otlp (:otlp-env ctx) {:run-id run
@@ -314,6 +323,7 @@
                                 :otlp otlp-vars
                                 :suite-env (:suite/env suite)
                                 :merge-ra (:merge-resource-attributes ctx)
+                                :run run
                                 :correlation {"HIVE_RUN_ID" run
                                               "HIVE_SUITE_ID" sid
                                               "HIVE_TEST_ID_PREFIX" (test-id-prefix cell)
@@ -325,23 +335,30 @@
                                 :test-id tid
                                 :trace-id (:trace-id tp)
                                 :env (into (sorted-map) env)
-                                :reports-dir host-reports
+                                :reports-dir state-reports
                                 :report-format (:suite/report-format suite :auto)}
-                         (:suite/timeout-ms suite) (assoc :timeout-ms (:suite/timeout-ms suite)))
-                command (:suite/command suite)]
-            (r/ok
-             (if container?
-               (cond-> (assoc common
-                              :runner :container
-                              :image image
-                              :name (str "hive-" run "-" (schema/slug sid) "-" (schema/slug project))
-                              :mounts [{:host state-reports :container runner-reports}]
-                              :network (schema/view-network run project)
-                              :labels {(:run schema/docker-labels) run
-                                       (:consumer schema/docker-labels) (suite-consumer sid)})
-                 command (assoc :command command))
-               (cond-> (assoc common :runner :command :command command)
-                 (:suite/dir suite) (assoc :dir (:suite/dir suite)))))))))))
+                         (:suite/timeout-ms suite) (assoc :timeout-ms (:suite/timeout-ms suite))
+                         collect-from (assoc :collect-from collect-from))
+                command (:suite/command suite)
+                present (filter #(contains? env %) otel/exporter-pair)]
+            (if (= 1 (count present))
+              (r/err :compose/otlp-pair-broken {:cell (:cell common) :present (vec present)
+                                                :pair otel/exporter-pair
+                                                :message "an OTLP endpoint without its protocol (or the reverse)"})
+              (r/ok
+               (if container?
+                 (cond-> (assoc common
+                                :runner :container
+                                :image image
+                                :name (str "hive-" run "-" (schema/slug sid) "-" (schema/slug project))
+                                :mounts [{:host state-reports :container runner-reports}]
+                                :network (schema/view-network run project)
+                                :labels {(:run schema/docker-labels) run
+                                         (:consumer schema/docker-labels) (suite-consumer sid)})
+                   command (assoc :command command)
+                   suite-net (assoc :extra-networks [suite-net]))
+                 (cond-> (assoc common :runner :command :command command)
+                   (:suite/dir suite) (assoc :dir (:suite/dir suite))))))))))))
 
 (def RunnerSpec
   "What `runner-spec` answers. Kept here because the stack schema belongs to
@@ -363,6 +380,8 @@
     [:dir {:optional true} :string]
     [:mounts {:optional true} [:vector [:map [:host :string] [:container :string]]]]
     [:network {:optional true} :string]
+    [:extra-networks {:optional true} [:vector :string]]
+    [:collect-from {:optional true} :string]
     [:labels {:optional true} [:map-of :string :string]]]
    [:fn {:error/message "a container has an image, mounts and a network; a command has a command"}
     (fn [s] (case (:runner s)
@@ -373,9 +392,13 @@
 ;; (d) Cell result
 ;; ---------------------------------------------------------------------------
 
-(defn- failures [report]
+(defn- failures
+  "Failed and errored cases of `report`: the larger of its totals and its
+   cases, so a report whose totals were not recounted still fails."
+  [report]
   (let [t (:report/totals report)]
-    (+ (:failed t 0) (:error t 0))))
+    (max (+ (:failed t 0) (:error t 0))
+         (count (filter #(#{:failed :error} (:case/status %)) (:report/cases report))))))
 
 (defn cell-status
   "How a cell ended.
