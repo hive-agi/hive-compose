@@ -37,7 +37,8 @@
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
-            [hive-addon.host :as addon-host])
+            [hive-addon.host :as addon-host]
+            [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
