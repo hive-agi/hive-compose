@@ -14,6 +14,7 @@ XML or TAP reports.
 | `orders/`  | project A, needs `kafka`     | Go 1.24     | `hive-compose-e2e/orders:dev`  |
 | `billing/` | project B (and C), needs `kafka` | Node 22 | `hive-compose-e2e/billing:dev` |
 | `suite/`   | suite runner `orders-suite`  | sh + curl   | `hive-compose-e2e/suite:dev`   |
+| `hog/`     | S13 fixture: allocates past its cap | sh + busybox awk | `hive-compose-e2e/hog:dev` |
 
 * **orders** serves `POST /orders` (publishes the order JSON to
   `${TOPIC_PREFIX}orders`, trace context injected into the Kafka headers) and
@@ -112,6 +113,46 @@ Then Grafana (`localhost:3000`, Explore, Tempo) answers
 
 Tear down with `docker compose -p <name> -f <dir>/compose.yml down` per project,
 `docker rm -f lgtm` and `docker network rm hive-e2e`.
+
+## Scenario S13: resource caps (hc-16c)
+
+S13 proves the caps of hc-16a (`:resources`, `:compose/budget`, plan
+admission) and hc-16b (capped suite runners, OOM in `why` and `flaky`) on
+the real daemon. Its fixture is `hog/`: busybox and `hog.sh`, which
+allocates `HOG_TARGET_MB` (default 512) in `HOG_STEP_MB` steps and prints
+`hog: holding <n> MiB` per step. Under `mem_limit = memswap_limit = 256m` it
+is OOM-killed after about 112 MiB held (awk copies on append, so the peak is
+about twice what it holds): `State.OOMKilled=true`, exit 137. A 96 MiB target
+passes, so the cap and not the script decides the kill.
+
+The world: provider `infra` gives `kafka` with `:resources {:mem "768m"}`;
+`a` and `b` need kafka `^3` (shared), `c` needs it `:share? false`, and `ap`
+and `bp` are `a` and `b` with `:share? false`. `:compose/budget` is `"1g"`.
+
+| id | claim | evidence |
+|----|-------|----------|
+| S13a | `plan` of stack `abc` (one shared kafka for a and b, one private for c: 2 x 768m = 1536m) is the Result error `:compose/over-budget` with `:basis :budget`, `:limit` 1 GiB, `:total-mem` 1536 MiB, `:over` 512 MiB and both instances listed largest first; `stack-up` answers the same error, and `docker ps -aq`, `docker network ls` and `docker volume ls` are identical before and after. Stack `ab` (768m) is admitted by the same plan. | the ps/network/volume sets before and after, the error data |
+| S13b | suite `hog-suite` (image `hive-compose-e2e/hog:dev`, `:suite/resources {:mem "256m"}`) is OOM-killed: the container reports `OOMKilled=true` and exit 137, `HostConfig.Memory` is 268435456 (the cap hive-compose planned is the cap the kernel enforced); the cell is not `:passed` and the matrix exits 1; `why` names the runner and says `OOM-killed at 256m`; the flake history classifies the case `:oom`, never `:flaky`. The same holds for the host-command form (`sh hog/hog.sh` under `systemd-run --scope -p MemoryMax=256m -p MemorySwapMax=0`). | the inspect line, the why text, the flaky row |
+| S13c | the planned totals: stack `ab` sharing kafka plans 768 MiB (`:budget/total-mem`), with `:budget/unshared-mem` 1536 MiB and `:budget/saved-mem` 768 MiB; stack `abp` (a and b private) plans 1536 MiB. Shared is strictly less than private, and the shared plan's saved-mem is exactly the difference. | both plan texts and budgets |
+
+Run them one stack at a time, under the host's heavy-run fence:
+
+```sh
+timeout 1200 ~/.local/bin/hive-heavy clojure -J-Xmx1g -M:integration \
+  -n hive-compose.scenario.s13-docker-test
+```
+
+Every compose project and network carries a per-test stamp and is taken
+down in `finally` (never with volumes).
+
+By hand, the fixture alone:
+
+```sh
+cd test/resources/e2e/hog
+HOG_MEM=256m docker compose -p hog -f compose.yml up --abort-on-container-exit hog
+docker inspect -f '{{.State.OOMKilled}} {{.State.ExitCode}}' hog-hog-1   # true 137
+docker compose -p hog -f compose.yml down
+```
 
 ## Pins
 
