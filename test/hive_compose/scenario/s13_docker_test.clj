@@ -1,12 +1,15 @@
 (ns hive-compose.scenario.s13-docker-test
   "Scenario S13 (hc-16c): resource caps on the real docker daemon, through the
-   real pipeline (`hive-compose.pipeline.stacks`) and the CLI engine.
+   real pipeline (`hive-compose.pipeline.stacks`), the CLI engine and the
+   host suite runner (`hive-compose.adapter.suite-runner`).
 
    S13a  a stack whose capped total exceeds :compose/budget is refused by
-         plan and by stack-up, and nothing starts.
+         plan (its :admission) and by stack-up, and nothing starts.
    S13b  a service that allocates past its 256m cap is OOM-killed with the
-         cap hive-compose planned; `why` names the service and the cap; the
-         flake history records :oom.
+         cap hive-compose planned: (1) as a private stack instance capped by
+         :resources, (2) as a container suite runner capped by
+         :suite/resources. The suite fails, `why` names the service and the
+         cap, and the flake history classes the run :oom, never :flaky.
    S13c  sharing lowers the planned total: A+B sharing kafka < A+B private.
 
    One stack at a time. Every compose project and network carries a
@@ -15,11 +18,9 @@
    fixture is test/resources/e2e/hog (busybox + hog.sh). Evidence is
    appended to /tmp/hc-verify-evidence.edn.
 
-   hc-16b's vars (OOM diagnosis, why line, :oom flake class) are resolved at
-   run time, so this namespace loads before hc-16b lands; a missing one
-   fails its assertion by name.
-
-   Run under the heavy-run fence:
+   Needs on staging: #52 (caps, budget), #53 (suite runner, OOM finding),
+   #56 (stack admission, the plan :budget block, capped private overrides),
+   #51 (the :oom flake class). Run under the heavy-run fence:
      timeout 1200 ~/.local/bin/hive-heavy clojure -J-Xmx1g -M:integration \\
        -n hive-compose.scenario.s13-docker-test"
   (:require [clojure.java.io :as io]
@@ -27,8 +28,12 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [hive-compose.adapter.cli :as cli]
+            [hive-compose.adapter.suite-runner :as sr]
+            [hive-compose.boundary.runs :as runs]
             [hive-compose.pipeline.stacks :as stacks]
+            [hive-compose.pipeline.why :as why]
             [hive-compose.port :as port]
+            [hive-compose.promote.flaky :as flaky]
             [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
@@ -48,10 +53,7 @@
 (defn- network-names [] (set (lines (:out (docker "network" "ls" "--format" "{{.Name}}")))))
 (defn- volume-names [] (set (lines (:out (docker "volume" "ls" "-q")))))
 
-(defn- ours
-  "The members of `xs` that contain `stamp`: what this test made."
-  [stamp xs]
-  (set (filter #(str/includes? % stamp) xs)))
+(defn- ours [stamp xs] (set (filter #(str/includes? % stamp) xs)))
 
 (defn- inspect [ctr fmt]
   (let [{:keys [exit out]} (docker "inspect" "-f" fmt ctr)] (when (zero? exit) out)))
@@ -64,14 +66,17 @@
 ;; ---------------------------------------------------------------------------
 ;; the world
 
+(defn- tmp-dir [prefix]
+  (str (java.nio.file.Files/createTempDirectory prefix (make-array java.nio.file.attribute.FileAttribute 0))))
+
 (defn- dir-with [prefix files]
-  (let [d (str (java.nio.file.Files/createTempDirectory prefix (make-array java.nio.file.attribute.FileAttribute 0)))]
+  (let [d (tmp-dir prefix)]
     (doseq [[f s] files] (spit (io/file d f) s))
     d))
 
 (def kafka-yml
   "A kafka provider as compose sees it. S13a and S13c only plan, so it never
-   starts; the image is the one the S1-S7 scenarios run."
+   starts."
   "services:
   kafka:
     image: apache/kafka:3.9.1
@@ -104,8 +109,6 @@
       - " script ":/hog/hog.sh:ro
 "))
 
-(def kafka-cap "768m")
-
 (defn- kafka-world
   "Provider infra gives kafka capped at 768m; a and b share it, c and the
    private twins ap and bp opt out."
@@ -120,7 +123,7 @@
               :project/provides {"kafka" {:service "kafka" :version "3.9.1"
                                           :env {"KAFKA_BROKERS" "kafka:9092"}
                                           :tenancy {:env "KAFKA_TOPIC_PREFIX"}
-                                          :resources {:mem kafka-cap}}}}
+                                          :resources {:mem "768m"}}}}
      "a" (consumer "a" need)
      "b" (consumer "b" need)
      "c" (consumer "c" private)
@@ -133,8 +136,9 @@
    "abp" {:stack/id "abp" :stack/consumers ["ap" "bp"]}})
 
 (defn- ctx [projects stacks-map extra-settings]
-  (let [state-dir (str (java.nio.file.Files/createTempDirectory "hc13-state" (make-array java.nio.file.attribute.FileAttribute 0)))]
+  (let [state-dir (tmp-dir "hc13-state")]
     {:engine (cli/make-engine {:compose/stack-dir (str state-dir "/stacks")})
+     :state-dir state-dir
      :settings (merge {:compose/default-ttl-minutes 60 :compose/default-idle-action :stop
                        :compose/up-timeout-ms 180000 :compose/profiles {}
                        :compose/projects projects :compose/stacks stacks-map}
@@ -145,62 +149,57 @@
 (defn- stamp [] (str (mod (System/currentTimeMillis) 100000000)))
 
 (defn- cleanup!
-  "Take down every compose project named with `stamp` and every hive-<run>
-   network of `runs`. Never volumes."
+  "Take down every compose project named with `stamp`, every hive-<run>
+   network of `runs` and every container named with `stamp`. Never volumes."
   [c stamp runs]
   (let [e (:engine c)]
     (doseq [p (lines (:out (docker "compose" "ls" "-a" "-q"))) :when (str/includes? p stamp)]
       (port/-down-project! e {:project p :all? true}))
+    (doseq [n (lines (:out (docker "ps" "-a" "--format" "{{.Names}}"))) :when (str/includes? n stamp)]
+      (docker "rm" "-f" n))
     (doseq [n (network-names) run runs :when (str/starts-with? n (str "hive-" run "-"))]
       (port/-network-rm! e n))))
-
-(defn- plan-budget
-  "The Budget (hc-16a schema/Budget) a `stacks/plan` answer carries."
-  [p]
-  (or (get-in p [:ok :budget]) (get-in p [:ok :diff :budget])))
-
-(defn- hc16b
-  "A var hc-16b provides, resolved at run time; nil when absent."
-  [sym]
-  (try (requiring-resolve sym) (catch Exception _ nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; S13a
 
 (deftest ^:integration s13a-over-budget-stack-starts-nothing
   "CLAIM: with :compose/budget 1g, stack abc plans one shared kafka (a, b)
-   and one private kafka (c), 2 x 768m = 1536m capped: plan and stack-up
-   answer :compose/over-budget with basis :budget, limit 1 GiB, total 1536
-   MiB, over 512 MiB, both instances listed at 768 MiB; no run is recorded,
-   docker ps -a, network ls and volume ls are what they were. Stack ab
-   (768m) passes the same budget."
+   and one private kafka (c), 2 x 768m = 1536m capped. plan's :admission and
+   stack-up answer :compose/over-budget with basis :budget, limit 1 GiB,
+   total 1536 MiB, over 512 MiB, both instances at 768 MiB; no run is
+   recorded, and docker ps -a, network ls and volume ls are what they were.
+   Stack ab (768m) is admitted under the same budget."
   (let [st (stamp) projects (kafka-world st) run (str "s13a" st)
         c (ctx projects kafka-stacks {:compose/budget "1g"})
         before {:ps (ps-all) :networks (network-names) :volumes (volume-names)}]
     (try
       (let [p (stacks/plan c {:stack "abc" :run run})
+            adm (get-in p [:ok :admission])
             up (stacks/stack-up! c {:stack "abc" :run run})
             after {:ps (ps-all) :networks (network-names) :volumes (volume-names)}
             ok (stacks/plan c {:stack "ab" :run (str run "ok")})]
-        (evidence! :s13a {:plan-error (select-keys p [:error :basis :limit :total-mem :over :instances :message])
+        (evidence! :s13a {:admission (select-keys adm [:error :basis :limit :total-mem :over :instances :message])
                           :up-error (select-keys up [:error :basis :total-mem :message])
+                          :plan-text (get-in p [:ok :text])
                           :ps-before (count (:ps before)) :ps-after (count (:ps after))
                           :ps-unchanged? (= (:ps before) (:ps after))
                           :networks-unchanged? (= (:networks before) (:networks after))
                           :volumes-unchanged? (= (:volumes before) (:volumes after))
-                          :ours-after {:ps (ours st (:ps after)) :networks (ours st (:networks after))}
-                          :admitted-ab (some-> (plan-budget ok) :budget/total-mem)})
-        (testing "plan refuses"
-          (is (= :compose/over-budget (:error p)) (pr-str p))
-          (is (= :budget (:basis p)))
-          (is (= (* 1024 mib) (:limit p)))
-          (is (= (* 1536 mib) (:total-mem p)))
-          (is (= (* 512 mib) (:over p)))
-          (is (= [(* 768 mib) (* 768 mib)] (map :mem (:instances p))))
-          (is (str/includes? (str (:message p)) ":compose/budget")))
+                          :admitted-ab {:admission (get-in ok [:ok :admission])
+                                        :total (get-in ok [:ok :budget :budget/total-mem])}})
+        (testing "plan says it would refuse"
+          (is (r/ok? p) (pr-str p))
+          (is (= :compose/over-budget (:error adm)) (pr-str adm))
+          (is (= :budget (:basis adm)))
+          (is (= (* 1024 mib) (:limit adm)))
+          (is (= (* 1536 mib) (:total-mem adm)))
+          (is (= (* 512 mib) (:over adm)))
+          (is (= [(* 768 mib) (* 768 mib)] (map :mem (:instances adm))))
+          (is (str/includes? (str (get-in p [:ok :text])) "REFUSED")))
         (testing "stack-up refuses the same way, before anything starts"
           (is (= :compose/over-budget (:error up)) (pr-str up))
-          (is (= (:total-mem p) (:total-mem up)))
+          (is (= (:total-mem adm) (:total-mem up)))
           (is (nil? (get-in @(:state c) [:stacks run])) "no run recorded"))
         (testing "nothing of the run exists"
           (is (empty? (ours st (:ps after))) "no container")
@@ -209,7 +208,8 @@
           (is (empty? (remove (:ps before) (:ps after))) "docker ps -a gained nothing"))
         (testing "the stack under budget is admitted"
           (is (r/ok? ok) (pr-str ok))
-          (is (= (* 768 mib) (:budget/total-mem (plan-budget ok))))))
+          (is (= :ok (get-in ok [:ok :admission])))
+          (is (= (* 768 mib) (get-in ok [:ok :budget :budget/total-mem])))))
       (finally (cleanup! c st [run])))))
 
 ;; ---------------------------------------------------------------------------
@@ -226,7 +226,7 @@
     (try
       (let [shared (stacks/plan c {:stack "ab" :run run})
             private (stacks/plan c {:stack "abp" :run (str run "p")})
-            bs (plan-budget shared) bp (plan-budget private)]
+            bs (get-in shared [:ok :budget]) bp (get-in private [:ok :budget])]
         (evidence! :s13c {:shared (select-keys bs [:budget/total-mem :budget/unshared-mem :budget/saved-mem])
                           :private (select-keys bp [:budget/total-mem :budget/unshared-mem :budget/saved-mem])
                           :shared-text (get-in shared [:ok :text]) :private-text (get-in private [:ok :text])})
@@ -249,7 +249,7 @@
 ;; S13b
 
 (defn- wait-exited
-  "The container's status once it is no longer running, or nil after `ms`."
+  "The container's status once it no longer runs, or nil after `ms`."
   [ctr ms]
   (let [deadline (+ (System/currentTimeMillis) ms)]
     (loop []
@@ -259,65 +259,101 @@
           (> (System/currentTimeMillis) deadline) nil
           :else (do (Thread/sleep 500) (recur)))))))
 
-(deftest ^:integration s13b-capped-service-oom-explained
-  "CLAIM: the hog provider has :resources {:mem \"256m\"} and no mem_limit of
-   its own; stack-up writes the cap into the override, so its container has
-   HostConfig.Memory 268435456; the hog allocates toward 512 MiB and is
-   OOM-killed (State.OOMKilled true, exit 137) before it reaches it. The
-   OOM diagnosis (hc-16b) names the service and the cap (`hog OOM-killed
-   at 256m`), and the flake history classifies the run :oom, never :flaky."
+(deftest ^:integration s13b-1-capped-stack-instance-oom-killed
+  "CLAIM: provider hogp gives `hog` with :resources {:mem \"256m\"} and no
+   mem_limit of its own; consumer w needs it :share? false, so it runs as a
+   private instance whose override carries the cap (hc-16a: a shared
+   instance's cap is admitted but not written). Its container has
+   HostConfig.Memory 268435456, allocates toward 512 MiB and is OOM-killed
+   (OOMKilled true, exit 137) before it gets there; the planned cap is the
+   enforced one."
   (is (some? hog-script) "test/resources/e2e/hog/hog.sh is on the classpath")
   (let [st (stamp) run (str "s13b" st)
         projects {"hogp" {:project/id "hogp" :project/dir (dir-with "hc13-hog" {"compose.yml" (hog-yml hog-script)})
                           :project/name (str "hp" st)
                           :project/provides {"hog" {:service "hog" :resources {:mem "256m"}}}}
                   "w" {:project/id "w" :project/dir (dir-with "hc13-w" {"compose.yml" idle-yml})
-                       :project/name (str "cw" st) :project/needs {"hog" {}}}}
-        c (ctx projects {"hog" {:stack/id "hog" :stack/consumers ["w"]}} {})
-        ctr (str "hp" st "-hog-1")]
+                       :project/name (str "cw" st) :project/needs {"hog" {:share? false}}}}
+        c (ctx projects {"hog" {:stack/id "hog" :stack/consumers ["w"]}} {})]
     (try
       (let [p (stacks/plan c {:stack "hog" :run run})
+            iid (first (keys (get-in p [:ok :budget :budget/instances])))
             up (stacks/stack-up! c {:stack "hog" :run run :wait? false})
-            status (wait-exited ctr 120000)
-            oom? (inspect ctr "{{.State.OOMKilled}}")
-            exit (inspect ctr "{{.State.ExitCode}}")
-            limit (inspect ctr "{{.HostConfig.Memory}}")
-            logs (lines (:out (docker "logs" ctr)))
-            diagnose (hc16b 'hive-compose.pipeline.oom/diagnose)
-            why-line (hc16b 'hive-compose.promote.oom/why-line)
-            diag (when diagnose (diagnose (:engine c) {:container ctr :service "hog" :cap (* 256 mib)}))
-            text (when (and why-line diag (r/ok? diag)) (why-line (:ok diag)))
-            outcomes (hc16b 'hive-compose.promote.flaky/run-outcomes)
-            rank (hc16b 'hive-compose.promote.flaky/rank)
-            config (hc16b 'hive-compose.promote.flaky/config)
-            rows (when outcomes
-                   (outcomes {:run/id run :suite/id "hog-suite" :project "w"
-                              :exit (some-> exit parse-long)
-                              :oom (when (and diag (r/ok? diag)) (:ok diag))}
-                             0))
-            ranked (when (and rank config (seq rows)) (rank (config nil) rows))]
-        (evidence! :s13b {:planned-cap (get-in (plan-budget p) [:budget/instances "hogp/hog" :mem])
-                          :status status :oom-killed oom? :exit exit :host-config-memory limit
-                          :last-log (last (filter #(str/starts-with? % "hog:") logs))
-                          :why text :flaky (mapv #(select-keys % [:case/id :class]) ranked)})
-        (testing "the plan caps the hog at 256m"
-          (is (r/ok? p) (pr-str p))
-          (is (= (* 256 mib) (get-in (plan-budget p) [:budget/instances "hogp/hog" :mem]))))
-        (testing "the kernel enforced the planned cap and killed the hog"
-          (is (r/ok? up) (pr-str up))
-          (is (= "exited" status))
-          (is (= (str (* 256 mib)) limit) "the override wrote mem_limit from :resources")
-          (is (= "true" oom?))
-          (is (= "137" exit))
-          (is (not-any? #(str/starts-with? % "hog: done") logs) "it never reached its target"))
-        (testing "why names the service and the cap (hc-16b)"
-          (is (some? diagnose) "hive-compose.pipeline.oom/diagnose (hc-16b) is not on the classpath")
-          (is (some? why-line) "hive-compose.promote.oom/why-line (hc-16b) is not on the classpath")
-          (is (and diag (r/ok? diag)) (pr-str diag))
-          (is (str/includes? (str text) "hog OOM-killed at 256m") (pr-str text)))
-        (testing "flake history records :oom, not a flake"
-          (is (seq ranked) "no flaky rows")
+            ctr (first (filter #(and (str/includes? % (str "hp" st)) (str/ends-with? % "-hog-1"))
+                               (lines (:out (docker "ps" "-a" "--format" "{{.Names}}")))))
+            status (when ctr (wait-exited ctr 120000))
+            oom? (some-> ctr (inspect "{{.State.OOMKilled}}"))
+            exit (some-> ctr (inspect "{{.State.ExitCode}}"))
+            limit (some-> ctr (inspect "{{.HostConfig.Memory}}"))
+            logs (when ctr (lines (str (:out (docker "logs" ctr)) "\n" (:err (docker "logs" ctr)))))]
+        (evidence! :s13b-stack {:instance iid :planned-cap (get-in p [:ok :budget :budget/instances iid :mem])
+                                :plan-text (get-in p [:ok :text]) :container ctr :status status
+                                :oom-killed oom? :exit exit :host-config-memory limit
+                                :last-log (last (filter #(str/starts-with? % "hog:") logs))})
+        (is (r/ok? p) (pr-str p))
+        (is (= (* 256 mib) (get-in p [:ok :budget :budget/instances iid :mem])) "the plan caps the hog at 256m")
+        (is (r/ok? up) (pr-str up))
+        (is (some? ctr) "the private hog container exists")
+        (is (= "exited" status))
+        (is (= (str (* 256 mib)) limit) "the override wrote mem_limit from :resources")
+        (is (= "true" oom?))
+        (is (= "137" exit))
+        (is (not-any? #(str/starts-with? % "hog: done") logs) "it never reached its target")
+        (is (r/ok? (stacks/stack-down! c {:run run}))))
+      (finally (cleanup! c st [run])))))
+
+(deftest ^:integration s13b-2-capped-suite-runner-oom-explained
+  "CLAIM: suite hog-suite (image hive-compose-e2e/hog:dev, built from
+   test/resources/e2e/hog) runs through the host suite runner with
+   :resources {:mem 256m}: it is OOM-killed (exit 137) and the answer
+   carries the finding `hog-suite/w OOM-killed at 256m`. Its cell result
+   is :error, written to runs/<run>/hog-suite/w/result.edn. `compose why`
+   on that run names the runner and the cap, and the flake history classes
+   it :oom, never :flaky, also over several runs that alternate pass and OOM."
+  (let [st (stamp) run (str "s13bs" st)
+        build (docker "build" "-q" "-t" "hive-compose-e2e/hog:dev"
+                      (str (.getParentFile (io/file hog-script))))
+        c (ctx {} {} {})
+        state-dir (:state-dir c)
+        runner (sr/make-runner {})
+        spec {:runner :container :image "hive-compose-e2e/hog:dev" :name (str "hc13-hog-" st)
+              :test-id "hog-suite/w" :env {"HOG_TARGET_MB" "512" "HOG_EXIT" "1"}
+              :mounts [] :labels {"hive.run" run} :timeout-ms 120000
+              :resources {:mem (* 256 mib)}}]
+    (try
+      (is (zero? (:exit build)) (:err build))
+      (let [res (port/-run! runner spec)
+            ans (:ok res)
+            finding (:oom ans)
+            cell (cond-> {:run/id run :suite/id "hog-suite" :project "w" :exit (:exit ans)
+                          :status (if (= 0 (:exit ans)) :passed :error)
+                          :started-at (:started-at ans) :finished-at (:finished-at ans)}
+                   finding (assoc :oom finding))
+            written (runs/write-result! state-dir cell)
+            w (why/why! c {:test "hog-suite/w" :run run})
+            why-text (str (get-in w [:ok :why/summary]) "\n" (get-in w [:ok :why/markdown]))
+            rows (vec (mapcat (fn [[i r]] (flaky/run-outcomes (assoc cell :run/id r :oom (when (even? i) finding)
+                                                                     :exit (if (even? i) 137 0))
+                                                              (* 1000 i)))
+                              (map-indexed vector [(str run "a") (str run "b") (str run "c") (str run "d")])))
+            ranked (flaky/rank (flaky/config nil) rows)]
+        (evidence! :s13b-suite {:runner (select-keys ans [:exit :cap :timed-out?]) :oom finding
+                                :output-tail (take-last 3 (:output ans))
+                                :written written :why (if (r/ok? w) (get-in w [:ok :why/summary]) (select-keys w [:error :hint]))
+                                :flaky (mapv #(select-keys % [:case/id :class]) ranked)})
+        (testing "the runner was OOM-killed at its cap"
+          (is (r/ok? res) (pr-str res))
+          (is (= 137 (:exit ans)))
+          (is (= (* 256 mib) (get-in ans [:cap :mem])))
+          (is (= "hog-suite/w OOM-killed at 256m" (:oom/line finding)) (pr-str finding)))
+        (testing "the suite failed"
+          (is (= :error (:status cell)))
+          (is (r/ok? written) (pr-str written)))
+        (testing "why names the service and the cap"
+          (is (r/ok? w) (pr-str (select-keys w [:error :hint :known])))
+          (is (str/includes? why-text "OOM-killed at 256m") why-text))
+        (testing "flake history: :oom, never :flaky"
+          (is (seq ranked))
           (is (some #(= :oom (:class %)) ranked) (pr-str ranked))
-          (is (not-any? #(= :flaky (:class %)) ranked))))
-      (is (r/ok? (stacks/stack-down! c {:run run})))
+          (is (not-any? #(= :flaky (:class %)) ranked) (pr-str ranked))))
       (finally (cleanup! c st [run])))))
