@@ -166,6 +166,18 @@
      MemSize?}}>: the image each of `services` runs, the JAVA_TOOL_OPTIONS
      and the memory limit its compose file sets."))
 
+(defprotocol IFlakeHistory
+  "Append-only history of test case outcomes across runs (CaseOutcome rows,
+   see `hive-compose.schema`), read by `hive-compose.promote.flaky`."
+  (-append! [h rows]
+    "Result<{:appended n}>: add `rows` to the history. Rows are never
+     rewritten or removed; appending a run again adds its rows again (the
+     reader keeps one per run). Empty `rows` is a no-op.")
+  (-history [h query]
+    "Result<[row]>: every row recorded, in append order, narrowed by `query`
+     {:suite s :project p} (a nil or absent key matches any). An absent
+     history is []."))
+
 (defprotocol ISuiteRunner
   "Runs one suite runner to its end under its resource caps (hc-16b): a host
    command inside a memory-capped systemd user scope (ulimit -v when no user
