@@ -180,6 +180,17 @@
   (is (nil? (report/detect-format nil)))
   (is (= :format/unknown (:reason (br/parse "")))))
 
+(deftest declared-format
+  (testing ":suite/report-format :auto | :junit | :tap"
+    (is (= :junit (:report/format (:ok (br/parse (fixture "pytest.xml") :junit)))))
+    (is (= :tap (:report/format (:ok (br/parse (fixture "bats.tap") :tap)))))
+    (is (= (br/parse (fixture "bats.tap")) (br/parse (fixture "bats.tap") :auto)))
+    (is (= :tap/no-tests (:reason (br/parse (fixture "pytest.xml") :tap))) "a declared format is not second-guessed")
+    (is (= :xml/unparseable (:reason (br/parse (fixture "bats.tap") :junit))))
+    (is (= :format/unsupported (:reason (br/parse "ok 1" :xunit))))
+    (is (= br/formats #{:auto :junit :tap}))
+    (is (= 4 (count (:report/cases (:ok (br/read-report (io/resource "reports/bats.tap") :tap))))))))
+
 (deftest merge-and-query
   (let [reps (map parsed ["surefire.xml" "bats.tap" "bail-out.tap"])
         merged (report/merge-reports reps)]

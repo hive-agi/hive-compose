@@ -73,17 +73,23 @@
   (r/let-ok [tree (xml-tree s)]
     (report/from-junit-tree tree)))
 
+(def formats
+  "What a suite may declare as its report format (:suite/report-format)."
+  #{:auto :junit :tap})
+
 (defn parse
-  "Result<Report> from report text of either format, detected from its
-   content. Never throws."
-  [s]
-  (try
-    (case (report/detect-format s)
-      :junit (parse-junit s)
-      :tap (report/parse-tap s)
-      (report/malformed :format/unknown))
-    (catch StackOverflowError _
-      (report/malformed :report/too-deep))))
+  "Result<Report> from report text. `format` is :junit, :tap or :auto (the
+   default), which detects it from the content. Never throws."
+  ([s] (parse s :auto))
+  ([s format]
+   (try
+     (case (if (= :auto format) (report/detect-format s) format)
+       :junit (parse-junit s)
+       :tap (report/parse-tap s)
+       nil (report/malformed :format/unknown)
+       (report/malformed :format/unsupported :format format))
+     (catch StackOverflowError _
+       (report/malformed :report/too-deep)))))
 
 (defn report-file?
   "True for a file a runner leaves its report in: .xml or .tap."
@@ -92,21 +98,25 @@
     (and (.isFile f) (re-find #"(?i)\.(xml|tap)$" (.getName f)))))
 
 (defn read-report
-  "Result<Report> of the report file at `path`, the file named in an error."
-  [path]
-  (r/let-ok [text (r/try-effect* :report/unreadable (slurp (io/file path)))]
-    (r/map-err (parse text) #(assoc % :file (str path)))))
+  "Result<Report> of the report file at `path` in `format` (default :auto),
+   the file named in an error."
+  ([path] (read-report path :auto))
+  ([path format]
+   (r/let-ok [text (r/try-effect* :report/unreadable (slurp (io/file path)))]
+     (r/map-err (parse text format) #(assoc % :file (str path))))))
 
 (defn read-reports
-  "Result<Report> merging every report file under directory `dir`, sorted by
-   path. A file that cannot be read fails the whole; a directory holding no
+  "Result<Report> merging every report file under directory `dir` (a suite's
+   :suite/reports-dir), sorted by path, each read in `format` (default
+   :auto). A file that cannot be read fails the whole; a directory holding no
    report is `:report/none`."
-  [dir]
-  (let [files (sort-by str (filter report-file? (file-seq (io/file dir))))]
-    (if (empty? files)
-      (r/err :report/none {:dir (str dir)})
-      (loop [files files acc []]
-        (if-let [f (first files)]
-          (let [res (read-report f)]
-            (if (r/err? res) res (recur (rest files) (conj acc (:ok res)))))
-          (r/ok (report/merge-reports acc)))))))
+  ([dir] (read-reports dir :auto))
+  ([dir format]
+   (let [files (sort-by str (filter report-file? (file-seq (io/file dir))))]
+     (if (empty? files)
+       (r/err :report/none {:dir (str dir)})
+       (loop [files files acc []]
+         (if-let [f (first files)]
+           (let [res (read-report f format)]
+             (if (r/err? res) res (recur (rest files) (conj acc (:ok res)))))
+           (r/ok (report/merge-reports acc))))))))
