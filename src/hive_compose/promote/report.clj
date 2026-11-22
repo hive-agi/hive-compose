@@ -93,14 +93,31 @@
   (let [leaf (str/join "." (keep blank->nil [(when (not= classname nm) classname) nm]))]
     (str/join "/" (keep blank->nil [suite leaf]))))
 
+;; Possessive throughout: no quantifier gives back what it took, so a long run
+;; of digits is read once (`\d+\.?\d*` was quadratic on a dotless run).
+(def ^:private seconds-re #"[+-]?+(?:\d++(?:\.\d*+)?+|\.\d++)(?:[eE][+-]?+\d++)?+")
+
+(defn- decimal-comma
+  "`s` with its comma read as a decimal separator (`0,123` is `0.123`), nil
+   when the comma could be a thousands separator instead (`1,234`: one to
+   three digits not starting with 0, then exactly three), which is not
+   supported, so no time is guessed. `s` without a comma is `s`."
+  [^String s]
+  (if-not (str/includes? s ",")
+    s
+    (when-let [[_ sign whole frac] (re-matches #"([+-]?+)(\d++),(\d++)" s)]
+      (when-not (and (re-matches #"[1-9]\d{0,2}" whole) (= 3 (count frac)))
+        (str sign whole "." frac)))))
+
 (defn parse-seconds
-  "A JUnit time attribute as seconds, nil when absent or unreadable. Tolerates
-   the thousands separators some writers put in (`1,234.5`)."
+  "A JUnit time attribute as seconds, nil when absent or unreadable. A comma
+   may be the decimal separator (`0,123` is 0.123); thousands separators are
+   not supported, so `1,234` and `1,234.5` are nil rather than a guess."
   [s]
-  (when-let [s (some-> s str/trim (str/replace "," "") blank->nil)]
-    (when (re-matches #"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?" s)
+  (when-let [s (some-> s str/trim blank->nil decimal-comma)]
+    (when (re-matches seconds-re s)
       (let [d (parse-double s)]
-        (when (Double/isFinite d) d)))))
+        (when (and d (Double/isFinite d)) d)))))
 
 (defn- children [el tag]
   (filter #(= tag (:tag %)) (:content el)))
@@ -167,13 +184,22 @@
    dropped, so no line costs more than a bounded, linear scan."
   65536)
 
-;; Every regex here is linear on its line: no nested or adjacent quantifiers
-;; over the same characters before a forced failure (see `tap-is-linear`).
-(def ^:private test-re #"^(not ok|ok)(?=\s|$)(?:\s+(\d+)(?=\s|$))?\s*(?:-\s*)?(.*)$")
-(def ^:private plan-re #"^1\.\.(\d{1,9})(?:\s*#.*)?$")
-(def ^:private bail-re #"^Bail out!\s*(.*)$")
-(def ^:private version-re #"(?i)^TAP version \d+$")
-(def ^:private directive-re #"(?i)#\s*(skip(?:ped)?|todo)(?=[\s:]|$)[\s:]*")
+(defn- capped-lines
+  "The lines of `text`, each cut to its first `max-line` characters."
+  [text]
+  (map #(if (> (count %) max-line) (subs % 0 max-line) %) (str/split-lines text)))
+
+;; Every regex here is linear on its line. Each quantifier is possessive, so
+;; none gives back what it took, and a line's tail is `(?s).*\z`: `.` takes
+;; the line terminators a plain `.` and `$` stop at (U+0085, U+2028, U+2029
+;; stay inside a line, since `str/split-lines` splits on \n only), so a
+;; whitespace run followed by one never backtracks. The `regexes-stay-linear`
+;; test holds them to it, through a bounded future.
+(def ^:private test-re #"(?s)^(not ok|ok)(?=\s|\z)(?:\s++(\d++)(?=\s|\z))?+\s*+(?:-\s*+)?+(.*)\z")
+(def ^:private plan-re #"(?s)^1\.\.(\d{1,9})(?:\s*+#.*)?+\z")
+(def ^:private bail-re #"(?s)^Bail out!\s*+(.*)\z")
+(def ^:private version-re #"(?i)^TAP version \d++\z")
+(def ^:private directive-re #"(?i)#\s*+(skip(?:ped)?|todo)(?=[\s:]|\z)[\s:]*+")
 
 (defn- indent [line]
   (count (re-find #"^ *" line)))
@@ -268,7 +294,7 @@
 (defn- yaml-seconds
   "duration_ms (node:test) of a YAML diagnostic block, in seconds."
   [yaml]
-  (when-let [ms (some->> yaml (re-find #"(?m)^\s*duration_ms:\s*([0-9.]+(?:[eE][+-]?\d+)?)\s*$") second parse-double)]
+  (when-let [ms (some->> yaml (re-find #"(?m)^[ \t]*+duration_ms:[ \t]*+([0-9.]++(?:[eE][+-]?+\d++)?+)[ \t]*+$") second parse-double)]
     (* 0.001 ms)))
 
 (defn- attach
@@ -282,58 +308,6 @@
                       (update-in [:case :case/time-s] #(or % (yaml-seconds text))))
             :comment (update-in p [:case :case/output] #(if % (str % "\n" text) text)))]
     (conj (pop points) p)))
-
-(declare fold-level)
-
-(defn- subtests
-  "Leaf points of the deeper tokens `tokens`, folded at `d`."
-  [tokens d]
-  (:points (fold-level tokens d)))
-
-(defn- fold-level
-  "Fold the tokens of one level, `d` deep, into {:points [..] :plan n}.
-   Deeper tokens are a subtest; TAP 14 prints it before the point that closes
-   it, which takes the subtest's points as :children."
-  [tokens d]
-  (loop [tokens tokens points [] plan nil pending [] n 0 open? false]
-    (if-let [{:keys [kind] :as t} (first tokens)]
-      (cond
-        (and (> (:depth t) d) (not (#{:yaml :comment} kind)))
-        (let [[deeper more] (split-with #(> (:depth %) d) tokens)
-              deeper (vec deeper)]
-          (recur more points plan (into pending (subtests deeper (apply min (map :depth deeper)))) n false))
-
-        (= :test kind)
-        (let [p (assoc (test-point (:body t) (inc n)) :children pending)]
-          (recur (rest tokens) (conj points p) plan [] (:num p) true))
-
-        (= :plan kind) (recur (rest tokens) points (:n t) pending n false)
-
-        (and open? (= :yaml kind))
-        (recur (rest tokens) (attach points t) plan pending n true)
-
-        (and open? (= :comment kind) (<= (:depth t) d)
-             (not (re-find #"(?i)^#\s*subtest\b" (:text t))))
-        (recur (rest tokens) (attach points t) plan pending n true)
-
-        :else (recur (rest tokens) points plan pending n false))
-      {:points (into points pending) :plan plan})))
-
-(defn- prefix-id [parent child]
-  (update child :case assoc :case/id (str (get-in parent [:case :case/id]) "/" (get-in child [:case :case/id]))))
-
-(defn- leaves
-  "Points standing for cases: a point with subtests stands for its leaves,
-   and for itself too when it failed while none of them did (a hook failing)."
-  [points]
-  (mapcat (fn [p]
-            (let [kids (map #(prefix-id p %) (leaves (:children p)))
-                  bad? #(#{:failed :error} (get-in % [:case :case/status]))]
-              (cond
-                (empty? kids) [p]
-                (and (bad? p) (not-any? bad? kids)) (concat kids [p])
-                :else kids)))
-          points))
 
 (def max-missing
   "More tests than this missing from a plan reads as a broken plan line, not
@@ -352,35 +326,161 @@
       (for [i (range 1 (inc plan)) :when (not (seen i))]
         (tap-case (str "test " i) :error why)))))
 
+(declare fold-level)
+
+(defn- with-shortfall
+  "Subtest points `pending` and an :error point per test the subtest's plan
+   `plan` promised that is not among them, as at the top level, so a subtest
+   cut short fails the point that closes it. `budget` (a volatile) is how
+   many such points every subtest of the parse may still add together; a
+   subtest plan overdrawing it reads as a broken plan line and throws
+   ::implausible-plan, which `parse-tap` answers as `:tap/implausible-plan`.
+   So the subtests of one parse add at most `max-missing` points between
+   them, however many there are and however deep."
+  [pending plan budget]
+  (let [short (vec (take (inc @budget) (missing plan pending nil)))]
+    (when (> (count short) @budget)
+      (throw (ex-info "subtest plan implausible" {::implausible-plan plan})))
+    (vswap! budget - (count short))
+    (into pending (map (fn [c] {:num nil :case c :children []})) short)))
+
+(defn- fold-subtest
+  "{:points :plan} of the subtest whose tokens are `pending`, folded at the
+   depth of its shallowest test point or plan (stray output, a comment or a
+   YAML block indented less never sets it). Tokens holding neither are
+   stray output: no points, no plan."
+  [pending budget]
+  (if-let [ds (seq (keep #(when (#{:test :plan} (:kind %)) (:depth %)) pending))]
+    (fold-level pending (apply min ds) budget)
+    {:points [] :plan nil}))
+
+(defn- unclosed
+  "What a subtest no point closed leaves at its parent's level, when the
+   stream ends inside it (truncated, or bailed out): an :error point taking
+   a number past every one its `siblings` hold, its points as children (so
+   their ids are prefixed and never collide with the parent's), no
+   shortfall of its own (the error stands for the whole subtest). A run of
+   deeper lines holding no point and no plan is stray output and leaves
+   nothing."
+  [pending siblings budget]
+  (when (seq pending)
+    (let [{:keys [points plan]} (fold-subtest pending budget)
+          ;; past the highest number any sibling holds, not the last one:
+          ;; points may come out of order, and an id must never repeat
+          num (inc (reduce max 0 (keep :num siblings)))]
+      (when (or (seq points) plan)
+        [{:num num
+          :case (tap-case (str "test " num) :error "not run: subtest never closed by a test point")
+          :children points}]))))
+
+(defn- fold-level
+  "Fold the tokens of one level, `d` deep, into {:points [..] :plan n}.
+   Deeper tokens are a subtest; TAP 14 prints it before the point that closes
+   it, which takes the subtest's points as :children, plus its plan's
+   shortfall (see `with-shortfall`). The deeper tokens are gathered until
+   that point and folded once, then, at every depth below this one: a blank
+   line, stray output or a comment at this depth (or shallower) inside a
+   subtest is dropped, never splitting it, so its numbering and its plan
+   stay whole. A subtest no point closes is `unclosed`."
+  [tokens d budget]
+  (loop [tokens tokens points [] plan nil pending [] n 0 open? false]
+    (if-let [{:keys [kind] :as t} (first tokens)]
+      (cond
+        (and (> (:depth t) d) (or (seq pending) (not (#{:yaml :comment} kind))))
+        (recur (rest tokens) points plan (conj pending t) n false)
+
+        (= :test kind)
+        (let [children (if (seq pending)
+                         (let [sub (fold-subtest pending budget)]
+                           (with-shortfall (:points sub) (:plan sub) budget))
+                         [])
+              p (assoc (test-point (:body t) (inc n)) :children children)]
+          (recur (rest tokens) (conj points p) plan [] (:num p) true))
+
+        (= :plan kind) (recur (rest tokens) points (:n t) pending n false)
+
+        (and open? (= :yaml kind))
+        (recur (rest tokens) (attach points t) plan pending n true)
+
+        (and open? (= :comment kind) (<= (:depth t) d)
+             (not (re-find #"(?i)^#\s*subtest\b" (:text t))))
+        (recur (rest tokens) (attach points t) plan pending n true)
+
+        :else (recur (rest tokens) points plan pending n false))
+      {:points (into points (unclosed pending points budget)) :plan plan})))
+
+(def max-id-chars
+  "Characters the prefixed case ids of one TAP parse may take together,
+   every level's prefixing counted. A subtest's ids repeat its parent's
+   description, so a long description over many leaves would grow the
+   Report far past its input: past this it reads as a hostile report,
+   `:tap/implausible-ids`."
+  (* 32 1024 1024))
+
+(defn- prefix-id
+  "`child` with its id under `parent`'s. Every prefixed id is charged to
+   `budget` (a volatile of characters left) BEFORE it is built, so however
+   the ids are realized, the parse allocates at most `max-id-chars` of
+   them; overdrawing it throws ::implausible-ids."
+  [budget parent child]
+  (let [pid (get-in parent [:case :case/id])
+        cid (get-in child [:case :case/id])]
+    (when (neg? (vswap! budget - (+ (count pid) 1 (count cid))))
+      (throw (ex-info "case ids implausible" {::implausible-ids true})))
+    (update child :case assoc :case/id (str pid "/" cid))))
+
+(defn- bad? [p]
+  (#{:failed :error} (get-in p [:case :case/status])))
+
+(defn- leaves
+  "Points standing for cases: a point with subtests stands for its leaves,
+   and for itself too when it failed while none of them did (a hook failing).
+   `budget` bounds the prefixed ids (see `prefix-id`)."
+  [points budget]
+  (mapcat (fn [p]
+            (let [kids (map #(prefix-id budget p %) (leaves (:children p) budget))]
+              (cond
+                (empty? kids) [p]
+                (and (bad? p) (not-any? bad? kids)) (concat kids [p])
+                :else kids)))
+          points))
+
 (defn parse-tap
   "Result<Report> from TAP 13/14 text: a plan `1..N` before or after the
    tests, `ok`/`not ok` points with `# SKIP`/`# TODO` directives, a YAML
    diagnostic block kept raw as its point's message, trailing `#` comments as
    its output, subtests flattened into `parent/child` ids. A test the plan
-   promised and that never ran counts as :error; so does `Bail out!` without a
-   plan. Text with no plan, no test point and no bail-out, or a plan promising
-   more than `max-missing` tests beyond those that ran, is
-   `:report/malformed`."
+   promised and that never ran counts as :error, a subtest's plan included
+   (`parent/test N`); so does a subtest no test point closes (`test N`,
+   N past every number its level used), and `Bail out!` without a plan.
+   Text with no plan, no test point and no bail-out, a plan promising more
+   than `max-missing` tests beyond those that ran, or case ids holding more
+   than `max-id-chars` characters together, is `:report/malformed`."
   [text]
   (if-not (string? text)
     (malformed :tap/not-text)
     (try
-      (let [lines (->> (str/split-lines (str/replace (str/replace-first text #"^\uFEFF" "") #"\r\n?" "\n"))
-                       (map #(if (> (count %) max-line) (subs % 0 max-line) %)))
+      (let [lines (capped-lines (str/replace (str/replace-first text #"^\uFEFF" "") #"\r\n?" "\n"))
             tokens (lex lines)
             [run [bail]] (split-with #(not= :bail (:kind %)) tokens)
             bail (some-> bail :reason str/trim)
-            {:keys [points plan]} (fold-level (vec run) 0)]
+            {:keys [points plan]} (fold-level (vec run) 0 (volatile! max-missing))]
         (cond
           (and (nil? plan) (empty? points) (nil? bail)) (malformed :tap/no-tests)
           (implausible-plan? plan points) (malformed :tap/implausible-plan :plan plan)
           :else
-          (let [cases (concat (map :case (leaves points))
-                              (missing plan points bail)
-                              (when (and bail (nil? plan))
-                                [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))]))]
+          (let [cases (vec (concat (map :case (leaves points (volatile! max-id-chars)))
+                                   (missing plan points bail)
+                                   (when (and bail (nil? plan))
+                                     [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))])))]
             (r/ok (cond-> (->report :tap cases)
                     bail (assoc :report/bail-out bail))))))
+      (catch clojure.lang.ExceptionInfo e
+        (let [data (ex-data e)]
+          (cond
+            (::implausible-plan data) (malformed :tap/implausible-plan :plan (::implausible-plan data))
+            (::implausible-ids data) (malformed :tap/implausible-ids :max-id-chars max-id-chars)
+            :else (throw e))))
       (catch StackOverflowError _
         (malformed :tap/too-deep)))))
 
@@ -390,7 +490,9 @@
 
 (defn detect-format
   "The format of report `content`: :junit for XML, :tap when a line is a TAP
-   version, plan or test point, nil otherwise."
+   version, plan or test point, nil otherwise. Each line is read as
+   `parse-tap` reads it, cut to `max-line` characters, so no line costs more
+   than a bounded, linear scan."
   [content]
   (when (string? content)
     (let [s (str/triml (str/replace-first content "\uFEFF" ""))]
@@ -398,7 +500,7 @@
         (str/starts-with? s "<") :junit
         (some #(let [l (str/trim %)]
                  (or (re-matches version-re l) (re-matches plan-re l) (re-matches test-re l)))
-              (str/split-lines s))
+              (capped-lines s))
         :tap))))
 
 (defn merge-reports

@@ -81,7 +81,8 @@
     (is (report/valid-report? rep))
     ;; the nearest named suite, not the path of suites
     (is (= ["inner/a" "outer/K.b" "outer" "loose"] (mapv :case/id (:report/cases rep))))
-    (is (= [nil 1234.5 nil nil] (mapv :case/time-s (:report/cases rep))))
+    (is (= [nil nil nil nil] (mapv :case/time-s (:report/cases rep)))
+        "a thousands separator is not guessed at: 1,234.5 reads as no time")
     (is (= :failed (:case/status (last (:report/cases rep)))) "a failure outranks a skip")
     (testing "a bare <testsuite> root"
       (is (= ["s/x"] (mapv :case/id (:report/cases (:ok (br/parse "<testsuite name='s'><testcase name='x'/></testsuite>")))))))))
@@ -183,14 +184,154 @@
 (defn- tap-cases [s]
   (mapv (juxt :case/id :case/status) (:report/cases (:ok (report/parse-tap s)))))
 
-(deftest review-regressions
-  (testing "regexes stay linear on long lines (ReDoS)"
-    (let [pad (apply str (repeat 60000 " "))
-          t0 (System/nanoTime)]
+(def ^:private linear-budget-ms
+  "Generous on purpose: each input below takes milliseconds when the parse is
+   linear and minutes when it is quadratic, so a loaded machine never flakes
+   it."
+  60000)
+
+(defn- bounded
+  "`(f)`, or ::timeout when it does not return within `linear-budget-ms`."
+  [f]
+  (let [fut (future (f))
+        v (deref fut linear-budget-ms ::timeout)]
+    (when (= ::timeout v) (future-cancel fut))
+    v))
+
+(deftest regexes-stay-linear
+  (let [pad (apply str (repeat 60000 " "))]
+    (testing "long lines (ReDoS)"
       (doseq [s [(str "ok 1 - a" pad "x") (str "ok 1 - a" pad "# x")
                  (str "not ok" pad "#" pad) (str "ok 1 - " (apply str (repeat 200000 "#")))]]
-        (is (r/ok? (report/parse-tap s))))
-      (is (< (/ (- (System/nanoTime) t0) 1e6) 2000.0))))
+        ;; 50 lines, as below: one line alone may slip under the bound when quadratic
+        (let [s (str/join "\n" (repeat 50 s))]
+          (is (r/ok? (bounded #(report/parse-tap s))) (pr-str (subs s 0 10))))))
+    (testing "a whitespace run followed by a line terminator split-lines keeps"
+      (doseq [nl ["\u2028" "\u2029" "\u0085"]
+              s [(str "ok 1 -" pad nl "x") (str "not ok" pad nl "x") (str "ok 1 - a #" pad nl "x")
+                 (str "Bail out!" pad nl "x") (str "1..3" pad nl "x")]]
+        ;; 50 lines: milliseconds when linear, far past the bound when not
+        (let [s (str/join "\n" (repeat 50 s))]
+          (is (not= ::timeout (bounded #(report/parse-tap s))) (pr-str (subs s 0 10) nl))
+          (is (not= ::timeout (bounded #(report/detect-format (str "zz\n" s)))) (pr-str (subs s 0 10) nl))))
+      (is (= :tap (bounded #(report/detect-format (str "ok 1 -" pad "\u2028x")))))
+      (is (= [["\u0085x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u0085x"))))
+          "U+0085 is neither \\s nor whitespace to str/trim: the description keeps it")
+      (is (= [["x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u2028x"))))
+          "U+2028 is whitespace to str/trim, which drops it from the description"))
+    (testing "YAML: blank lines before a duration"
+      (let [yaml (str "ok 1 - a\n  ---\n" (apply str (repeat 200000 "  \n")) "  x: 1\n  ...\n1..1")]
+        (is (r/ok? (bounded #(report/parse-tap yaml))))))
+    (testing "a JUnit time that is a long run of digits"
+      (is (nil? (bounded #(report/parse-seconds (str (apply str (repeat 200000 "1")) "x"))))))
+    (testing "a 1 MB single line through :auto"
+      (let [mb (apply str (repeat (* 1024 1024) " "))]
+        (is (r/ok? (bounded #(br/parse (str "ok" mb "\u0085x")))))
+        (is (r/ok? (bounded #(br/parse (str "ok 1 - a" mb "\u2028x")))))
+        (is (= :format/unknown (:reason (bounded #(br/parse (str "zz" mb "\u2028x"))))))))))
+
+(deftest parse-seconds
+  (testing "a comma as the decimal separator"
+    (is (= 0.123 (report/parse-seconds "0,123")))
+    (is (= 12.5 (report/parse-seconds "12,5")))
+    (is (= 1.2345 (report/parse-seconds "1,2345"))))
+  (testing "thousands separators are not supported: nil, never a guess"
+    (is (nil? (report/parse-seconds "1,234")))
+    (is (nil? (report/parse-seconds "1,234.5")))
+    (is (nil? (report/parse-seconds "1,234,567")))
+    (is (nil? (report/parse-seconds "1,2.3"))))
+  (testing "plain and exponent forms"
+    (is (= 1.5 (report/parse-seconds " 1.5 ")))
+    (is (= 0.5 (report/parse-seconds ".5")))
+    (is (= 3.0 (report/parse-seconds "3.")))
+    (is (= 1500.0 (report/parse-seconds "1.5e3")))
+    (is (nil? (report/parse-seconds "1e999")))
+    (is (nil? (report/parse-seconds "NaN")))
+    (is (nil? (report/parse-seconds "")))
+    (is (nil? (report/parse-seconds nil)))))
+
+(deftest subtest-plan-shortfall
+  (testing "a test a subtest's plan promised and that never ran is an error under its parent"
+    (let [rep (:ok (report/parse-tap "    1..3\n    ok 1 - c\nnot ok 1 - p\n1..1"))]
+      (is (= {"p/c" :passed "p/test 2" :error "p/test 3" :error} (by-status rep)))
+      (is (= {:passed 1 :failed 0 :error 2 :skipped 0} (:report/totals rep)))))
+  (testing "nested two deep"
+    (is (= {"p/q/a" :passed "p/q/test 2" :error "p/b" :passed}
+           (by-status (:ok (report/parse-tap (str "        ok 1 - a\n        1..2\n    not ok 1 - q\n"
+                                                  "    ok 2 - b\n    1..2\nnot ok 1 - p\n1..1")))))))
+  (testing "a subtest split by a blank line or stray output is one subtest: no false error"
+    (is (= {"p/a" :passed "p/b" :passed}
+           (by-status (:ok (report/parse-tap "    1..2\n\n    ok 1 - a\n    ok 2 - b\nok 1 - p\n1..1")))))
+    (is (= {"p/a" :passed "p/b" :passed}
+           (by-status (:ok (report/parse-tap "    ok 1 - a\nstray\n    ok 2 - b\n    1..2\nok 1 - p\n1..1")))))
+    (is (= {"p/a" :passed "p/test 2" :error}
+           (by-status (:ok (report/parse-tap "    1..2\n\n    ok 1 - a\nok 1 - p\n1..1"))))
+        "and its shortfall still counts, once"))
+  (testing "a subtest no point closes is an error taking the closing point's number"
+    (is (= [["test 1/a" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..3\n    ok 1 - a\n")))
+    (is (= [["test 1/a" :passed] ["test 1" :error]]
+           (tap-cases "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\n")))
+    (is (not (report/passed? (:ok (report/parse-tap "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\n"))))
+        "a stream cut mid-subtest never passes")
+    (is (= [["test 1/a" :passed] ["test 1" :error]]
+           (tap-cases "1..1\n# Subtest: p\n    1..3\n    ok 1 - a\nBail out! db")))
+    (is (= [["test 1/a" :passed] ["test 1/b" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..5\n    ok 1 - a\n    ok 2 - b\n")))
+    (is (= [["test 1/a" :passed] ["test 1" :error] ["test 2" :error]]
+           (tap-cases "1..2\n    1..3\n    ok 1 - a\nBail out! db"))
+        "a bail-out inside a subtest: ids never collide")
+    (is (= [["a" :passed]] (tap-cases "ok 1 - a\n    stray indented\n1..1"))
+        "deeper stray output with no point or plan is no subtest")
+    (is (= [["test 2" :passed] ["test 1" :passed] ["test 3/a" :passed] ["test 3" :error]]
+           (tap-cases "1..2\nok 2\nok 1\n    ok 1 - a\n"))
+        "points out of order: the unclosed subtest takes a number none of them holds (review 3, F2)"))
+  (testing "ids repeating a long parent description over many leaves read as hostile (review 3, F1)"
+    (let [s (str (apply str (repeat 3000 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1")]
+      (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))))
+    (is (= 300 (count (tap-cases (str (apply str (repeat 300 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1"))))
+        "18 M id characters are still a report")
+    (let [s (str (apply str (repeat 3000 "    ok\n")) "not ok 1 - " (apply str (repeat 60000 "d")) "\n1..1")]
+      (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))
+          "under a failing parent too, whose passing subtree is realized to judge it"))
+    (testing "nested: every level's prefixing is charged"
+      (let [d (apply str (repeat 60000 "d"))
+            s (str (apply str (repeat 3000 "        ok\n")) "    ok 1 - " d "\n    1..1\nnot ok 1 - " d "\n1..1")]
+        (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))))))
+  (testing "a split never breaks a subtest, at any depth (review 2, MAJOR 1)"
+    (doseq [gap ["" "stray" "# note"]]
+      (is (= {"p/a" :passed "p/q/b" :passed "p/q/c" :passed}
+             (by-status (:ok (report/parse-tap (str "    ok 1 - a\n        ok 1 - b\n" gap "\n        ok 2 - c\n"
+                                                    "        1..2\n    ok 2 - q\n    1..2\nok 1 - p\n1..1")))))
+          (pr-str gap))
+      (is (= {"p/q/a" :passed "p/q/b" :passed}
+             (by-status (:ok (report/parse-tap (str "        ok 1 - a\n" gap "\n        ok 2 - b\n        1..2\n"
+                                                    "    ok 1 - q\n    1..1\nok 1 - p\n1..1")))))
+          (str "depth 2 " (pr-str gap)))
+      (is (= {"p/q/r/a" :passed "p/q/r/b" :passed}
+             (by-status (:ok (report/parse-tap (str "            ok 1 - a\n" gap "\n            ok 2 - b\n            1..2\n"
+                                                    "        ok 1 - r\n        1..1\n    ok 1 - q\n    1..1\nok 1 - p\n1..1")))))
+          (str "depth 3 " (pr-str gap)))
+      (is (= {"p/a" :passed "p/b" :passed}
+             (by-status (:ok (report/parse-tap (str "    ok - a\n" gap "\n    ok - b\n    1..2\nok 1 - p\n1..1")))))
+          (str "unnumbered " (pr-str gap))))
+    (is (= {"p/q/a" :passed "p/q/b" :passed}
+           (by-status (:ok (report/parse-tap "        1..2\n\n        ok 1 - a\n        ok 2 - b\n    ok 1 - q\nok 1 - p\n1..1"))))
+        "a plan two deep belongs to the subtest two deep")
+    (is (= {"p/q/a" :passed "p/q/b" :passed "p/q/test 3" :error}
+           (by-status (:ok (report/parse-tap (str "        1..3\n\n        ok 1 - a\n        ok 2 - b\n    ok 1 - q\n"
+                                                  "    1..1\nok 1 - p\n1..1")))))
+        "and its shortfall is reported there, not lost"))
+  (testing "a subtest plan promising far more than ran reads as broken"
+    (is (= :tap/implausible-plan
+           (:reason (bounded #(report/parse-tap "    1..99999999\n    ok 1 - c\nok 1 - p\n1..1")))))
+    (is (= :tap/implausible-plan
+           (:reason (bounded #(report/parse-tap
+                               (apply str (concat (repeat 3 "    1..6000\n    ok 1 - c\nok 1 - p\n")
+                                                  ["1..3"]))))))
+        "the shortfall budget is shared by every subtest of a parse")))
+
+(deftest review-regressions
   (testing "an unterminated YAML block never swallows later test points"
     (is (= [["a" :passed] ["b" :failed] ["c" :passed]]
            (tap-cases "ok 1 - a\n  ---\n  x: 1\nnot ok 2 - b\nok 3 - c\n1..3")))
@@ -377,3 +518,76 @@
       (and (not (:thrown res))
            (or (and (r/ok? res) (report/valid-report? (:ok res)) (all-counted? (:ok res)))
                (= :report/malformed (:error res)))))))
+
+;; Well-formed nested TAP: a level is {:first? plan-before-points :nodes [..]},
+;; each node nil (a leaf point) or a deeper level (the subtest its point closes).
+(defn- gen-level [depth]
+  (gen/let [first? gen/boolean
+            nodes (gen/vector (if (< depth 3)
+                                (gen/frequency [[2 (gen/return nil)] [1 (gen-level (inc depth))]])
+                                (gen/return nil))
+                              1 3)]
+    {:first? first? :nodes nodes}))
+
+(defn- render-level
+  "Lines of `level`, `d` deep, its points `ok i - t<i>`; the level whose id
+   prefix is `short` plans one test more than it has."
+  [{:keys [first? nodes]} d prefix short]
+  (let [pad (apply str (repeat (* 4 d) " "))
+        plan [(str pad "1.." (cond-> (count nodes) (= prefix short) inc))]
+        body (mapcat (fn [i kid]
+                       (concat (when kid (render-level kid (inc d) (str prefix "t" (inc i) "/") short))
+                               [(str pad "ok " (inc i) " - t" (inc i))]))
+                     (range) nodes)]
+    (if first? (concat plan body) (concat body plan))))
+
+(defn- leaf-ids [{:keys [nodes]} prefix]
+  (mapcat (fn [i kid]
+            (let [id (str prefix "t" (inc i))]
+              (if kid (leaf-ids kid (str id "/")) [id])))
+          (range) nodes))
+
+(defn- level-prefixes
+  "[prefix level] of `level` and of every subtest under it."
+  [level prefix]
+  (cons [prefix level]
+        (mapcat (fn [i kid] (when kid (level-prefixes kid (str prefix "t" (inc i) "/"))))
+                (range) (:nodes level))))
+
+(def ^:private gen-noise-lines
+  "Blank lines and stray output, at any depth, to insert anywhere."
+  (gen/vector (gen/tuple gen/nat (gen/elements ["" "  " "stray" "# note" "    stray" "    # note"
+                                                "        stray" "            x" "        # deep"]))
+              0 6))
+
+(defn- with-noise [lines noise]
+  (reduce (fn [v [pos line]]
+            (let [i (mod pos (inc (count v)))]
+              (into (conj (subvec v 0 i) line) (subvec v i))))
+          (vec lines) noise))
+
+(defspec noise-never-breaks-a-subtest 300
+  (prop/for-all [top (gen-level 0)
+                 noise gen-noise-lines]
+    (let [res (report/parse-tap (str/join "\n" (with-noise (render-level top 0 "" nil) noise)))
+          cases (:report/cases (:ok res))
+          ids (map :case/id cases)]
+      (and (r/ok? res)
+           (report/passed? (:ok res))
+           (every? #(= :passed (:case/status %)) cases)
+           (apply distinct? ids)
+           (= (leaf-ids top "") ids)))))
+
+(defspec a-short-plan-fails-at-its-own-path 300
+  (prop/for-all [[top [prefix level]] (gen/bind (gen-level 0)
+                                                (fn [top] (gen/tuple (gen/return top)
+                                                                     (gen/elements (level-prefixes top "")))))
+                 noise gen-noise-lines]
+    (let [res (report/parse-tap (str/join "\n" (with-noise (render-level top 0 "" prefix) noise)))
+          cases (:report/cases (:ok res))
+          bad (filter #(not= :passed (:case/status %)) cases)]
+      (and (r/ok? res)
+           (= [[(str prefix "test " (inc (count (:nodes level)))) :error]]
+              (map (juxt :case/id :case/status) bad))
+           (= (leaf-ids top "") (map :case/id (remove (set bad) cases)))
+           (apply distinct? (map :case/id cases))))))

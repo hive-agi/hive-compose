@@ -45,6 +45,8 @@
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
             [hive-addon.host :as addon-host]
+            [hive-compose.api :as api]
+            [hive-compose.adapter.http :as http]
             [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
@@ -315,7 +317,11 @@
                         (cond-> t
                           (map? (:attributes t)) (update :attributes #(into {} (map (fn [[k v]] [(name k) v])) %)))))}))))
 
-(defn- dispatch [a command params]
+(defn dispatch
+  "Result of `command` with `params` (the tool's params, string or keyword
+   keys) on addon `a`: the one dispatch both transports run, the MCP `compose`
+   tool (`tool`) and the control API (`hive-compose.api`)."
+  [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
@@ -338,7 +344,8 @@
                                                   :errors (:errors @(:state a))})
       :else
       (case command
-        "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
+        "status" (r/ok (cond-> (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+                         (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
@@ -419,7 +426,7 @@
                               "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
-                              "wait" {:type "boolean" :description "[up|switch] wait until the started services are healthy"}
+                              "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
@@ -446,8 +453,54 @@
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})
 
+(def ^:private subject-commands
+  "Commands that resolve a section from target or profile (ops/subject)."
+  #{"up" "switch" "down" "stop" "restart" "touch" "ps" "logs" "claim" "release"})
+
+(def command-params
+  "{command #{param}}: the params each command reads, the one source the
+   control API rejects unknown params by and the spec's Req_<command>
+   schemas are generated from. Read off the [cmd|..] prefix of each param's
+   description in the tool's inputSchema, plus target and profile for the
+   commands that resolve a section and agent_id (stamped by the MCP host)
+   for claim and release."
+  (let [props (dissoc (get-in (tool nil) [:inputSchema :properties]) "command")
+        by-desc (apply merge-with into {}
+                       (for [[p {:keys [description]}] props
+                             [_ cs] (re-seq #"\[([a-z|_-]+)\]" (str description))
+                             c (str/split cs #"\|")]
+                         {c #{p}}))]
+    (into (sorted-map)
+          (for [c commands]
+            [c (cond-> (get by-desc c #{})
+                 (subject-commands c) (into #{"target" "profile"})
+                 (#{"claim" "release"} c) (conj "agent_id"))]))))
+
 ;; ---------------------------------------------------------------------------
 ;; lifecycle
+
+(defn- start-api!
+  "Serve the control API when `:compose/api` enables it. The bound address
+   (or why it failed: the addon still starts) lands in the state's :api, which
+   `status` answers; the server itself under :api-server."
+  [a cfg]
+  (let [{:keys [enabled?] :as acfg} (api/config cfg)]
+    (when enabled?
+      (let [deps {:dispatch (fn [command params] (dispatch a command params))
+                  :commands commands
+                  :params command-params
+                  :declared (get-in (tool a) [:inputSchema :properties])
+                  :health (fn [] (addon/health a))
+                  :spec api/spec-text}
+            res (http/start! acfg #(api/route deps %))]
+        (if (r/ok? res)
+          (swap! (:state a) assoc :api-server (:ok res) :api (select-keys (:ok res) [:host :port :url]))
+          ;; the keyword: MCP writes it bare, the API qualifies it, as every category
+          (swap! (:state a) assoc :api {:error (:error res) :detail (dissoc res :error)}))))))
+
+(defn- stop-api! [{:keys [state]}]
+  (when-let [s (:api-server @state)] (http/stop! s))
+  (swap! state dissoc :api-server :api))
 
 (defn- start! [a cfg settings]
   (let [{:keys [state]} a
@@ -465,10 +518,12 @@
                              (long (or (:compose/initial-delay-ms cfg) 5000))
                              (long (* 1000 tick))
                              TimeUnit/MILLISECONDS)
+    (start-api! a cfg)
     {:success? true :errors []
-     :metadata {:profiles (count (:compose/profiles settings))
-                :active (count (:active @(:state ctx)))
-                :tick-seconds tick}}))
+     :metadata (cond-> {:profiles (count (:compose/profiles settings))
+                        :active (count (:active @(:state ctx)))
+                        :tick-seconds tick}
+                 (:api @state) (assoc :api (:api @state)))}))
 
 (defn reload!
   "Re-read the addon config block declared now and the profiles file into the
@@ -482,8 +537,9 @@
    with until recreated)."
   [{:keys [state seed]}]
   (locking state
-    (let [{:keys [runtime-config declared ctx]} @state
+    (let [{:keys [runtime-config declared ctx] old-cfg :cfg} @state
           {:keys [cfg source]} (merged-config seed runtime-config declared)
+          api-changed? (not= (api/config old-cfg) (api/config cfg))
           old (:settings ctx)]
       (r/let-ok [settings (build-settings cfg)]
         (let [fresh (build-ctx cfg settings {})
@@ -497,6 +553,8 @@
                          :changed diff
                          :sections sections
                          :not-reloaded (cond-> ["env and files of running containers: they apply when the containers are recreated (up after the change, restart recreate=true)"]
+                                         api-changed?
+                                         (conj "the control API (:compose/api): it is rebound at the next initialize!")
                                          (seq (:restart-required diff))
                                          (conj (str "settings applied at the next initialize!: "
                                                     (str/join ", " (map name (:restart-required diff))))))}
@@ -519,8 +577,9 @@
                 (swap! state assoc :lifecycle :error :errors [(ex-message e)])
                 {:success? false :errors [(ex-message e)]}))))))))
 
-(defn- shutdown-addon! [{:keys [state]}]
+(defn- shutdown-addon! [{:keys [state] :as a}]
   (locking state
+    (stop-api! a)
     (when-let [^ScheduledExecutorService sched (:scheduler @state)]
       (.shutdownNow sched))
     (swap! state #(-> % (dissoc :scheduler :ctx) (assoc :lifecycle :stopped))))
