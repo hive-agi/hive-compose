@@ -213,7 +213,11 @@
     (r/let-ok [_ (if wait?
                    (all-ok #(gate engine (get-in sp [:stack/instances (:instance %)]) c) (:consumer/attach cp))
                    (r/ok nil))
-               services (consumer-services engine proj c)
+               all (consumer-services engine proj c)
+               ;; hc-4 :consumer/provider-of: what this consumer provides runs
+               ;; as its instance (shared or private), never again as the consumer
+               services (r/ok (run/without-provided all (map #(get-in sp [:stack/instances %])
+                                                            (:consumer/provider-of cp))))
                _ (port/-up-project! engine (run/consumer-spec settings (:stack/run sp) (:stack/id sp) c services w
                                                               (injected-vars settings c w) wait?))]
       (r/ok {:consumer c :network (:wiring/network w)

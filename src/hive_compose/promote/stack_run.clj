@@ -136,6 +136,26 @@
     (cond-> (update step :services #(vec (remove pre %)))
       (seq spared) (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:preexisting]]])) spared))))
 
+(defn without-provided
+  "`services` of a consumer minus what its own provided instances (`ips`,
+   hc-4 `:consumer/provider-of`) run, their depends_on closures included: a
+   consumer step never re-ups an instance it provides."
+  [services ips]
+  (let [provided (into #{} (mapcat #(concat (:instance/services %) (:instance/needs %))) ips)]
+    (vec (remove provided services))))
+
+(defn spare-stack-held
+  "Section release step `step` (promote.plan: {:project :services ..}) with
+   the services live stack instances keep alive (`held`, hc-4
+   `stack/stack-held`: {compose-project #{service}}) moved from :services to
+   :kept as [:stack]: a section down or reap never stops a stack's instance."
+  [step held]
+  (let [h (get held (:project step) #{})
+        spared (filter h (:services step))]
+    (cond-> step
+      (seq spared) (-> (update :services #(vec (remove h %)))
+                       (update :kept (fnil into (sorted-map)) (map (fn [s] [s [[:stack]]])) spared)))))
+
 (defn whole-project?
   "True when release `step` of a private instance takes its whole compose
    project down: it is private and nothing of it is kept."

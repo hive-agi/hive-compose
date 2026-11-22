@@ -585,11 +585,27 @@
   [exec argv timeout-ms]
   (run exec nil argv timeout-ms nil identity))
 
+(def compose-default-files
+  "The files compose reads when given no -f, in its own order."
+  ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
+
+(defn- with-default-files
+  "`spec` naming its project's default compose file when it names none: an
+   override passed as `-f` replaces compose's default lookup, so the base file
+   must then be named too."
+  [spec]
+  (if (or (seq (:files spec)) (nil? (:dir spec)))
+    spec
+    (if-let [f (first (filter #(.exists (io/file (:dir spec) %)) compose-default-files))]
+      (assoc spec :files [f])
+      spec)))
+
 (defn- stack-up!
   [{:keys [exec resolver up-timeout-ms override-dir]} spec]
   (if (empty? (:services spec))
     (r/ok {:out "" :skipped :no-services})
-    (r/let-ok [override (write-override! override-dir spec)
+    (r/let-ok [spec (r/ok (cond-> spec (override? spec) with-default-files))
+               override (write-override! override-dir spec)
                resolved (secrets/resolve-env resolver (:env spec))]
       (let [declared (:env spec)
             argv (up-project-argv spec override)]
@@ -602,7 +618,8 @@
   (if (and (not (:all? spec)) (empty? (:services spec)))
     (r/ok {:out "" :skipped :no-services})
     (let [override (let [p (override-path override-dir (:project spec))]
-                     (when (.exists (io/file p)) p))]
+                     (when (.exists (io/file p)) p))
+          spec (cond-> spec override with-default-files)]
       (r/map-ok (run exec {:profile/dir (:dir spec)} (down-project-argv spec override) timeout-ms
                      (env/rendered (:env spec)) identity)
                 (fn [out] {:out (clip out)})))))

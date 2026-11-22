@@ -8,6 +8,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.port :as port]
             [hive-compose.stub :as stub]
@@ -166,6 +167,43 @@
             :started-at 0 :last-touch 0})
     (is (r/ok? (stacks/stack-down! c {:run run})))
     (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")))))
+
+(deftest a-section-down-spares-a-stack-instance
+  (let [c (ctx)
+        _ (stacks/stack-up! c {:stack "billing"})
+        sec (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/up-profile! c %))]
+    (is (r/ok? sec) (pr-str sec))
+    (let [down (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/down-profile! c % :down))]
+      (is (r/ok? down) (pr-str down))
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka")) "the billing run still binds kafka")
+      (is (= {"kafka" [[:stack]] "zookeeper" [[:stack]]}
+             (select-keys (:kept (:ok down)) ["kafka" "zookeeper"])))
+      (is (empty? (:services (:ok down)))))
+    (testing "the reaper too"
+      (r/bind (ops/subject c {:target "kafka/kafka"}) #(ops/up-profile! c %))
+      (swap! (:clock c) + (* 61 minute))
+      (ops/reap! c)
+      (is (= #{"kafka" "zookeeper"} (stub/running (e c) "kafka"))))))
+
+(deftest down-disconnects-and-removes-the-view-networks
+  (let [c (ctx)
+        run (get-in (stacks/stack-up! c {:stack "all"}) [:ok :run])
+        nets (set (get-in @(:state c) [:stacks run :networks]))
+        down (stacks/stack-down! c {:run run})]
+    (is (= #{(str "hive-" run "-audit") (str "hive-" run "-billing") (str "hive-" run "-shop")} nets))
+    (is (= nets (set (get-in down [:ok :runs 0 :networks-removed]))))
+    (is (= (count nets) (count (filter #(= :network-rm (first %)) (stub/calls (e c))))))
+    (is (empty? (stub/networks (e c))))
+    (is (every? #(empty? (:networks %)) (vals (stub/containers (e c))))
+        "a shared instance that stays up is detached from every view network of the run")))
+
+(deftest a-consumer-never-re-ups-what-it-provides
+  (let [c (assoc-in (ctx) [:settings :compose/stacks "self"]
+                    {:stack/id "self" :stack/consumers ["kafka" "billing"]})
+        res (stacks/stack-up! c {:stack "self"})]
+    (is (r/ok? res) (pr-str res))
+    (is (= 1 (count (filter #(and (= :up-project (first %)) (= "kafka" (second %))) (stub/calls (e c))))))
+    (is (empty? (get-in res [:ok :consumers 1 :services])) "kafka's own consumer step starts nothing")))
 
 (deftest errors-are-results
   (let [c (ctx)]
