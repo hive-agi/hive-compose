@@ -205,6 +205,21 @@
     (is (= 1 (count (filter #(and (= :up-project (first %)) (= "kafka" (second %))) (stub/calls (e c))))))
     (is (empty? (get-in res [:ok :consumers 1 :services])) "kafka's own consumer step starts nothing")))
 
+(deftest adopt-never-takes-a-stack-instance
+  (let [c (ctx)]
+    (stacks/stack-up! c {:stack "billing"})
+    (is (not-any? #(= "kafka/adopted" %) (ops/adopt! c)))
+    (is (not (contains? (:active @(:state c)) "kafka/adopted")))))
+
+(deftest a-consumer-whose-up-fails-is-still-taken-down
+  (let [c (ctx)]
+    (stub/health! (e c) "billing-billing000001" "billing" :unhealthy)
+    (let [res (stacks/stack-up! c {:stack "billing"})]
+      (is (r/err? res))
+      (is (seq (stub/running (e c) "billing-billing000001")) "compose left the container behind")
+      (is (r/ok? (stacks/stack-down! c {:run (:run res)})))
+      (is (= #{} (stub/running (e c) "billing-billing000001"))))))
+
 (deftest errors-are-results
   (let [c (ctx)]
     (is (= :compose/unknown-stack (:error (stacks/stack-up! c {:stack "nope"}))))

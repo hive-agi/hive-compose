@@ -37,7 +37,9 @@
   (is (run/container-consumer? "shop/api"))
   (is (not (run/container-consumer? "stack:shop")))
   (is (not (run/container-consumer? "suite:smoke")))
-  (is (= "shop-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop/api" "r1x"))))
+  (is (= "shop-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop" "r1x")))
+  (is (= "shop-api-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop/api" "r1x"))
+      "two sections of one project never share a compose project"))
 
 (deftest sparing
   (is (= {:services ["b"] :kept {"a" [[:preexisting]]}}
