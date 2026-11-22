@@ -284,6 +284,48 @@
           want (assoc (into {} (apply concat attr-sets)) "hive.run.id" run)]
       (= want got))))
 
+(deftest run-scoped-tenancy-gives-every-consumer-the-run-prefix
+  (let [s (assoc-in settings [:compose/projects "infra" :project/provides "kafka" :tenancy :scope] :run)
+        ws (:ok (wiring/wirings s resolution "r01"))]
+    (is (= "r01." (get-in ws ["shop" :wiring/env "KAFKA_TOPIC_PREFIX"])))
+    (is (= "r01." (get-in ws ["billing" :wiring/env "KAFKA_TOPIC_PREFIX"]))
+        "producer and consumer of one topic see one prefix")
+    (is (= "r01.shop." (get-in ws ["shop" :wiring/prefix])) ":wiring/prefix stays per consumer")
+    (is (nil? (schema/explain schema/Provide (get-in s [:compose/projects "infra" :project/provides "kafka"])))))
+  (testing "a string scope from config reads the same; :consumer is the default"
+    (let [s (assoc-in settings [:compose/projects "infra" :project/provides "kafka" :tenancy :scope] "run")]
+      (is (= "r01." (get-in (:ok (wiring/wiring s resolution "r01" "billing")) [:wiring/env "KAFKA_TOPIC_PREFIX"]))))
+    (let [s (assoc-in settings [:compose/projects "infra" :project/provides "kafka" :tenancy :scope] :consumer)]
+      (is (= "r01.billing." (get-in (:ok (wiring/wiring s resolution "r01" "billing")) [:wiring/env "KAFKA_TOPIC_PREFIX"])))))
+  (testing "an unknown scope is refused by the schema"
+    (is (some? (schema/explain schema/Provide {:service "kafka" :tenancy {:env "P" :scope :galaxy}})))))
+
+(def gen-scope (gen/elements [nil :consumer :run "consumer" "run"]))
+
+(defspec tenancy-prefix-follows-its-scope 100
+  (prop/for-all [world gen-world run gen-run other gen-run scopes (gen/vector gen-scope (count caps))]
+    (let [scope-of (zipmap caps scopes)
+          world (update-in world [:settings :compose/projects "infra" :project/provides]
+                           (fn [ps] (into {} (map (fn [[cap p]]
+                                                    [cap (if (and (:tenancy p) (scope-of cap))
+                                                           (assoc-in p [:tenancy :scope] (scope-of cap))
+                                                           p)]))
+                                          ps)))
+          provides (get-in world [:settings :compose/projects "infra" :project/provides])
+          ws (all-wirings world run)
+          ws2 (all-wirings world other)]
+      (every? (fn [[c w]]
+                (every? (fn [cap]
+                          (let [{:keys [env scope]} (:tenancy (get provides cap))
+                                got (get-in w [:wiring/env env])]
+                            (or (nil? env)
+                                (if (#{:run "run"} scope)
+                                  (and (= (str run ".") got)
+                                       (or (= run other) (not= got (get-in ws2 [c :wiring/env env]))))
+                                  (= (str run "." (schema/slug c) ".") got)))))
+                        (keys (get-in world [:resolution :resolution/bindings c]))))
+              ws))))
+
 (defspec otlp-pair-travels-together 100
   (prop/for-all [maps (gen/vector (gen/elements [{} {"X" "1"}
                                                  {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://otel:4317"

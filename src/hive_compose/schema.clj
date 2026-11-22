@@ -205,12 +205,17 @@
    `kafka:9092` stays right for shared and private instances alike.
    `:tenancy` names the env var a consumer's namespace prefix (topics,
    schemas, buckets) is passed in, so consumers of a shared instance do not
-   cross-talk."
+   cross-talk. `:tenancy :scope` is :consumer (the default, `<run>.<consumer>.`:
+   consumers never see each other's data) or :run (`<run>.`, one prefix for
+   every consumer of the run, for a producer and a consumer of one topic;
+   runs stay isolated); config may write it as a string."
   [:map
    [:service [:string {:min 1}]]
    [:version {:optional true} Version]
    [:env {:optional true} Env]
-   [:tenancy {:optional true} [:map [:env [:string {:min 1}]]]]
+   [:tenancy {:optional true} [:map
+                               [:env [:string {:min 1}]]
+                               [:scope {:optional true} [:enum :consumer :run "consumer" "run"]]]]
    [:description {:optional true} :string]])
 
 (def Need

@@ -11,7 +11,8 @@
    1. injected: each bound provider's `:env` (by capability; two instances
       setting one key to different values is a Result error naming both and
       the key), then for each provider with `:tenancy {:env VAR}` VAR = the
-      consumer's tenancy prefix `<run>.<consumer>.`, then `extra-envs`, a seq
+      consumer's tenancy prefix `<run>.<consumer>.` (the run's `<run>.` when
+      the tenancy says `:scope :run`), then `extra-envs`, a seq
       of Env maps in order (the OTLP hook: `hive-compose.promote.otel`).
    2. the consumer's own env (`consumer-env`), per key.
    3. forced: HIVE_RUN_ID=<run> and hive.run.id=<run>.
@@ -215,8 +216,9 @@
                         (filter (fn [[cap _]] (serves? settings consumer cap service)))
                         (map second))
             tenancy (into {} (keep (fn [inst]
-                                     (when-let [var (get-in (provide settings inst) [:tenancy :env])]
-                                       [var prefix])))
+                                     (let [t (:tenancy (provide settings inst))]
+                                       (when-let [var (:env t)]
+                                         [var (names/tenancy-prefix-for t run consumer)]))))
                           served)]
         (r/let-ok [provided (let [p (providers-env settings served)]
                               (if (r/err? p) p (r/ok (:env p))))

@@ -32,3 +32,19 @@
    shared instance: `<run>.<slug consumer>.`."
   [run consumer]
   (str (slug run) "." (slug consumer) "."))
+
+(defn run-tenancy-prefix
+  "Namespace prefix shared by every consumer of `run`, for a provider whose
+   `:tenancy` has `:scope :run` (a producer and a consumer of one topic):
+   `<run>.`. Runs on a shared instance stay isolated."
+  [run]
+  (str (slug run) "."))
+
+(defn tenancy-prefix-for
+  "The prefix `consumer` in `run` receives from a provider with `tenancy`
+   ({:env VAR :scope :consumer|:run}, the scope a keyword or a string): the
+   run's when `:scope` is :run, the consumer's otherwise (the default)."
+  [tenancy run consumer]
+  (if (= "run" (some-> (:scope tenancy) name))
+    (run-tenancy-prefix run)
+    (tenancy-prefix run consumer)))
