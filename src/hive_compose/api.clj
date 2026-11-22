@@ -104,6 +104,7 @@
    :compose/instance-unhealthy 502
    :compose/stack-down-incomplete 502
    :compose/toxiproxy-failed 502
+   :compose/runner-failed 502
    :compose/toxiproxy-unreachable 502
    :trace/unreachable 502
    :trace/http-error 502
@@ -127,6 +128,7 @@
    :compose/orphan-check-failed 500
    :compose/ownership-check-failed 500
    :compose/proc-unreadable 500
+   :compose/meminfo-unreadable 500
    :compose/api-bind-failed 500})
 
 (defn http-status
