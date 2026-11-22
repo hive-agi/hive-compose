@@ -82,6 +82,11 @@
    :compose/unknown-data-service 400
    :compose/shared-reset-without-tenancy 400
    :compose/volume-removal-refused 400
+   ;; a suite's test report (JUnit / TAP) the runner left: 502 like any
+   ;; other backend whose output cannot be read or is not there
+   :report/malformed 502
+   :report/unreadable 502
+   :report/none 502
    :compose/unknown-command 404
    :compose/unknown-stack 404
    :compose/unknown-run 404
