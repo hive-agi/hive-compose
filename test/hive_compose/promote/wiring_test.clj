@@ -6,6 +6,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [hive-compose.promote.env :as env]
+            [hive-compose.promote.otel :as otel]
             [hive-compose.promote.wiring :as wiring]
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]))
@@ -280,7 +281,7 @@
     (let [extra (map (fn [kvs] {"OTEL_RESOURCE_ATTRIBUTES" (str/join "," (map (fn [[k v]] (str k "=" v)) kvs))})
                      attr-sets)
           e (:wiring/env (:ok (wiring/wiring settings resolution run "shop" extra)))
-          got (into {} (wiring/parse-attributes (get e "OTEL_RESOURCE_ATTRIBUTES")))
+          got (otel/parse-resource-attributes (get e "OTEL_RESOURCE_ATTRIBUTES"))
           want (assoc (into {} (apply concat attr-sets)) "hive.run.id" run)]
       (= want got))))
 
