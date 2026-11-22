@@ -8,6 +8,7 @@
    (see `hive-compose.adapter.secrets`). Every other call is given their
    renderings, so it interpolates and reads no store."
   (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [hive-compose.adapter.secrets :as secrets]
             [hive-compose.port :as port]
@@ -264,6 +265,180 @@
      :ports (into (sorted-set) (for [[_ m] svcs p (get m "ports") :let [n (port-of p)] :when n] n))}))
 
 ;; ---------------------------------------------------------------------------
+;; stacks: networks, labelled projects, labelled containers (IStackEngine)
+;;
+;; compose has no CLI flag putting labels on a service's containers, nor one
+;; attaching it to an extra network. A stack run therefore adds a generated
+;; override file (JSON, which compose reads as YAML) as the last `-f`: it
+;; carries the labels, the external view networks and the names of the
+;; variables passed into the containers. Values never go in the file: a
+;; variable is listed with a null value, which compose fills from its own
+;; process environment, so a secret read at spawn stays in memory. Instances
+;; that already run join a view network with `docker network connect
+;; --alias`, which recreates nothing.
+
+(defn label-args
+  "`--label k=v` pairs of `labels`, sorted by key."
+  [labels]
+  (vec (mapcat (fn [[k v]] ["--label" (str k "=" v)]) (sort-by key labels))))
+
+(defn label-filter-args
+  "`--filter label=k=v` pairs of `labels`, sorted by key."
+  [labels]
+  (vec (mapcat (fn [[k v]] ["--filter" (str "label=" k "=" v)]) (sort-by key labels))))
+
+(defn network-ls-argv
+  "The network named exactly `network`, its name on one line when present."
+  [network]
+  ["docker" "network" "ls" "--filter" (str "name=^" network "$") "--format" "{{.Name}}"])
+
+(defn network-create-argv [network labels]
+  (-> ["docker" "network" "create" "--driver" "bridge"] (into (label-args labels)) (conj network)))
+
+(defn network-containers-argv
+  "The containers attached to `network`, one name per line."
+  [network]
+  ["docker" "network" "inspect" network "--format" "{{range .Containers}}{{.Name}}\n{{end}}"])
+
+(defn network-disconnect-argv [network container]
+  ["docker" "network" "disconnect" "-f" network container])
+
+(defn network-rm-argv [network]
+  ["docker" "network" "rm" network])
+
+(defn service-containers-argv
+  "Every container of `service` in compose project `project`, running or not,
+   one name per line. Loads no compose file."
+  [project service]
+  ["docker" "ps" "-a"
+   "--filter" (str "label=com.docker.compose.project=" project)
+   "--filter" (str "label=com.docker.compose.service=" service)
+   "--format" "{{.Names}}"])
+
+(defn network-connect-argv
+  "`docker network connect` of `container` to `network` under every alias."
+  [network container aliases]
+  (-> ["docker" "network" "connect"]
+      (into (mapcat (fn [a] ["--alias" a])) aliases)
+      (conj network container)))
+
+(defn already-attached?
+  "True when docker refused a `network connect` because the container is
+   already on the network."
+  [stderr]
+  (boolean (re-find #"(?i)already exists|already attached" (str stderr))))
+
+(defn override?
+  "True when ProjectSpec `spec` needs a generated override file."
+  [spec]
+  (boolean (or (seq (:labels spec)) (seq (:networks spec)) (seq (:container-env spec)))))
+
+(defn override-doc
+  "The compose override of ProjectSpec `spec` as data: each of its
+   `:services` gets `:labels`, joins the external `:networks` (its project's
+   default network is then left out, so names resolve on those networks
+   alone; networks a service declares in its own files stay) and receives the
+   variables `:container-env` names, as null so compose reads their values
+   from its own environment. Pure."
+  [{:keys [services labels networks container-env]}]
+  (let [svc (cond-> {}
+              (seq labels) (assoc "labels" (into (sorted-map) labels))
+              (seq networks) (assoc "networks" (into (sorted-map) (map (fn [n] [n {}])) networks))
+              (seq container-env) (assoc "environment" (into (sorted-map) (map (fn [v] [v nil])) container-env)))]
+    (cond-> {"services" (into (sorted-map) (map (fn [s] [s svc])) services)}
+      (seq networks) (assoc "networks" (into (sorted-map)
+                                             (map (fn [n] [n {"external" true "name" n}]))
+                                             networks)))))
+
+(defn override-json
+  "`override-doc` of `spec` as JSON text."
+  [spec]
+  (json/write-str (override-doc spec) :escape-slash false))
+
+(defn override-path
+  "Where the override of compose project `project` is written under `dir`."
+  [dir project]
+  (str dir "/" project ".override.json"))
+
+(defn project-argv
+  "`docker compose` addressed at ProjectSpec `spec`, `override` (a path, or
+   nil) as the last `-f`."
+  [spec override]
+  (-> ["docker" "compose"]
+      (cond-> (:dir spec) (into ["--project-directory" (:dir spec)]))
+      (into ["-p" (:project spec)])
+      (into (mapcat (fn [f] ["-f" f])) (:files spec))
+      (cond-> override (into ["-f" override]))))
+
+(defn up-project-argv [spec override]
+  (-> (project-argv spec override)
+      (into ["up" "-d"])
+      (cond-> (:wait? spec) (conj "--wait"))
+      (cond-> (and (:wait? spec) (:wait-timeout-s spec)) (into ["--wait-timeout" (str (:wait-timeout-s spec))]))
+      (cond-> (:no-deps? spec) (conj "--no-deps"))
+      (into (:services spec))))
+
+(defn down-project-argv
+  "Remove the containers of `spec`'s services, or with `:all?` the whole
+   project and its own networks. Never `-v`."
+  [spec override]
+  (if (:all? spec)
+    (into (project-argv spec override) ["down" "--remove-orphans"])
+    (-> (project-argv spec override) (conj "down") (into (:services spec)))))
+
+(defn labelled-containers-argv
+  "Every container, running or not, carrying all `labels`, one JSON object a line."
+  [labels]
+  (-> ["docker" "ps" "-a" "--no-trunc"] (into (label-filter-args labels)) (into ["--format" "{{json .}}"])))
+
+(defn labelled-networks-argv
+  "Every network carrying all `labels`, one JSON object a line."
+  [labels]
+  (-> ["docker" "network" "ls"] (into (label-filter-args labels)) (into ["--format" "{{json .}}"])))
+
+(defn parse-labels
+  "{k v} of docker's `Labels` column, \"k=v,k2=v2\". A value holding a comma
+   is cut there: docker joins with no escape."
+  [s]
+  (into (sorted-map)
+        (for [kv (str/split (str s) #",")
+              :let [[k v] (str/split kv #"=" 2)]
+              :when (seq k)]
+          [k (or v "")])))
+
+(defn health-of
+  "The health in a docker `Status` column: \"Up 2 minutes (healthy)\" ->
+   :healthy, \"(unhealthy)\" -> :unhealthy, \"(health: starting)\" -> :starting,
+   anything else :none (no healthcheck)."
+  [status]
+  (let [s (str status)]
+    (cond (str/includes? s "(unhealthy)") :unhealthy
+          (str/includes? s "(healthy)") :healthy
+          (str/includes? s "health: starting") :starting
+          :else :none)))
+
+(defn labelled-containers
+  "Rows of `labelled-containers-argv` output: {:name :project :service
+   :labels :state :health}, sorted by name."
+  [s]
+  (vec (sort-by :name
+                (for [row (parse-json-rows s)
+                      :let [labels (parse-labels (get row "Labels"))]]
+                  {:name (get row "Names")
+                   :project (get labels "com.docker.compose.project")
+                   :service (get labels "com.docker.compose.service")
+                   :labels labels
+                   :state (get row "State")
+                   :health (health-of (get row "Status"))}))))
+
+(defn labelled-networks
+  "Rows of `labelled-networks-argv` output: {:name :labels}, sorted by name."
+  [s]
+  (vec (sort-by :name
+                (for [row (parse-json-rows s)]
+                  {:name (get row "Name") :labels (parse-labels (get row "Labels"))}))))
+
+;; ---------------------------------------------------------------------------
 ;; boundary
 
 (defn- run
@@ -392,13 +567,113 @@
         (r/map-ok (run exec nil (stats-argv (keys names)) timeout-ms)
                   #(service-cpu names %))))))
 
+(defn- write-override!
+  "Result<path-or-nil>: the override of `spec` written under `dir`, nil when
+   `spec` needs none. Holds no value, only names (see `override-doc`)."
+  [dir spec]
+  (if (override? spec)
+    (r/try-effect* :compose/override-unwritable
+      (let [path (override-path dir (:project spec))
+            f (io/file path)]
+        (io/make-parents f)
+        (spit f (override-json spec))
+        path))
+    (r/ok nil)))
+
+(defn- run-argv
+  "Result<stdout> of a docker call addressed by argv alone."
+  [exec argv timeout-ms]
+  (run exec nil argv timeout-ms nil identity))
+
+(defn- stack-up!
+  [{:keys [exec resolver up-timeout-ms override-dir]} spec]
+  (if (empty? (:services spec))
+    (r/ok {:out "" :skipped :no-services})
+    (r/let-ok [override (write-override! override-dir spec)
+               resolved (secrets/resolve-env resolver (:env spec))]
+      (let [declared (:env spec)
+            argv (up-project-argv spec override)]
+        (r/map-ok (run exec {:profile/dir (:dir spec)} argv up-timeout-ms resolved
+                       #(env/scrub declared resolved %))
+                  (fn [out] {:out (clip out) :override override}))))))
+
+(defn- stack-down!
+  [{:keys [exec timeout-ms override-dir]} spec]
+  (if (and (not (:all? spec)) (empty? (:services spec)))
+    (r/ok {:out "" :skipped :no-services})
+    (let [override (let [p (override-path override-dir (:project spec))]
+                     (when (.exists (io/file p)) p))]
+      (r/map-ok (run exec {:profile/dir (:dir spec)} (down-project-argv spec override) timeout-ms
+                     (env/rendered (:env spec)) identity)
+                (fn [out] {:out (clip out)})))))
+
+(defn- connect-one
+  "Result<name>: `container` connected to `network`; already attached is ok."
+  [exec timeout-ms network container aliases]
+  (let [argv (network-connect-argv network container aliases)]
+    (r/bind (exec argv {:timeout-ms timeout-ms})
+            (fn [{:keys [exit stderr]}]
+              (if (or (zero? exit) (already-attached? stderr))
+                (r/ok container)
+                (r/err :compose/command-failed {:argv argv :exit exit :stderr (clip stderr)}))))))
+
+(defn- results
+  "Result<[v]> of a seq of Results, the first error winning."
+  [rs]
+  (reduce (fn [acc x] (if (r/err? x) (reduced x) (r/map-ok acc #(conj % (:ok x)))))
+          (r/ok [])
+          rs))
+
+(extend-type CliEngine
+  port/IStackEngine
+  (-network-create! [{:keys [exec timeout-ms]} network labels]
+    (r/let-ok [present (r/map-ok (run-argv exec (network-ls-argv network) timeout-ms) lines)]
+      (if (some #{network} present)
+        (r/ok {:network network :created? false})
+        (r/map-ok (run-argv exec (network-create-argv network labels) timeout-ms)
+                  (fn [_] {:network network :created? true})))))
+  (-network-rm! [{:keys [exec timeout-ms]} network]
+    (r/let-ok [present (r/map-ok (run-argv exec (network-ls-argv network) timeout-ms) lines)]
+      (if-not (some #{network} present)
+        (r/ok {:network network :removed? false :disconnected []})
+        (r/let-ok [attached (r/map-ok (run-argv exec (network-containers-argv network) timeout-ms) lines)
+                   gone (results (for [c attached]
+                                   (r/map-ok (run-argv exec (network-disconnect-argv network c) timeout-ms)
+                                             (constantly c))))
+                   _ (run-argv exec (network-rm-argv network) timeout-ms)]
+          (r/ok {:network network :removed? true :disconnected gone})))))
+  (-network-connect! [{:keys [exec timeout-ms]} network {:keys [project service]} aliases]
+    (r/let-ok [names (r/map-ok (run-argv exec (service-containers-argv project service) timeout-ms) lines)]
+      (if (empty? names)
+        (r/err :compose/no-container {:project project :service service :network network})
+        (r/map-ok (results (for [c names] (connect-one exec timeout-ms network c aliases)))
+                  (fn [cs] {:network network :containers cs})))))
+  (-up-project! [e spec] (stack-up! e spec))
+  (-down-project! [e spec] (stack-down! e spec))
+  (-running-labelled [{:keys [exec timeout-ms]} labels]
+    (parsed (run-argv exec (labelled-containers-argv labels) timeout-ms)
+            :compose/unparseable labelled-containers))
+  (-networks-labelled [{:keys [exec timeout-ms]} labels]
+    (parsed (run-argv exec (labelled-networks-argv labels) timeout-ms)
+            :compose/unparseable labelled-networks)))
+
+(defn stack-dir
+  "Where stack overrides are written: `stacks/` beside the state file, else
+   under the temp dir."
+  [opts]
+  (if-let [sf (:compose/state-file opts)]
+    (str (or (.getParent (io/file sf)) ".") "/stacks")
+    (str (System/getProperty "java.io.tmpdir") "/hive-compose-stacks")))
+
 (defn make-engine
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),
    :compose/resolver ({scheme ISecretBackend}, default the `pass` one over
-   that exec), :compose/timeout-ms, :compose/up-timeout-ms."
+   that exec), :compose/timeout-ms, :compose/up-timeout-ms,
+   :compose/stack-dir (where stack overrides go, default `stack-dir`)."
   [opts]
   (let [exec (or (:exec opts) shell/exec!)]
-    (->CliEngine exec
-                 (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
-                 (or (:compose/timeout-ms opts) 60000)
-                 (or (:compose/up-timeout-ms opts) 600000))))
+    (map->CliEngine {:exec exec
+                     :resolver (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
+                     :timeout-ms (or (:compose/timeout-ms opts) 60000)
+                     :up-timeout-ms (or (:compose/up-timeout-ms opts) 600000)
+                     :override-dir (or (:compose/stack-dir opts) (stack-dir opts))})))
