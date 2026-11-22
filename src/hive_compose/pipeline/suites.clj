@@ -227,16 +227,23 @@
   (let [root (str (.getCanonicalPath (io/file (state-dir ctx))) "/")]
     (str/starts-with? (str (.getCanonicalPath (io/file dir)) "/") root)))
 
+(def ^:private scrubbed-case-keys
+  "Every text a case carries: a parametrised test id or name (pytest
+   `test_auth[<token>]`) is as likely a carrier as its output."
+  [:case/id :case/name :case/classname :case/message :case/output])
+
 (defn- scrub-report
-  "`report` (a Result<Report>) with every case's message and output passed
-   through `scrub`, the runner's own (closed over the values it resolved)."
+  "`report` (a Result<Report>) with every text of every case and the
+   bail-out reason passed through `scrub`, the runner's own (closed over the
+   values it resolved)."
   [report scrub]
   (if (and scrub (r/ok? report))
-    (update-in report [:ok :report/cases]
-               (fn [cs] (mapv (fn [c] (cond-> c
-                                        (string? (:case/message c)) (update :case/message scrub)
-                                        (string? (:case/output c)) (update :case/output scrub)))
-                              cs)))
+    (-> report
+        (update-in [:ok :report/cases]
+                   (fn [cs] (mapv (fn [c] (reduce (fn [c k] (cond-> c (string? (get c k)) (update k scrub)))
+                                                  c scrubbed-case-keys))
+                                  cs)))
+        (update :ok #(cond-> % (string? (:report/bail-out %)) (update :report/bail-out scrub))))
     report))
 
 (defn- run-cell!

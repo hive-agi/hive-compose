@@ -258,7 +258,7 @@
 
 (deftest secrets-in-reports-never-reach-the-answer-or-the-history
   (let [secret "s3cr3t-tok"
-        raw (str "<testsuite name=\"load\"><testcase classname=\"c\" name=\"t\">"
+        raw (str "<testsuite name=\"load\"><testcase classname=\"c\" name=\"test_auth[" secret "]\">"
                  "<failure message=\"bad token " secret "\"/>"
                  "<system-out>TOKEN=" secret "</system-out></testcase></testsuite>")
         c (ctx {"load" {:exit 1 :raw raw :scrub {secret "pass:ci/token"}}})
