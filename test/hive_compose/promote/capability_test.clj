@@ -53,11 +53,12 @@
                  [">=3.7.1" "3.7.1-rc1" false] [">=3.7.1-rc1" "3.7.1-rc2" true] [">=3.7.1-rc.10" "3.7.1-rc.9" false]
                  [">=3.7.1" "3.7.1+build5" true] ["16" "16.2-alpine" true]]))
   (testing "invalid ranges and versions satisfy nothing"
-    (doseq [rng ["" "x" "3 4" "^" ">=" "3.x" "v3" ">= 3.5" "3\t4" "99999999999999999999"]]
+    (doseq [rng ["" "x" "3 4" "^" ">=" "3.x" "v3" ">= 3.5" "3\t4" "99999999999999999999" "3 " ">=3 <4 " " 3"]]
       (is (= :compose/invalid-range (:error (cap/parse-range rng))) (pr-str rng)))
     (is (= :compose/invalid-version (:error (cap/parse-version "latest"))))
     (is (= :compose/invalid-version (:error (cap/parse-version "99999999999999999999"))))
-    (is (false? (cap/version-satisfies? "*" "latest"))))
+    (is (false? (cap/version-satisfies? "*" "latest")))
+    (is (false? (cap/version-satisfies? "^9223372036854775807" "1")) "no overflow at Long/MAX_VALUE"))
   (testing "an unversioned provider satisfies only *"
     (is (true? (cap/version-satisfies? "*" nil)))
     (is (false? (cap/version-satisfies? "3" nil)))))
