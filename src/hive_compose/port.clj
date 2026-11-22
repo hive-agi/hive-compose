@@ -222,7 +222,7 @@
   "Optional runner capability: run a host command to completion (hc-9 data
    commands declared as `:command`), unlike `IProgramRunner/-start!`, which
    detaches a long-lived program."
-  (-run! [r argv opts]
+  (-run-command! [r argv opts]
     "Result<{:exit 0 :out}>: run `argv` with `opts` {:dir path :env {VAR
      EnvValue} :timeout-ms n} and wait for it; secret references in :env are
      read only now. A non-zero exit is :compose/command-failed carrying :exit

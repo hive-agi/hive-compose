@@ -50,7 +50,7 @@
 (deftest host-runner-runs-to-completion-in-dir
   (let [[calls ex] (recording-exec [])
         rn (host/make-runner {:exec ex :compose/resolver resolver :compose/systemd-scope? false})
-        res (port/-run! rn ["./seed.sh"] {:dir "/w/kafka" :env {"T" "p."} :timeout-ms 5000})]
+        res (port/-run-command! rn ["./seed.sh"] {:dir "/w/kafka" :env {"T" "p."} :timeout-ms 5000})]
     (is (r/ok? res))
     (is (= [["./seed.sh"] {:timeout-ms 5000 :dir "/w/kafka" :env {"T" "p."}}] (first @calls)))
     (is (= ["docker" "exec" "c" "ls"] (exec/exec-argv "c" [] ["ls"])))))

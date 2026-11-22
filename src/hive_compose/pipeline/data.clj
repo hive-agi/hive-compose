@@ -69,7 +69,7 @@
                                                      :hint "the engine has no IDataExec (docker exec)"})))
     :host (let [rn (:runner ctx)]
             (if (satisfies? port/ICommandRunner rn)
-              (port/-run! rn (:step/argv step)
+              (port/-run-command! rn (:step/argv step)
                           (cond-> (opts-of step)
                             (provider-dir ctx sp step) (assoc :dir (provider-dir ctx sp step))))
               (r/err :compose/data-runner-unsupported {:step (:step/id step)

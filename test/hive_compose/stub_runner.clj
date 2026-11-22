@@ -64,7 +64,7 @@
 ;; [:run argv opts]; `fail!` :run makes every one fail.
 (extend-type StubRunner
   port/ICommandRunner
-  (-run! [{:keys [world]} argv opts]
+  (-run-command! [{:keys [world]} argv opts]
     (record! world [:run (vec argv) opts])
     (or (fault world :run)
         (r/ok {:exit 0 :out ""}))))

@@ -84,7 +84,7 @@
 
 (extend-type HostRunner
   port/ICommandRunner
-  (-run! [{:keys [exec resolver]} argv opts]
+  (-run-command! [{:keys [exec resolver]} argv opts]
     (run-with-env exec resolver (vec argv) (:env opts)
                   (cond-> {:timeout-ms (or (:timeout-ms opts) 600000)}
                     (:dir opts) (assoc :dir (:dir opts))))))
