@@ -32,6 +32,6 @@
                        cider/cider-nrepl {:mvn/version "0.62.2"}}
           :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
 
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.1"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.3"}}
           :jvm-opts ["-Xmx1g"]
           :ns-default hive-build.api}}}
