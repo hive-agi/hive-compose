@@ -205,12 +205,15 @@
    `kafka:9092` stays right for shared and private instances alike.
    `:tenancy` names the env var a consumer's namespace prefix (topics,
    schemas, buckets) is passed in, so consumers of a shared instance do not
-   cross-talk."
+   cross-talk. `:port` is the container port the service answers on; a
+   consumer needing the capability `:via :toxiproxy` needs it (hc-12, the
+   proxy's upstream is `<service>:<port>`)."
   [:map
    [:service [:string {:min 1}]]
    [:version {:optional true} Version]
    [:env {:optional true} Env]
    [:tenancy {:optional true} [:map [:env [:string {:min 1}]]]]
+   [:port {:optional true} [:int {:min 1 :max 65535}]]
    [:description {:optional true} :string]])
 
 (def Need
