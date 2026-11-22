@@ -120,6 +120,25 @@
      `hive-compose.promote.orphan`. An error when the table cannot be read
      (another OS, no /proc), never a throw."))
 
+(defprotocol ITraceQuery
+  "The traces a stack's services exported, read back from the trace store
+   (Tempo, ClickHouse ..), so a failed test can be explained by the spans
+   that carry its test.id. See `hive-compose.promote.trace` for the data."
+  (-find-traces [q query]
+    "Result<[{:trace/id :trace/root-service :trace/root-name :trace/start-ms
+     :trace/duration-ms}]>: the traces with a span matching every entry of
+     `(:attrs query)` ({\"hive.run.id\" \"r1\" \"test.id\" \"t\"}) that started
+     between `:start-ms` and `:end-ms` (epoch ms, both optional), at most
+     `:limit` of them. None found is an empty vector, not an error.")
+  (-trace [q trace-id]
+    "Result<{:trace/id :trace/spans [{:span/id :span/parent-id :span/name
+     :span/service :span/start-ms :span/duration-ms :span/status
+     :span/status-message :span/attrs}]}>: every span of the trace `trace-id`
+     (hex). :span/status is :ok, :error or :unset. A trace the store does not
+     hold is :trace/not-found.")
+  (-health [q]
+    "Result<{:ready? true}>: the trace store answers, or why it does not."))
+
 (defprotocol IContainerOwnership
   "Optional engine capability: which containers the daemon runs and what a
    section's services hold, so a process can be told apart from the
@@ -142,3 +161,66 @@
     "Result<[row]>: every row recorded, in append order, narrowed by `query`
      {:suite s :project p} (a nil or absent key matches any). An absent
      history is []."))
+
+(defprotocol IStackEngine
+  "Optional engine capability: what a stack run needs beyond sections. View
+   networks (one per consumer and run), compose projects brought up with
+   labels and networks a stack adds, and what runs under given labels.
+
+   A ProjectSpec is {:project name :dir path :files [path] :services [svc]
+   :env {VAR EnvValue} :container-env [VAR] :labels {k v} :networks [name]
+   :wait? bool :wait-timeout-s n :all? bool}. `:env` is the environment of
+   the compose process (interpolation; its secret references read only when
+   containers are created); `:container-env` names the variables of `:env`
+   passed into every service of `:services`; `:labels` land on every
+   container of `:services`; with `:networks` those services attach to these
+   external networks instead of the project's default one (so Docker DNS on
+   them is never ambiguous; list every service that must reach another). An engine applies labels, networks and
+   container-env through a generated compose override (compose has no label
+   flag); a spec with none of them runs the project's own files untouched."
+  (-network-create! [e network labels]
+    "Result<{:network :created? bool}>: create bridge network `network` with
+     `labels` ({k v}). Idempotent: an existing network answers :created? false.")
+  (-network-rm! [e network]
+    "Result<{:network :removed? bool :disconnected [container]}>: disconnect
+     every container still attached to `network`, then remove it. An absent
+     network answers :removed? false.")
+  (-network-connect! [e network target aliases]
+    "Result<{:network :containers [name]}>: connect every container of
+     `target` ({:project :service}) to `network` under `aliases`. Idempotent: a
+     container already attached counts as connected.")
+  (-up-project! [e spec]
+    "Result<{:out}>: `compose up -d` (`--wait` when :wait?) of ProjectSpec
+     `spec`. Empty `:services` is a no-op.")
+  (-down-project! [e spec]
+    "Result<{:out}>: remove the containers of `spec`'s `:services`, or with
+     `:all?` the whole compose project (its containers and own networks).
+     Never volumes.")
+  (-running-labelled [e labels]
+    "Result<[{:name :project :service :labels {k v} :state :health}]>: every
+     container, running or not, carrying all `labels` ({k v}). :state is the
+     docker state string (\"running\", \"exited\"), :health one of :healthy
+     :unhealthy :starting :none.")
+  (-networks-labelled [e labels]
+    "Result<[{:name :labels {k v}}]>: every network carrying all `labels`."))
+
+(defprotocol IToxiproxyClient
+  "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is
+   {:name :listen :upstream :enabled :toxics [toxic]}, a toxic {\"name\"
+   \"type\" \"stream\" \"toxicity\" \"attributes\"} as toxiproxy writes it.
+   Every method answers a Result; an unreachable server is an error, never a
+   throw."
+  (-create-proxy! [c proxy]
+    "Result<Proxy>: create `proxy` ({\"name\" \"listen\" \"upstream\"
+     \"enabled\"}). Idempotent: an existing proxy of that name with the same
+     listen and upstream answers itself; a different one is an error.")
+  (-add-toxic! [c proxy-name toxic]
+    "Result<toxic>: add `toxic` to proxy `proxy-name`, replacing a toxic of
+     the same name.")
+  (-remove-toxic! [c proxy-name toxic-name]
+    "Result<{:removed? bool}>: remove toxic `toxic-name`; an absent one
+     answers :removed? false.")
+  (-reset! [c]
+    "Result<{:reset true}>: remove every toxic and enable every proxy.")
+  (-list [c]
+    "Result<{name Proxy}>: every proxy with its toxics."))
