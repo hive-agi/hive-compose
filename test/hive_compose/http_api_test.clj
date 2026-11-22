@@ -46,16 +46,20 @@
         (proto/shutdown! a)
         (.delete (java.io.File. state-file))))))
 
+(def ^:private client (delay (HttpClient/newHttpClient)))
+
 (defn- request
-  [port method path body]
-  (let [b (HttpRequest/newBuilder (URI. (str "http://127.0.0.1:" port path)))
-        rq (.build (if (= "GET" method)
-                     (.GET b)
-                     (.POST b (HttpRequest$BodyPublishers/ofString (or body "")))))
-        rs (.send (HttpClient/newHttpClient) rq (HttpResponse$BodyHandlers/ofString))]
-    {:status (.statusCode rs)
-     :type (first (.allValues (.headers rs) "content-type"))
-     :text (.body rs)}))
+  ([port method path body] (request port method path body {"Content-Type" "application/json"}))
+  ([port method path body headers]
+   (let [b (HttpRequest/newBuilder (URI. (str "http://127.0.0.1:" port path)))
+         _ (doseq [[k v] headers] (.header b k v))
+         rq (.build (if (= "GET" method)
+                      (.GET b)
+                      (.POST b (HttpRequest$BodyPublishers/ofString (or body "")))))
+         rs (.send ^HttpClient @client rq (HttpResponse$BodyHandlers/ofString))]
+     {:status (.statusCode rs)
+      :type (first (.allValues (.headers rs) "content-type"))
+      :text (.body rs)})))
 
 (defn- post [port cmd body]
   (let [res (request port "POST" (str "/v1/" cmd) (json/write-str body))]
@@ -90,6 +94,12 @@
         (is (= 400 (:status (post port "ps" {}))))
         (is (= 404 (:status (post port "ps" {"target" "nope/x"}))))
         (is (= 501 (:status (post port "stack/up" {"stack" "s"})))))
+      (testing "a param of the wrong type is 400, not a throw"
+        (is (= 400 (:status (post port "logs" {"target" "dc/envoy" "tail" "many"})))))
+      (testing "browser traffic is refused over the wire too"
+        (is (= 415 (:status (request port "POST" "/v1/status" "{}" {"Content-Type" "text/plain"}))))
+        (is (= 403 (:status (request port "POST" "/v1/status" "{}"
+                                     {"Content-Type" "application/json" "Origin" "https://evil.example"})))))
       (testing "the two reads"
         (let [h (request port "GET" "/v1/health" nil)]
           (is (= 200 (:status h)))
@@ -103,7 +113,19 @@
       (fn [a port]
         (is (nil? port) "off: nothing is bound")
         (let [res ((:handler (addon/tool a)) {"command" "bogus"})]
+          (is (:isError res))
           (is (= "unknown-command" (get (json/read-str (get-in res [:content 0 :text])) "error"))))))))
+
+(deftest a-bad-api-config-never-fails-the-addon
+  (doseq [bad [{:port 70000} {:port "7781"} {:threads 0} {:threads "4"}]]
+    (is (= :compose/invalid-config (:error (http/start! (merge {:host "127.0.0.1" :port 0 :threads 1} bad)
+                                                        (fn [_] {:status 200 :body ""}))))
+        (pr-str bad)))
+  (with-addon {:enabled? true :port 70000}
+    (fn [a port]
+      (is (nil? port))
+      (is (= :compose/invalid-config (get-in @(:state a) [:api :error])))
+      (is (= :active (:lifecycle @(:state a))) "the addon runs; only the API is down"))))
 
 (deftest shutdown-stops-the-server
   (let [seen (atom nil)]
@@ -113,10 +135,10 @@
 
 (deftest a-non-loopback-host-is-refused
   (is (= :compose/invalid-config
-         (:error (http/start! {:host "8.8.8.8" :port 0} (fn [_ _ _] {:status 200 :body ""})))))
+         (:error (http/start! {:host "8.8.8.8" :port 0 :threads 1} (fn [_] {:status 200 :body ""})))))
   (testing "the addon still starts and status says why the API is not up"
     (with-addon {:enabled? true :host "8.8.8.8"}
       (fn [a port]
         (is (nil? port))
-        (is (= "compose/invalid-config" (get-in @(:state a) [:api :error])))
+        (is (= :compose/invalid-config (get-in @(:state a) [:api :error])))
         (is (r/ok? (addon/dispatch a "status" {})))))))

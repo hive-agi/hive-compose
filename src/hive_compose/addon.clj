@@ -344,13 +344,14 @@
     (when enabled?
       (let [deps {:dispatch (fn [command params] (dispatch a command params))
                   :commands commands
+                  :declared (get-in (tool a) [:inputSchema :properties])
                   :health (fn [] (addon/health a))
                   :spec api/spec-text}
-            res (http/start! acfg #(api/route deps %1 %2 %3))]
+            res (http/start! acfg #(api/route deps %))]
         (if (r/ok? res)
           (swap! (:state a) assoc :api-server (:ok res) :api (select-keys (:ok res) [:host :port :url]))
-          (swap! (:state a) assoc :api {:error (api/category-str (:error res))
-                                        :detail (dissoc res :error)}))))))
+          ;; the keyword: MCP writes it bare, the API qualifies it, as every category
+          (swap! (:state a) assoc :api {:error (:error res) :detail (dissoc res :error)}))))))
 
 (defn- stop-api! [{:keys [state]}]
   (when-let [s (:api-server @state)] (http/stop! s))
@@ -391,8 +392,9 @@
    with until recreated)."
   [{:keys [state seed]}]
   (locking state
-    (let [{:keys [runtime-config declared ctx]} @state
+    (let [{:keys [runtime-config declared ctx] old-cfg :cfg} @state
           {:keys [cfg source]} (merged-config seed runtime-config declared)
+          api-changed? (not= (api/config old-cfg) (api/config cfg))
           old (:settings ctx)]
       (r/let-ok [settings (build-settings cfg)]
         (let [fresh (build-ctx cfg settings {})
@@ -406,6 +408,8 @@
                          :changed diff
                          :sections sections
                          :not-reloaded (cond-> ["env and files of running containers: they apply when the containers are recreated (up after the change, restart recreate=true)"]
+                                         api-changed?
+                                         (conj "the control API (:compose/api): it is rebound at the next initialize!")
                                          (seq (:restart-required diff))
                                          (conj (str "settings applied at the next initialize!: "
                                                     (str/join ", " (map name (:restart-required diff))))))}

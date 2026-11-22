@@ -46,8 +46,10 @@
    :compose/unknown-target 404
    :compose/unknown-project 404
    :compose/no-projects 404
+   :compose/forbidden-origin 403
    :compose/method-not-allowed 405
    :compose/payload-too-large 413
+   :compose/unsupported-media-type 415
    :compose/not-active 409
    :compose/not-claimed 409
    :compose/orphans-hold-resources 409
@@ -130,20 +132,79 @@
 
     :else
     (try (dispatch command params)
-         (catch Throwable t (r/err :compose/dispatch-threw {:command command :message (str t)})))))
+         (catch Throwable t
+           ;; class and message only: an ex-info's data could carry env values
+           (r/err :compose/dispatch-threw {:command command :class (.getName (class t))
+                                           :message (ex-message t)})))))
+
+(defn- type-ok?
+  "Whether JSON value `v` fits JSON Schema type `t` as the tool reads it
+   (booleans also as \"true\"/\"false\", see addon/flag)."
+  [t v]
+  (case t
+    "string" (string? v)
+    "integer" (int? v)
+    "boolean" (or (boolean? v) (contains? #{"true" "false"} (some-> v str str/lower-case)))
+    "object" (map? v)
+    true))
+
+(defn check-params
+  "Result<params>: `params` when every one the tool declares (`declared`, the
+   tool's inputSchema properties, string names to {:type ..}) has that JSON
+   type, else an invalid-param naming the first that does not. Params the
+   tool does not declare pass through, as on MCP."
+  [declared params]
+  (if-let [[k t] (first (for [[k v] (sort-by key params)
+                              :let [t (get-in declared [k :type])]
+                              :when (and t (some? v) (not (type-ok? t v)))]
+                          [k t]))]
+    (r/err :compose/invalid-param {:param k :hint (str "expected " t)})
+    (r/ok params)))
+
+(def ^:private loopback-hosts #{"127.0.0.1" "localhost" "[::1]" "::1"})
+
+(defn- host-part
+  "The host of a Host header or an Origin URL, lower-cased, port dropped."
+  [s]
+  (when s
+    (let [s (str/lower-case (str/replace s #"^[a-z][a-z0-9+.-]*://" ""))
+          s (first (str/split s #"/"))]
+      (if (str/starts-with? s "[")
+        (subs s 0 (inc (or (str/index-of s "]") (dec (count s)))))
+        (first (str/split s #":"))))))
+
+(defn browser-guard
+  "nil when request headers `hs` (lower-cased names) may reach the API, else
+   the refusal. Loopback binding does not stop a web page: it can POST a
+   `text/plain` body without a preflight, and DNS rebinding lets it read the
+   answer. So the Host must be a loopback name, an Origin, when sent, must be
+   one too, and a POST must be `application/json` (which forces a CORS
+   preflight this server never grants)."
+  [method hs]
+  (cond
+    (not (contains? loopback-hosts (host-part (get hs "host"))))
+    (r/err :compose/forbidden-origin {:hint "Host must be 127.0.0.1, localhost or [::1]"})
+
+    (and (contains? hs "origin") (not (contains? loopback-hosts (host-part (get hs "origin")))))
+    (r/err :compose/forbidden-origin {:hint "requests from a web page are refused"})
+
+    (and (= "POST" method)
+         (not (str/starts-with? (str/lower-case (str (get hs "content-type"))) "application/json")))
+    (r/err :compose/unsupported-media-type {:hint "send Content-Type: application/json"})))
 
 (defn spec-text
   "The OpenAPI document served at GET /v1/openapi.yaml, nil when missing."
   []
   (some-> (io/resource "hive_compose/openapi.yaml") slurp))
 
-(defn route
-  "{:status :headers :body} for one request. `deps`: :dispatch and :commands
-   (see `call`), :health (0-arity, the addon health map) and :spec (0-arity,
-   the spec text). `body` is the request text, nil when it was too large."
-  [deps method path body]
-  (let [seg (some->> path (re-matches #"/v1/(.+)") second)]
+(defn- route*
+  [deps {:keys [method path body] hs :headers}]
+  (let [seg (some->> path (re-matches #"/v1/(.+)") second)
+        refused (browser-guard method hs)]
     (cond
+      refused
+      (respond refused)
+
       (nil? body)
       (respond (r/err :compose/payload-too-large {:hint "the body is limited to 1 MiB"}))
 
@@ -162,4 +223,17 @@
       (respond (r/err :compose/method-not-allowed {:method method :allow "POST"}) {"Allow" "POST"})
 
       :else
-      (respond (r/bind (parse-params body) #(call deps seg %))))))
+      (respond (r/bind (r/bind (parse-params body) #(check-params (:declared deps) %))
+                       #(call deps seg %))))))
+
+(defn route
+  "{:status :headers :body} for one request {:method :path :headers :body}
+   (:headers lower-cased names; :body the request text, nil when it was too
+   large). `deps`: :dispatch and :commands (see `call`), :declared (the tool's
+   inputSchema properties, see `check-params`), :health (0-arity, the addon
+   health map) and :spec (0-arity, the spec text). Never throws: a throw is
+   answered as the envelope of compose/internal."
+  [deps req]
+  (try (route* deps req)
+       (catch Throwable t
+         (respond (r/err :compose/internal {:class (.getName (class t)) :message (ex-message t)})))))

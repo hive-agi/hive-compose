@@ -18,7 +18,7 @@ servers:
 - url: http://127.0.0.1:{port}
   variables:
     port:
-      default: '7781'
+      default: '0'
       description: :compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)
 tags:
 - name: sections
@@ -30,6 +30,10 @@ tags:
 - name: meta
   description: health and this document
 security: []
+x-trust-model: 'No authentication. The server binds a loopback address only and refuses browser traffic (Host must
+  be a loopback name, an Origin header must be loopback, POST must be application/json so a cross-site request needs
+  a preflight that is never granted). Every local process is trusted as the operator: `agent`/`agent_id` are taken
+  as sent, so any local caller can claim or release for any agent.'
 paths:
   /v1/help:
     post:
@@ -65,8 +69,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '503':
-          $ref: '#/components/responses/Unavailable'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
   /v1/status:
     post:
       operationId: status
@@ -101,6 +109,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/targets:
@@ -137,6 +151,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '502':
@@ -175,6 +195,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/up:
@@ -215,6 +241,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -257,6 +289,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -301,6 +339,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -343,6 +387,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -386,6 +436,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -428,6 +484,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -468,6 +530,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -508,6 +576,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -550,6 +624,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -594,6 +674,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '404':
@@ -638,6 +724,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/nrepl:
@@ -676,6 +768,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/reap:
@@ -712,6 +810,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/adopt:
@@ -748,6 +852,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/projects:
@@ -784,6 +894,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '502':
@@ -822,6 +938,12 @@ paths:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
         '502':
@@ -2844,7 +2966,9 @@ components:
       additionalProperties: true
       description: The MCP `compose` tool params minus `command` (the op is the path segment / hive_call op). Booleans
         also accept the strings "true"/"false" on the MCP side (addon/flag); HTTP clients should send booleans.
-        Unknown keys are ignored by dispatch.
+        Over MCP unknown keys are ignored; each Req_<command> schema below is closed (additionalProperties false)
+        so a client learns of a typo, while the server still ignores what it does not read. A declared param of
+        the wrong JSON type is answered 400 compose/invalid-param.
       x-source: generated
       x-from: hive-compose.addon/tool :inputSchema @ origin/staging
     Ok:
@@ -2921,6 +3045,11 @@ components:
       - compose/unknown-route
       - compose/method-not-allowed
       - compose/payload-too-large
+      - compose/forbidden-origin
+      - compose/unsupported-media-type
+      - compose/internal
+      - compose/proc-unreadable
+      - compose/api-bind-failed
       - secrets/unknown-backend
     ProgramReport:
       type: object
@@ -4658,6 +4787,24 @@ components:
     EngineFailed:
       description: compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved,
         secrets/unknown-backend
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: 'compose/forbidden-origin: Host not a loopback name, or an Origin header from a web page'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnsupportedMediaType:
+      description: 'compose/unsupported-media-type: a POST without Content-Type application/json'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Internal:
+      description: compose/dispatch-threw, compose/internal and any unmapped category (class and message only)
       content:
         application/json:
           schema:

@@ -45,7 +45,15 @@
   (let [enum (set (get-in @spec ["components" "schemas" "ErrorCategory" "enum"]))]
     (doseq [c (keys api/status-by-category)]
       (is (contains? enum (api/category-str c)) (str c)))
-    (is (every? #(re-find #"^[a-z-]+/[a-z-]+$" %) enum) "every category is qualified")))
+    (is (every? #(re-find #"^[a-z-]+/[a-z-]+$" %) enum) "every category is qualified")
+    (testing "every category the source can answer (r/err :ns/name ..) is in the enum"
+      (let [in-src (into (sorted-set)
+                         (comp (filter #(re-find #"\.clj$" (str %)))
+                               (mapcat #(re-seq #"\(r/err :([a-z-]+/[a-z-]+)" (slurp %)))
+                               (map second))
+                         (file-seq (io/file "src")))]
+        (is (seq in-src))
+        (is (= #{} (apply disj in-src enum)) "missing from ErrorCategory")))))
 
 (deftest request-params-are-the-tools-params
   (let [tool-params (set (keys (get-in (addon/tool (addon/make-addon)) [:inputSchema :properties])))]

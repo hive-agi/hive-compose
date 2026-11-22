@@ -65,7 +65,8 @@ components["ComposeRequest"] = {
     "type": "object", "properties": req_props, "additionalProperties": True,
     "description": "The MCP `compose` tool params minus `command` (the op is the path segment / hive_call op). "
                    "Booleans also accept the strings \"true\"/\"false\" on the MCP side (addon/flag); HTTP clients should send booleans. "
-                   "Unknown keys are ignored by dispatch.",
+                   "Over MCP unknown keys are ignored; each Req_<command> schema below is closed (additionalProperties false) so a client learns of a typo, "
+                   "while the server still ignores what it does not read. A declared param of the wrong JSON type is answered 400 compose/invalid-param.",
     "x-source": "generated", "x-from": "hive-compose.addon/tool :inputSchema @ origin/staging"}
 
 SUBJECT = ["up", "switch", "down", "stop", "restart", "ps", "logs", "claim", "release"]
@@ -104,7 +105,8 @@ components["ErrorCategory"] = {"type": "string", "x-source": "hand", "x-from": "
            "compose/held-by-another-section", "compose/orphan-check-failed", "compose/ownership-check-failed",
            "compose/release-threw", "compose/notice-failed", "compose/swarm-failed", "compose/notice-dropped",
            "compose/dispatch-threw", "compose/not-implemented", "compose/unknown-route", "compose/method-not-allowed",
-           "compose/payload-too-large", "secrets/unknown-backend"]}
+           "compose/payload-too-large", "compose/forbidden-origin", "compose/unsupported-media-type",
+           "compose/internal", "compose/proc-unreadable", "compose/api-bind-failed", "secrets/unknown-backend"]}
 
 # ---------------------------------------------------------------- hand-written response rows
 components["ProgramReport"] = obj({"id": S, "pid": I, "log": S, "dir": S, "kind": S, "started-at": I, "nrepl-port": I,
@@ -203,6 +205,9 @@ responses = {
   "NotFound": {"description": "compose/unknown-command, compose/unknown-profile, compose/unknown-target, compose/unknown-project, compose/no-projects", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Conflict": {"description": "compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "EngineFailed": {"description": "compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved, secrets/unknown-backend", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "Forbidden": {"description": "compose/forbidden-origin: Host not a loopback name, or an Origin header from a web page", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "UnsupportedMediaType": {"description": "compose/unsupported-media-type: a POST without Content-Type application/json", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "Internal": {"description": "compose/dispatch-threw, compose/internal and any unmapped category (class and message only)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Unavailable": {"description": "compose/not-initialized (addon not active), compose/invalid-config", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
 }
 
@@ -217,7 +222,11 @@ for cmd in tool["commands"]:
           "requestBody": {"required": False, "content": {"application/json": {"schema": ref(rname)}}},
           "responses": {"200": {"description": "Result ok", "content": {"application/json": {"schema": ok_of(ref(RESULT[cmd]))}}},
                         "400": {"$ref": "#/components/responses/BadRequest"},
-                        "503": {"$ref": "#/components/responses/Unavailable"}}}
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "415": {"$ref": "#/components/responses/UnsupportedMediaType"},
+                        "500": {"$ref": "#/components/responses/Internal"}}}
+    if cmd != "help":  # help answers before init
+        op["responses"]["503"] = {"$ref": "#/components/responses/Unavailable"}
     if cmd in SUBJECT or cmd in ("touch",):
         op["responses"]["404"] = {"$ref": "#/components/responses/NotFound"}
     if cmd in ("up", "switch", "restart", "touch", "release", "claim"):
@@ -295,11 +304,14 @@ doc = {
              "compose/not-implemented. Off by default: config :compose/api {:enabled? true :port 0 :host \"127.0.0.1\"}; "
              "`status` answers the bound address under `api`."},
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base",
-  "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "7781", "description": ":compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)"}}}],
+  "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "0", "description": ":compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)"}}}],
   "tags": [{"name": "sections", "description": "existing section commands"}, {"name": "swarm", "description": "existing claim / nREPL routing commands"},
            {"name": "stacks (planned)", "description": "hc-4/6/8/10/12/13 placeholders"},
            {"name": "meta", "description": "health and this document"}],
   "security": [],
+  "x-trust-model": "No authentication. The server binds a loopback address only and refuses browser traffic (Host must be a loopback name, "
+                   "an Origin header must be loopback, POST must be application/json so a cross-site request needs a preflight that is never granted). "
+                   "Every local process is trusted as the operator: `agent`/`agent_id` are taken as sent, so any local caller can claim or release for any agent.",
   "paths": paths,
   "components": {"schemas": components, "responses": responses},
 }
