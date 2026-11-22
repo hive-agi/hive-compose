@@ -208,15 +208,17 @@
       (doseq [nl ["\u2028" "\u2029" "\u0085"]
               s [(str "ok 1 -" pad nl "x") (str "not ok" pad nl "x") (str "ok 1 - a #" pad nl "x")
                  (str "Bail out!" pad nl "x") (str "1..3" pad nl "x")]]
-        (is (not= ::timeout (bounded #(report/parse-tap s))) (pr-str (subs s 0 10) nl))
-        (is (not= ::timeout (bounded #(report/detect-format s))) (pr-str (subs s 0 10) nl)))
+        ;; 50 lines: milliseconds when linear, far past the bound when not
+        (let [s (str/join "\n" (repeat 50 s))]
+          (is (not= ::timeout (bounded #(report/parse-tap s))) (pr-str (subs s 0 10) nl))
+          (is (not= ::timeout (bounded #(report/detect-format (str "zz\n" s)))) (pr-str (subs s 0 10) nl))))
       (is (= :tap (bounded #(report/detect-format (str "ok 1 -" pad "\u2028x")))))
       (is (= [["\u0085x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u0085x"))))
           "U+0085 is neither \\s nor whitespace to str/trim: the description keeps it")
       (is (= [["x" :failed]] (bounded #(tap-cases (str "not ok 1 -" pad "\u2028x"))))
           "U+2028 is whitespace to str/trim, which drops it from the description"))
     (testing "YAML: blank lines before a duration"
-      (let [yaml (str "ok 1 - a\n  ---\n" (apply str (repeat 20000 "  \n")) "  x: 1\n  ...\n1..1")]
+      (let [yaml (str "ok 1 - a\n  ---\n" (apply str (repeat 200000 "  \n")) "  x: 1\n  ...\n1..1")]
         (is (r/ok? (bounded #(report/parse-tap yaml))))))
     (testing "a JUnit time that is a long run of digits"
       (is (nil? (bounded #(report/parse-seconds (str (apply str (repeat 200000 "1")) "x"))))))
@@ -255,6 +257,16 @@
     (is (= {"p/q/a" :passed "p/q/test 2" :error "p/b" :passed}
            (by-status (:ok (report/parse-tap (str "        ok 1 - a\n        1..2\n    not ok 1 - q\n"
                                                   "    ok 2 - b\n    1..2\nnot ok 1 - p\n1..1")))))))
+  (testing "a subtest split by a blank line or stray output is one subtest: no false error"
+    (is (= {"p/a" :passed "p/b" :passed}
+           (by-status (:ok (report/parse-tap "    1..2\n\n    ok 1 - a\n    ok 2 - b\nok 1 - p\n1..1")))))
+    (is (= {"p/a" :passed "p/b" :passed}
+           (by-status (:ok (report/parse-tap "    ok 1 - a\nstray\n    ok 2 - b\n    1..2\nok 1 - p\n1..1")))))
+    (is (= {"p/a" :passed "p/test 2" :error}
+           (by-status (:ok (report/parse-tap "    1..2\n\n    ok 1 - a\nok 1 - p\n1..1"))))
+        "and its shortfall still counts, once"))
+  (testing "a subtest no point closes adds no shortfall: the parent's plan counts it"
+    (is (= [["a" :passed] ["test 2" :error]] (tap-cases "1..2\n    1..3\n    ok 1 - a\n"))))
   (testing "a subtest plan promising far more than ran reads as broken"
     (is (= :tap/implausible-plan
            (:reason (bounded #(report/parse-tap "    1..99999999\n    ok 1 - c\nok 1 - p\n1..1")))))

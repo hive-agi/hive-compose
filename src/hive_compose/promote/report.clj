@@ -328,51 +328,56 @@
 
 (declare fold-level)
 
-(defn- subtests
-  "Points of the deeper tokens `tokens`, folded at `d`, and an :error point
-   per test the subtest's own plan promised that never ran, as at the top
-   level, so a subtest cut short fails its parent. `budget` (a volatile) is
-   how many such points every subtest of the parse may still add together; a
+(defn- with-shortfall
+  "Subtest points `pending` and an :error point per test the subtest's plan
+   `plan` promised that is not among them, as at the top level, so a subtest
+   cut short fails the point that closes it. `budget` (a volatile) is how
+   many such points every subtest of the parse may still add together; a
    subtest plan overdrawing it reads as a broken plan line and throws
    ::implausible-plan, which `parse-tap` answers as `:tap/implausible-plan`.
    So the subtests of one parse add at most `max-missing` points between
    them, however many there are and however deep."
-  [tokens d budget]
-  (let [{:keys [points plan]} (fold-level tokens d budget)
-        short (vec (take (inc @budget) (missing plan points nil)))]
+  [pending plan budget]
+  (let [short (vec (take (inc @budget) (missing plan pending nil)))]
     (when (> (count short) @budget)
       (throw (ex-info "subtest plan implausible" {::implausible-plan plan})))
     (vswap! budget - (count short))
-    (into points (map (fn [c] {:num nil :case c :children []})) short)))
+    (into pending (map (fn [c] {:num nil :case c :children []})) short)))
 
 (defn- fold-level
   "Fold the tokens of one level, `d` deep, into {:points [..] :plan n}.
    Deeper tokens are a subtest; TAP 14 prints it before the point that closes
-   it, which takes the subtest's points as :children. `budget` bounds the
-   :error points the subtests' plans may add (see `subtests`)."
+   it, which takes the subtest's points as :children, plus its plan's
+   shortfall (see `with-shortfall`). A subtest may come in several runs of
+   deeper tokens (a blank line or stray output at this depth splits it): the
+   shortfall is reckoned once, when the closing point takes them all, against
+   the last plan any of them carried. A subtest no point closes (a truncated
+   or bailed run) adds no shortfall: its parent's own plan already counts the
+   parent as missing."
   [tokens d budget]
-  (loop [tokens tokens points [] plan nil pending [] n 0 open? false]
+  (loop [tokens tokens points [] plan nil pending [] sub-plan nil n 0 open? false]
     (if-let [{:keys [kind] :as t} (first tokens)]
       (cond
         (and (> (:depth t) d) (not (#{:yaml :comment} kind)))
         (let [[deeper more] (split-with #(> (:depth %) d) tokens)
-              deeper (vec deeper)]
-          (recur more points plan (into pending (subtests deeper (apply min (map :depth deeper)) budget)) n false))
+              deeper (vec deeper)
+              sub (fold-level deeper (apply min (map :depth deeper)) budget)]
+          (recur more points plan (into pending (:points sub)) (or (:plan sub) sub-plan) n false))
 
         (= :test kind)
-        (let [p (assoc (test-point (:body t) (inc n)) :children pending)]
-          (recur (rest tokens) (conj points p) plan [] (:num p) true))
+        (let [p (assoc (test-point (:body t) (inc n)) :children (with-shortfall pending sub-plan budget))]
+          (recur (rest tokens) (conj points p) plan [] nil (:num p) true))
 
-        (= :plan kind) (recur (rest tokens) points (:n t) pending n false)
+        (= :plan kind) (recur (rest tokens) points (:n t) pending sub-plan n false)
 
         (and open? (= :yaml kind))
-        (recur (rest tokens) (attach points t) plan pending n true)
+        (recur (rest tokens) (attach points t) plan pending sub-plan n true)
 
         (and open? (= :comment kind) (<= (:depth t) d)
              (not (re-find #"(?i)^#\s*subtest\b" (:text t))))
-        (recur (rest tokens) (attach points t) plan pending n true)
+        (recur (rest tokens) (attach points t) plan pending sub-plan n true)
 
-        :else (recur (rest tokens) points plan pending n false))
+        :else (recur (rest tokens) points plan pending sub-plan n false))
       {:points (into points pending) :plan plan})))
 
 (defn- prefix-id [parent child]
