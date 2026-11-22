@@ -140,7 +140,7 @@
         (.exitValue ^Process p))))
   (-log-tail [_ log n] (tail-lines log n)))
 
-(defn- systemd-user-scope?
+(defn systemd-user-scope?
   "True when a systemd user manager answers here: `systemd-run` is on PATH and
    the manager's private socket exists under XDG_RUNTIME_DIR."
   []
