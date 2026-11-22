@@ -112,7 +112,8 @@
             (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
-    (r/ok {:out "log"}))
+    (or (fault world :logs)
+        (r/ok {:out (get-in @world [:logs (profile/project p)] "log")})))
 
   port/IDependencyGraph
   ;; As `compose config --format json [targets]`: the targets' closure when
@@ -348,8 +349,41 @@
   [e project g]
   (swap! (:world e) assoc-in [:graphs project] g))
 
+(defn logs!
+  "Make `-logs` of compose project `project` answer `text` (as `compose logs` prints it)."
+  [e project text]
+  (swap! (:world e) assoc-in [:logs project] text))
+
 (defn holds!
   "Make the services of `project` mount volumes and publish ports `m`
    ({service {:volumes #{name} :ports #{port}}})."
   [e project m]
   (swap! (:world e) assoc-in [:holds project] m))
+
+;; ---------------------------------------------------------------------------
+;; IDataExec: `docker exec` into a running container of the world. Every call
+;; is recorded as [:exec project service argv env]; `exec-fails!` makes an
+;; argv holding a given text exit non-zero with a stderr.
+
+(extend-type StubEngine
+  port/IDataExec
+  (-exec! [{:keys [world]} {:keys [project service]} argv opts]
+    (record! world [:exec project service (vec argv) (:env opts {})])
+    (or (fault world :exec)
+        (let [c (get-in @world [:containers (container-name project service)])]
+          (if-not (= "running" (:state c))
+            (r/err :compose/no-container {:project project :service service})
+            (if-let [[_ stderr] (first (filter (fn [[text _]] (some #(.contains ^String % text) argv))
+                                               (:exec-fails @world)))]
+              (r/err :compose/command-failed {:exit 1 :stderr stderr})
+              (r/ok {:exit 0 :out ""})))))))
+
+(defn exec-fails!
+  "Make every exec whose argv holds `text` in an argument fail with `stderr`."
+  [e text stderr]
+  (swap! (:world e) update :exec-fails (fnil assoc {}) text stderr))
+
+(defn execs
+  "[[:exec project service argv env] ...] recorded so far."
+  [e]
+  (filterv #(= :exec (first %)) (calls e)))
