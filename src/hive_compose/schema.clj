@@ -470,6 +470,7 @@
     [:suite/reports-dir {:optional true} [:string {:min 1}]]
     [:suite/report-format {:optional true} ReportFormat]
     [:suite/timeout-ms {:optional true} [:int {:min 1000}]]
+    [:suite/resources {:optional true} Resources]
     [:suite/description {:optional true} :string]]
    [:fn {:error/message "a suite needs :suite/image or :suite/command"}
     (fn [s] (or (contains? s :suite/image) (contains? s :suite/command)))]])

@@ -210,7 +210,8 @@
                 (contains? s :suite/id) (update :suite/id id-name)
                 (string? (:suite/dir s)) (update :suite/dir #(expand-home home %))
                 (map? (:suite/needs s)) (update :suite/needs normalize-needs)
-                (string? (:suite/report-format s)) (update :suite/report-format keyword)))
+                (string? (:suite/report-format s)) (update :suite/report-format keyword)
+                (contains? s :suite/resources) (update :suite/resources normalize-resources)))
             suites))
 
 

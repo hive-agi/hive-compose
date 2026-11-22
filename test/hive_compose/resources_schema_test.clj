@@ -26,7 +26,14 @@
   (is (m/validate schema/Need {:resources :unbounded}))
   (is (m/validate schema/Stack {:stack/id "s" :stack/consumers ["a"]
                                 :stack/resources {"kafka" {:mem "2g"}}
-                                :stack/budget "6g" :stack/priority -1})))
+                                :stack/budget "6g" :stack/priority -1}))
+  (is (m/validate schema/Suite {:suite/id "e2e" :suite/command "make e2e" :suite/resources {:mem "1g" :cpus 1}}))
+  (is (m/validate schema/Suite {:suite/id "e2e" :suite/command "make e2e" :suite/resources :unbounded}))
+  (is (not (m/validate schema/Suite {:suite/id "e2e" :suite/command "x" :suite/resources {:mem "lots"}})))
+  (is (= :unbounded (get-in (:ok (config/settings {:compose/suites [{:suite/id "e2e" :suite/command "x"
+                                                                       :suite/resources "unbounded"}]}
+                                                  nil "/home/u"))
+                            [:compose/suites "e2e" :suite/resources]))))
 
 (deftest config-normalizes-and-stays-additive
   (testing "a config without the new keys yields no new keys"
