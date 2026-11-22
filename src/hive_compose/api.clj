@@ -1,0 +1,165 @@
+(ns hive-compose.api
+  "The control API's request/response layer (card hc-14). Pure apart from the
+   dispatch fn it is handed: (method, path, body) -> {:status :headers :body}.
+
+   POST /v1/{command} with a JSON object body = the `compose` MCP tool's params
+   minus `command`, run through the SAME dispatch the tool runs
+   (`hive-compose.addon/dispatch`). The answer is the hive-cabi/v1 envelope,
+   {ok:true,value} | {ok:false,error,..rest of the Result error map}, with the
+   error category QUALIFIED (\"compose/held-by-another-section\"); the MCP tool
+   text keeps today's bare name. GET /v1/health and GET /v1/openapi.yaml (the
+   spec in resources/hive_compose/openapi.yaml) are the two reads.
+
+   HTTP status per category (`status-by-category`), 200 for ok. The body is
+   always the envelope, so a client may ignore the code, as hive_call does."
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.walk :as walk]
+            [hive-dsl.result :as r]))
+
+;; SPDX-License-Identifier: MIT
+
+(def defaults
+  "`:compose/api` config, off by default. :port 0 binds an ephemeral port
+   (`status` answers the bound one); :host must be a loopback address."
+  {:enabled? false :host "127.0.0.1" :port 0 :threads 4})
+
+(defn config
+  "The API config of addon config `cfg`: `defaults` under `:compose/api`."
+  [cfg]
+  (merge defaults (when (map? (:compose/api cfg)) (:compose/api cfg))))
+
+(def planned
+  "Path segment -> hive_call op of the paths the spec marks x-status planned
+   (plan 20261122140443-09c5c225). Answered 501 until they are implemented."
+  {"stack/plan" "stack.plan" "stack/up" "stack.up" "stack/down" "stack.down"
+   "stack/status" "stack.status" "test" "test" "why" "why" "flaky" "flaky" "faults" "faults"})
+
+(def status-by-category
+  "HTTP status of a Result error category. Any other category answers 500."
+  {:compose/missing-param 400
+   :compose/invalid-param 400
+   :compose/unknown-command 404
+   :compose/unknown-route 404
+   :compose/unknown-profile 404
+   :compose/unknown-target 404
+   :compose/unknown-project 404
+   :compose/no-projects 404
+   :compose/method-not-allowed 405
+   :compose/payload-too-large 413
+   :compose/not-active 409
+   :compose/not-claimed 409
+   :compose/orphans-hold-resources 409
+   :compose/held-by-another-section 409
+   :compose/not-implemented 501
+   :compose/command-failed 502
+   :compose/secret-unresolved 502
+   :secrets/unknown-backend 502
+   :compose/not-initialized 503
+   :compose/invalid-config 503})
+
+(defn http-status
+  "200 for an ok Result, else the status of its category (500 when unmapped)."
+  [res]
+  (if (r/ok? res) 200 (get status-by-category (:error res) 500)))
+
+(defn category-str
+  "A category keyword as the API writes it: ns/name, or name when bare."
+  [k]
+  (if (qualified-keyword? k) (str (namespace k) "/" (name k)) (name k)))
+
+(defn qualify-errors
+  "`x` with every keyword under an :error key, at any depth, written as its
+   qualified string, so the wire keeps the category's namespace. Every other
+   key and value is left to the encoder (namespaced keys stay bare, as on the
+   MCP wire)."
+  [x]
+  (letfn [(error-of [m]
+            ;; a sorted map with string keys (status :claims) throws on a keyword lookup
+            (try (get m :error) (catch ClassCastException _ nil)))]
+    (walk/postwalk (fn [f] (if (and (map? f) (keyword? (error-of f))) (assoc f :error (category-str (:error f))) f)) x)))
+
+(defn envelope
+  "The hive-cabi/v1 envelope of Result `res`."
+  [res]
+  (if (r/ok? res)
+    {:ok true :value (qualify-errors (:ok res))}
+    (assoc (qualify-errors res) :ok false)))
+
+(defn encode
+  "JSON text of `x`, slashes unescaped (compose/x, not compose\\/x)."
+  [x]
+  (json/write-str x :escape-slash false))
+
+(defn respond
+  "{:status :headers :body} answering Result `res`."
+  ([res] (respond res {}))
+  ([res headers]
+   {:status (http-status res)
+    :headers (merge {"Content-Type" "application/json; charset=utf-8"} headers)
+    :body (encode (envelope res))}))
+
+(defn parse-params
+  "Result<params>: the request body as the tool's params (string keys; a
+   `command` key is dropped, the path names the command). A blank body is {}.
+   Anything but a JSON object is an invalid-param."
+  [^String body]
+  (if (str/blank? body)
+    (r/ok {})
+    (let [v (try (json/read-str body) (catch Exception _ ::unreadable))]
+      (if (map? v)
+        (r/ok (dissoc v "command"))
+        (r/err :compose/invalid-param {:param "body"
+                                       :hint "the body is a JSON object of the command's params"})))))
+
+(defn call
+  "Result of `command` with `params` through `dispatch` ((command params) ->
+   Result, the MCP tool's contract). A planned op answers not-implemented and a
+   command not in `commands` unknown-command, both before dispatch, so they do
+   not depend on the addon's lifecycle. A throw is answered, never propagated."
+  [{:keys [dispatch commands]} command params]
+  (cond
+    (contains? planned command)
+    (r/err :compose/not-implemented {:op (get planned command)
+                                     :hint "planned: x-status planned in GET /v1/openapi.yaml"})
+
+    (not (some #{command} commands))
+    (r/err :compose/unknown-command {:command command :known (vec commands)
+                                     :hint "POST /v1/help lists what each does"})
+
+    :else
+    (try (dispatch command params)
+         (catch Throwable t (r/err :compose/dispatch-threw {:command command :message (str t)})))))
+
+(defn spec-text
+  "The OpenAPI document served at GET /v1/openapi.yaml, nil when missing."
+  []
+  (some-> (io/resource "hive_compose/openapi.yaml") slurp))
+
+(defn route
+  "{:status :headers :body} for one request. `deps`: :dispatch and :commands
+   (see `call`), :health (0-arity, the addon health map) and :spec (0-arity,
+   the spec text). `body` is the request text, nil when it was too large."
+  [deps method path body]
+  (let [seg (some->> path (re-matches #"/v1/(.+)") second)]
+    (cond
+      (nil? body)
+      (respond (r/err :compose/payload-too-large {:hint "the body is limited to 1 MiB"}))
+
+      (and (= "GET" method) (= "/v1/health" path))
+      (respond (r/ok ((:health deps))))
+
+      (and (= "GET" method) (= "/v1/openapi.yaml" path))
+      (if-let [s ((:spec deps))]
+        {:status 200 :headers {"Content-Type" "application/yaml; charset=utf-8"} :body s}
+        (respond (r/err :compose/unknown-route {:path path :hint "the spec resource is missing"})))
+
+      (nil? seg)
+      (respond (r/err :compose/unknown-route {:path path :hint "POST /v1/{command}, GET /v1/health, GET /v1/openapi.yaml"}))
+
+      (not= "POST" method)
+      (respond (r/err :compose/method-not-allowed {:method method :allow "POST"}) {"Allow" "POST"})
+
+      :else
+      (respond (r/bind (parse-params body) #(call deps seg %))))))

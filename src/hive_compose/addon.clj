@@ -33,7 +33,9 @@
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
-            [hive-addon.host :as addon-host])
+            [hive-addon.host :as addon-host]
+            [hive-compose.api :as api]
+            [hive-compose.adapter.http :as http])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -231,7 +233,11 @@
       (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
     res))
 
-(defn- dispatch [a command params]
+(defn dispatch
+  "Result of `command` with `params` (the tool's params, string or keyword
+   keys) on addon `a`: the one dispatch both transports run, the MCP `compose`
+   tool (`tool`) and the control API (`hive-compose.api`)."
+  [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
         tgt (some-> (param params "target") str)
@@ -254,7 +260,8 @@
                                                   :errors (:errors @(:state a))})
       :else
       (case command
-        "status" (r/ok (assoc (ops/status ctx) :last-pass (:last-pass @(:state a))))
+        "status" (r/ok (cond-> (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+                         (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
@@ -328,6 +335,27 @@
 ;; ---------------------------------------------------------------------------
 ;; lifecycle
 
+(defn- start-api!
+  "Serve the control API when `:compose/api` enables it. The bound address
+   (or why it failed: the addon still starts) lands in the state's :api, which
+   `status` answers; the server itself under :api-server."
+  [a cfg]
+  (let [{:keys [enabled?] :as acfg} (api/config cfg)]
+    (when enabled?
+      (let [deps {:dispatch (fn [command params] (dispatch a command params))
+                  :commands commands
+                  :health (fn [] (addon/health a))
+                  :spec api/spec-text}
+            res (http/start! acfg #(api/route deps %1 %2 %3))]
+        (if (r/ok? res)
+          (swap! (:state a) assoc :api-server (:ok res) :api (select-keys (:ok res) [:host :port :url]))
+          (swap! (:state a) assoc :api {:error (api/category-str (:error res))
+                                        :detail (dissoc res :error)}))))))
+
+(defn- stop-api! [{:keys [state]}]
+  (when-let [s (:api-server @state)] (http/stop! s))
+  (swap! state dissoc :api-server :api))
+
 (defn- start! [a cfg settings]
   (let [{:keys [state]} a
         persisted (files/load-state (:compose/state-file settings))
@@ -344,10 +372,12 @@
                              (long (or (:compose/initial-delay-ms cfg) 5000))
                              (long (* 1000 tick))
                              TimeUnit/MILLISECONDS)
+    (start-api! a cfg)
     {:success? true :errors []
-     :metadata {:profiles (count (:compose/profiles settings))
-                :active (count (:active @(:state ctx)))
-                :tick-seconds tick}}))
+     :metadata (cond-> {:profiles (count (:compose/profiles settings))
+                        :active (count (:active @(:state ctx)))
+                        :tick-seconds tick}
+                 (:api @state) (assoc :api (:api @state)))}))
 
 (defn reload!
   "Re-read the addon config block declared now and the profiles file into the
@@ -398,8 +428,9 @@
                 (swap! state assoc :lifecycle :error :errors [(ex-message e)])
                 {:success? false :errors [(ex-message e)]}))))))))
 
-(defn- shutdown-addon! [{:keys [state]}]
+(defn- shutdown-addon! [{:keys [state] :as a}]
   (locking state
+    (stop-api! a)
     (when-let [^ScheduledExecutorService sched (:scheduler @state)]
       (.shutdownNow sched))
     (swap! state #(-> % (dissoc :scheduler :ctx) (assoc :lifecycle :stopped))))
