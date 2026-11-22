@@ -290,7 +290,14 @@
     (let [s (str (apply str (repeat 3000 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1")]
       (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))))
     (is (= 300 (count (tap-cases (str (apply str (repeat 300 "    ok\n")) "ok 1 - " (apply str (repeat 60000 "d")) "\n1..1"))))
-        "18 M id characters are still a report"))
+        "18 M id characters are still a report")
+    (let [s (str (apply str (repeat 3000 "    ok\n")) "not ok 1 - " (apply str (repeat 60000 "d")) "\n1..1")]
+      (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))
+          "under a failing parent too, whose passing subtree is realized to judge it"))
+    (testing "nested: every level's prefixing is charged"
+      (let [d (apply str (repeat 60000 "d"))
+            s (str (apply str (repeat 3000 "        ok\n")) "    ok 1 - " d "\n    1..1\nnot ok 1 - " d "\n1..1")]
+        (is (= :tap/implausible-ids (:reason (bounded #(report/parse-tap s))))))))
   (testing "a split never breaks a subtest, at any depth (review 2, MAJOR 1)"
     (doseq [gap ["" "stray" "# note"]]
       (is (= {"p/a" :passed "p/q/b" :passed "p/q/c" :passed}

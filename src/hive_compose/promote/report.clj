@@ -410,34 +410,35 @@
       {:points (into points (unclosed pending points budget)) :plan plan})))
 
 (def max-id-chars
-  "Characters the case ids of one TAP parse may hold together. A subtest's
-   ids repeat its parent's description, so a long description over many
-   leaves would grow the Report far past its input: past this it reads as
-   a hostile report, `:tap/implausible-ids`."
+  "Characters the prefixed case ids of one TAP parse may take together,
+   every level's prefixing counted. A subtest's ids repeat its parent's
+   description, so a long description over many leaves would grow the
+   Report far past its input: past this it reads as a hostile report,
+   `:tap/implausible-ids`."
   (* 32 1024 1024))
 
-(defn- charge-ids
-  "`cases` as a vector, throwing ::implausible-ids once their ids together
-   pass `max-id-chars`. Realizes them one at a time, so no more than the
-   budget (plus one id, itself bounded by the input) is ever held."
-  [cases]
-  (let [total (volatile! 0)]
-    (mapv (fn [c]
-            (when (> (vswap! total + (count (:case/id c))) max-id-chars)
-              (throw (ex-info "case ids implausible" {::implausible-ids true})))
-            c)
-          cases)))
+(defn- prefix-id
+  "`child` with its id under `parent`'s. Every prefixed id is charged to
+   `budget` (a volatile of characters left) BEFORE it is built, so however
+   the ids are realized, the parse allocates at most `max-id-chars` of
+   them; overdrawing it throws ::implausible-ids."
+  [budget parent child]
+  (let [pid (get-in parent [:case :case/id])
+        cid (get-in child [:case :case/id])]
+    (when (neg? (vswap! budget - (+ (count pid) 1 (count cid))))
+      (throw (ex-info "case ids implausible" {::implausible-ids true})))
+    (update child :case assoc :case/id (str pid "/" cid))))
 
-(defn- prefix-id [parent child]
-  (update child :case assoc :case/id (str (get-in parent [:case :case/id]) "/" (get-in child [:case :case/id]))))
+(defn- bad? [p]
+  (#{:failed :error} (get-in p [:case :case/status])))
 
 (defn- leaves
   "Points standing for cases: a point with subtests stands for its leaves,
-   and for itself too when it failed while none of them did (a hook failing)."
-  [points]
+   and for itself too when it failed while none of them did (a hook failing).
+   `budget` bounds the prefixed ids (see `prefix-id`)."
+  [points budget]
   (mapcat (fn [p]
-            (let [kids (map #(prefix-id p %) (leaves (:children p)))
-                  bad? #(#{:failed :error} (get-in % [:case :case/status]))]
+            (let [kids (map #(prefix-id budget p %) (leaves (:children p) budget))]
               (cond
                 (empty? kids) [p]
                 (and (bad? p) (not-any? bad? kids)) (concat kids [p])
@@ -468,11 +469,10 @@
           (and (nil? plan) (empty? points) (nil? bail)) (malformed :tap/no-tests)
           (implausible-plan? plan points) (malformed :tap/implausible-plan :plan plan)
           :else
-          (let [cases (charge-ids
-                       (concat (map :case (leaves points))
-                               (missing plan points bail)
-                               (when (and bail (nil? plan))
-                                 [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))])))]
+          (let [cases (vec (concat (map :case (leaves points (volatile! max-id-chars)))
+                                   (missing plan points bail)
+                                   (when (and bail (nil? plan))
+                                     [(tap-case "Bail out!" :error (str/trim (str "Bail out! " bail)))])))]
             (r/ok (cond-> (->report :tap cases)
                     bail (assoc :report/bail-out bail))))))
       (catch clojure.lang.ExceptionInfo e
