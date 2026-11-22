@@ -164,3 +164,24 @@
      :network, :labels, plus :resources {:mem bytes :cpus n}) and wait for its
      end. A runner that exits non-zero, is OOM-killed or times out is an ok
      answer; an error only when it could not be started at all."))
+
+(defprotocol IToxiproxyClient
+  "A Toxiproxy server's REST API (hc-12 fault injection). A proxy is
+   {:name :listen :upstream :enabled :toxics [toxic]}, a toxic {\"name\"
+   \"type\" \"stream\" \"toxicity\" \"attributes\"} as toxiproxy writes it.
+   Every method answers a Result; an unreachable server is an error, never a
+   throw."
+  (-create-proxy! [c proxy]
+    "Result<Proxy>: create `proxy` ({\"name\" \"listen\" \"upstream\"
+     \"enabled\"}). Idempotent: an existing proxy of that name with the same
+     listen and upstream answers itself; a different one is an error.")
+  (-add-toxic! [c proxy-name toxic]
+    "Result<toxic>: add `toxic` to proxy `proxy-name`, replacing a toxic of
+     the same name.")
+  (-remove-toxic! [c proxy-name toxic-name]
+    "Result<{:removed? bool}>: remove toxic `toxic-name`; an absent one
+     answers :removed? false.")
+  (-reset! [c]
+    "Result<{:reset true}>: remove every toxic and enable every proxy.")
+  (-list [c]
+    "Result<{name Proxy}>: every proxy with its toxics."))
