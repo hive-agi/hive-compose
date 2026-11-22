@@ -231,35 +231,57 @@
 
 (defn layer-env
   "The runner env, built in layers: `wiring` (the suite consumer's endpoints),
-   then `otlp`, then `suite-env`, then `correlation`, forced on top.
-   OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_PROTOCOL are one unit
-   (`otel/exporter-pair`): a layer that names either one replaces both.
-   OTEL_RESOURCE_ATTRIBUTES is merged per key through `merge-ra` (fn [base
-   over], default `otel/merge-resource-attributes`) in the same order, wiring
-   < otlp < suite. On top of that the `hive.*` correlation keys of the otlp
-   attributes are forced, and `hive.run.id=<run>` always is: only those win
-   over the suite, which may still set service.name and its own attributes."
-  [{:keys [wiring otlp suite-env correlation merge-ra run]}]
+   then `otlp`, then `suite-env`, then `correlation`, forced on top. At each
+   layer `otel/otlp-pair-merge` keeps OTEL_EXPORTER_OTLP_ENDPOINT and
+   OTEL_EXPORTER_OTLP_PROTOCOL one unit. OTEL_RESOURCE_ATTRIBUTES is merged
+   per key through `merge-ra` (fn [base over], default
+   `otel/merge-resource-attributes`) in the same order, wiring < otlp <
+   suite. Then the `hive.*` correlation keys are forced: those of the otlp
+   attributes, plus `hive.run.id=<run>` and `hive.test.id=<test-id>` always.
+   The suite still sets service.name and its own attributes."
+  [{:keys [wiring otlp suite-env correlation merge-ra run test-id]}]
   (let [merge-ra (or merge-ra otel/merge-resource-attributes)
-        pair otel/exporter-pair
-        over (fn [lower upper]
-               (merge (if (some #(contains? upper %) pair) (apply dissoc lower pair) lower)
-                      upper))
-        env (-> (over wiring otlp) (over suite-env) (merge correlation))
+        env (-> (otel/otlp-pair-merge (or wiring {}) (or otlp {}))
+                (otel/otlp-pair-merge (or suite-env {}))
+                (merge correlation))
         ras (keep #(let [v (get % resource-attributes)] (when (string? v) v)) [wiring otlp suite-env])
         forced (otel/render-resource-attributes
                 (cond-> (into {} (filter (comp otel/correlation-attribute? key))
                               (otel/parse-resource-attributes (get otlp resource-attributes)))
-                  run (assoc "hive.run.id" run)))]
+                  run (assoc "hive.run.id" run)
+                  test-id (assoc "hive.test.id" test-id)))]
     (if (seq ras)
       (assoc env resource-attributes (reduce merge-ra (concat ras [forced])))
       env)))
 
-(defn- join-path [dir path]
-  (cond
-    (str/starts-with? path "/") path
-    dir (str (str/replace dir #"/+\z" "") "/" path)
-    :else nil))
+(defn path-part?
+  "True when `s` is one safe path segment: `hive-compose.boundary.runs/PathPart`
+   (letters, digits, `_` `.` `-`, starting with a letter or digit, never only
+   dots). Suite and project ids name directories under the run dir and the
+   container name, so anything else (`..`, `a/../b`, `/abs`, `a:b`) is refused."
+  [s]
+  (boolean (and (string? s)
+                (re-matches #"[A-Za-z0-9][A-Za-z0-9_.-]*" s)
+                (not (re-matches #"\.+" s)))))
+
+(defn- relative-inside?
+  "True when `path` is relative and never climbs out with a `..` segment."
+  [path]
+  (and (not (str/starts-with? path "/"))
+       (not-any? #{".."} (str/split path #"/"))))
+
+(defn- join-path
+  "`path` under `dir` (both checked by the caller: `path` relative and inside)."
+  [dir path]
+  (str (str/replace dir #"/+\z" "") "/" path))
+
+(defn container-name
+  "`hive-<run>-<slug suite>-<slug project>-<8 hex>`: the slugs keep it
+   readable, the hash of the exact ids keeps two cells whose ids slug alike
+   (\"a.b\" and \"a-b\") from sharing a container name."
+  [run sid project]
+  (str "hive-" run "-" (schema/slug sid) "-" (schema/slug project) "-"
+       (format "%08x" (bit-and (hash [sid project]) 0xffffffff))))
 
 (defn runner-spec
   "Result<RunnerSpec> of `cell` in run `run`.
@@ -274,6 +296,7 @@
                  i.e. `hive-compose.promote.otel/otlp-env`; nil injects no OTLP
      :merge-resource-attributes  optional, see `layer-env`
      :wiring-env optional Env of the suite consumer's wiring (hc-5)
+     :default-resources optional, `:compose/default-resources`
 
    A suite with `:suite/image` gives a container:
      {:runner :container :image :command? :env :mounts [{:host :container}]
@@ -282,17 +305,32 @@
    A container of a suite with `:suite/needs` also joins the view network of
    `suite:<id>` (:extra-networks), where the suite's own instances answer.
    Both carry :cell :run :test-id :trace-id :reports-dir and :report-format,
-   plus :timeout-ms when the suite sets one. :reports-dir is always the
+   :resources (`:suite/resources`, else `:default-resources`; `:unbounded`
+   passes through) and :timeout-ms when set. :reports-dir is always the
    cell's own `<state-dir>/runs/<run>/<suite>/<project>/reports`, so no two
    cells share one. A command that names `:suite/reports-dir` (relative to
-   `:suite/dir`) also carries it as :collect-from: the pipeline empties it
-   before the cell and moves what the runner leaves there into :reports-dir
-   after. An env holding half the OTLP pair is :compose/otlp-pair-broken."
+   `:suite/dir`, never leaving it) also carries it as :collect-from: the
+   pipeline empties it before the cell and moves what the runner leaves there
+   into :reports-dir after.
+
+   Refused: an unknown suite, a bad run id, a suite or project id that is not
+   `path-part?`, a command's reports dir that is absolute, climbs out with
+   `..` or has no `:suite/dir` to be relative to (:compose/invalid-param), and
+   an env holding half the OTLP pair (:compose/otlp-pair-broken)."
   [{:keys [suites run state-dir id-source wiring-env] :as ctx} cell]
   (let [sid (:suite/id cell)
         project (:project cell)
-        suite (get suites sid)]
+        suite (get suites sid)
+        declared (:suite/reports-dir suite)]
     (cond
+      (not (path-part? sid))
+      (r/err :compose/invalid-param {:param "suite" :value sid
+                                     :message (str "not a safe suite id: " (pr-str sid))})
+
+      (not (path-part? project))
+      (r/err :compose/invalid-param {:param "project" :value project
+                                     :message (str "not a safe project id: " (pr-str project))})
+
       (nil? suite)
       (r/err :compose/unknown-names {:suites [sid] :message (str "unknown suite: " sid)})
 
@@ -305,14 +343,20 @@
       (nil? id-source)
       (r/err :compose/invalid-param {:param "id-source" :message "runner-spec needs an :id-source"})
 
+      (and declared (nil? (:suite/image suite))
+           (not (and (:suite/dir suite) (relative-inside? declared))))
+      (r/err :compose/invalid-param {:param "suite/reports-dir" :suite sid :value declared
+                                     :message (str "a command's :suite/reports-dir must be relative to its "
+                                                   ":suite/dir and stay inside it: " (pr-str declared))})
+
       :else
       (let [image (:suite/image suite)
             container? (some? image)
             state-reports (reports-dir state-dir run cell)
-            declared (:suite/reports-dir suite)
             collect-from (when-not container? (some->> declared (join-path (:suite/dir suite))))
             runner-reports (if container? (or declared container-reports-dir) state-reports)
             suite-net (when (seq (:suite/needs suite)) (schema/view-network run (suite-consumer sid)))
+            resources (or (:suite/resources suite) (:default-resources ctx))
             tid (test-id cell)]
         (r/let-ok [tp (traceparent id-source)
                    otlp-vars (otlp (:otlp-env ctx) {:run-id run
@@ -324,6 +368,7 @@
                                 :suite-env (:suite/env suite)
                                 :merge-ra (:merge-resource-attributes ctx)
                                 :run run
+                                :test-id tid
                                 :correlation {"HIVE_RUN_ID" run
                                               "HIVE_SUITE_ID" sid
                                               "HIVE_TEST_ID_PREFIX" (test-id-prefix cell)
@@ -338,11 +383,12 @@
                                 :reports-dir state-reports
                                 :report-format (:suite/report-format suite :auto)}
                          (:suite/timeout-ms suite) (assoc :timeout-ms (:suite/timeout-ms suite))
+                         resources (assoc :resources resources)
                          collect-from (assoc :collect-from collect-from))
-                command (:suite/command suite)
-                present (filter #(contains? env %) otel/exporter-pair)]
-            (if (= 1 (count present))
-              (r/err :compose/otlp-pair-broken {:cell (:cell common) :present (vec present)
+                command (:suite/command suite)]
+            (if (otel/otlp-pair-broken? env)
+              (r/err :compose/otlp-pair-broken {:cell (:cell common)
+                                                :present (vec (filter #(contains? env %) otel/exporter-pair))
                                                 :pair otel/exporter-pair
                                                 :message "an OTLP endpoint without its protocol (or the reverse)"})
               (r/ok
@@ -350,7 +396,7 @@
                  (cond-> (assoc common
                                 :runner :container
                                 :image image
-                                :name (str "hive-" run "-" (schema/slug sid) "-" (schema/slug project))
+                                :name (container-name run sid project)
                                 :mounts [{:host state-reports :container runner-reports}]
                                 :network (schema/view-network run project)
                                 :labels {(:run schema/docker-labels) run
@@ -373,6 +419,7 @@
     [:env schema/Env]
     [:reports-dir [:string {:min 1}]]
     [:report-format schema/ReportFormat]
+    [:resources {:optional true} schema/Resources]
     [:timeout-ms {:optional true} :int]
     [:image {:optional true} :string]
     [:name {:optional true} :string]
