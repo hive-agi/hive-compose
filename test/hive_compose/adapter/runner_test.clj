@@ -80,6 +80,28 @@
     (is (nil? (:exit res)))
     (is (= ["docker" "rm" "-f" "hive-r01-smoke-shop"] (first (last @calls))))))
 
+(deftest a-failed-or-throwing-create-still-removes-the-container
+  (doseq [answer [(r/err :shell/timeout {:timeout-ms 60000})
+                  (r/ok {:exit 125 :stdout "" :stderr (str "bad " secret)})]]
+    (let [[calls exec] (recording {["create" "--name"] answer})
+          res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver}) (spec))]
+      (is (r/err? res))
+      (is (not (str/includes? (pr-str res) secret)) "stderr scrubbed")
+      (is (= ["docker" "rm" "-f" "hive-r01-smoke-shop"] (first (last @calls))))))
+  (let [calls (atom [])
+        exec (fn [argv opts]
+               (swap! calls conj argv)
+               (if (= "create" (second argv)) (throw (ex-info (str "boom " secret) {})) (r/ok {:exit 0 :stdout "" :stderr ""})))
+        res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver}) (spec))]
+    (is (= :compose/runner-threw (:error res)) "never throws")
+    (is (not (str/includes? (pr-str res) secret)))
+    (is (= ["docker" "rm" "-f" "hive-r01-smoke-shop"] (last @calls)))))
+
+(deftest the-runner-scrub-hides-resolved-values
+  (let [[_ exec] (recording {})
+        res (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver}) (spec))]
+    (is (= "x pass:ci/token" ((get-in res [:ok :scrub]) (str "x " secret))))))
+
 (deftest extra-networks-are-connected-before-start
   (let [[calls exec] (recording {})
         _ (port/-run-container! (runner/make-runner {:exec exec :compose/resolver resolver})

@@ -77,16 +77,18 @@
 
 (defn- outcome
   "The runner answer of a finished exec Result `res`: its exit and tail, both
-   streams scrubbed of every resolved secret. A timeout or a process that
+   streams scrubbed of every resolved secret, and `:scrub` (fn [s]), which
+   does the same to any text the caller reads afterwards (the reports), so
+   no resolved value ever leaves the adapter. A timeout or a process that
    could not start is an error carrying :exit nil."
   [res declared resolved started ended]
   (let [scrub #(env/scrub declared resolved %)]
     (if (r/ok? res)
       (let [{:keys [exit stdout stderr]} (:ok res)]
-        (r/ok {:exit exit :started-ms started :ended-ms ended
+        (r/ok {:exit exit :started-ms started :ended-ms ended :scrub scrub
                :log-tail (log-tail (scrub (str stdout "\n" stderr)) tail-lines)}))
       (assoc (select-keys res [:error :timeout-ms])
-             :exit nil :started-ms started :ended-ms ended
+             :exit nil :started-ms started :ended-ms ended :scrub scrub
              :message (scrub (str (or (:message res) (name (:error res)))))))))
 
 (defn- ensure-dir! [dir]
@@ -107,28 +109,36 @@
     (let [declared (:env spec)
           nm (:name spec)]
       (r/let-ok [_ (ensure-dir! (:reports-dir spec))
-                 resolved (secrets/resolve-env resolver declared)
-                 ;; a leftover of an interrupted run under this name: best effort
-                 _ (do (exec (rm-argv nm) {:timeout-ms 60000}) (r/ok nil))
-                 _ (r/map-err (step! exec (create-argv spec) {:env resolved})
-                              #(update % :stderr (fn [s] (env/scrub declared resolved s))))]
+                 resolved (secrets/resolve-env resolver declared)]
+        ;; everything from the first docker call on sits inside try/finally:
+        ;; a create that fails or times out half way still has its container removed
         (try
-          (r/let-ok [_ (reduce (fn [acc n] (if (r/err? acc) (reduced acc) (step! exec (connect-argv n nm) {})))
+          ;; a leftover of an interrupted run under this name: best effort
+          (exec (rm-argv nm) {:timeout-ms 60000})
+          (r/let-ok [_ (r/map-err (step! exec (create-argv spec) {:env resolved})
+                                  #(update % :stderr (fn [s] (env/scrub declared resolved s))))
+                     _ (reduce (fn [acc n] (if (r/err? acc) (reduced acc) (step! exec (connect-argv n nm) {})))
                                (r/ok nil) (:networks spec))]
             (let [t0 (now)
                   res (exec (start-argv nm) {:timeout-ms (timeout-ms spec)})]
               (outcome res declared resolved t0 (now))))
+          (catch Throwable t
+            (r/err :compose/runner-threw {:exit nil :message (env/scrub declared resolved (str t))}))
           (finally
-            (exec (rm-argv nm) {:timeout-ms 60000}))))))
+            (try (exec (rm-argv nm) {:timeout-ms 60000})
+                 (catch Throwable _best-effort-removal nil)))))))
   (-run-command! [_ spec]
     (let [declared (:env spec)]
       (r/let-ok [_ (ensure-dir! (:reports-dir spec))
                  resolved (secrets/resolve-env resolver declared)]
-        (let [t0 (now)
-              res (exec (command-argv (:command spec))
-                        (cond-> {:timeout-ms (timeout-ms spec) :env resolved}
-                          (:dir spec) (assoc :dir (:dir spec))))]
-          (outcome res declared resolved t0 (now)))))))
+        (try
+          (let [t0 (now)
+                res (exec (command-argv (:command spec))
+                          (cond-> {:timeout-ms (timeout-ms spec) :env resolved}
+                            (:dir spec) (assoc :dir (:dir spec))))]
+            (outcome res declared resolved t0 (now)))
+          (catch Throwable t
+            (r/err :compose/runner-threw {:exit nil :message (env/scrub declared resolved (str t))})))))))
 
 (defn make-runner
   "SuiteRunner. `opts`: :exec (default hive-system `shell.core/exec!`),

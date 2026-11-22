@@ -3,7 +3,9 @@
    runner: one union stack, a runner per cell, JUnit read back, results
    recorded, down on success, kept on failure. test.check: the summary and
    the stack's fate follow the cells' outcomes, whatever they are."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -213,6 +215,58 @@
             res (suites/test! c {})]
         (is (= :error (get-in res [:ok :status])))
         (is (empty? (sr/suite-runs (:suite-runner c))))))))
+
+(deftest a-rerun-never-reads-the-previous-attempts-reports
+  (let [c (ctx {"load" {:exit 1 :passed 0 :failed 2}})
+        first-run (suites/test! c {:suites "load" :run "ci001"})]
+    (is (= :failed (get-in first-run [:ok :status])))
+    (sr/script! (:suite-runner c) {"load" {:exit 0}})
+    (let [again (suites/test! c {:suites "load" :run "ci001"})
+          cell (first (get-in again [:ok :cells]))]
+      (is (r/ok? again) (pr-str again))
+      (is (true? (get-in again [:ok :reused?])) "the kept run is reused")
+      (is (nil? (:report cell)) "the old junit.xml was cleared, not read")
+      (is (= :report/none (get-in cell [:report-error :error])))
+      (is (= :passed (:status cell)) "exit 0 with no report is the verdict"))))
+
+(deftest a-declared-host-reports-dir-is-read-only-for-fresh-files
+  (let [dir (tmp-dir)
+        old (io/file dir "old.xml")]
+    (spit old (sr/junit "load" 0 3))
+    (.setLastModified old 1000)
+    (let [c (-> (ctx {"load" {:exit 0}})
+                (assoc-in [:settings :compose/suites "load" :suite/reports-dir] dir)
+                (assoc :now #(System/currentTimeMillis)))
+          res (suites/test! c {:suites "load"})]
+      (is (= :passed (get-in res [:ok :status])) (pr-str res))
+      (is (.exists old) "a directory hive-compose does not own is never cleared")
+      (is (= 0 (get-in res [:ok :summary :cases :failed]))))))
+
+(deftest the-run-is-claimed-while-cells-run-and-touched-after
+  (let [seen (atom nil)
+        c (ctx {"load/shop" {:exit 1 :passed 0 :failed 1}})
+        c (assoc c :record-run! (fn [cx run]
+                                  (reset! seen (get-in @(:state cx) [:stacks (:run/id run) :claims]))
+                                  (r/ok {})))
+        clock (atom 5000)
+        c (assoc c :now #(deref clock))
+        res (do (swap! clock + 0) (suites/test! c {:suites "load"}))
+        run (get-in res [:ok :run])]
+    (is (contains? @seen (str "test:" run)) "the reaper sees a live claim mid-matrix")
+    (is (empty? (get-in @(:state c) [:stacks run :claims])) "released when the matrix ends")
+    (is (= 5000 (get-in @(:state c) [:stacks run :last-touch])))))
+
+(deftest secrets-in-reports-never-reach-the-answer-or-the-history
+  (let [secret "s3cr3t-tok"
+        raw (str "<testsuite name=\"load\"><testcase classname=\"c\" name=\"t\">"
+                 "<failure message=\"bad token " secret "\"/>"
+                 "<system-out>TOKEN=" secret "</system-out></testcase></testsuite>")
+        c (ctx {"load" {:exit 1 :raw raw :scrub {secret "pass:ci/token"}}})
+        res (suites/test! c {:suites "load"})]
+    (is (= :failed (get-in res [:ok :status])))
+    (is (not (str/includes? (pr-str res) secret)) "answer scrubbed")
+    (is (not (str/includes? (pr-str @(:recorded c)) secret)) "flake history scrubbed")
+    (is (str/includes? (pr-str res) "pass:ci/token"))))
 
 (def outcome-gen
   (gen/one-of [(gen/fmap (fn [[p f]] {:exit (if (pos? f) 1 0) :passed p :failed f})

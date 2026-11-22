@@ -79,7 +79,8 @@
 
 (defn- run-suite! [world kind spec]
   (swap! world update :runs conj (assoc spec ::kind kind))
-  (let [{:keys [exit passed failed error raw]} (script-of world spec)
+  (let [{:keys [exit passed failed error raw scrub]} (script-of world spec)
+        scrub-fn (fn [s] (reduce (fn [s [v r]] (clojure.string/replace s v r)) s scrub))
         t (:clock (swap! world update :clock + 10))]
     (if error
       (r/err error {:exit nil :log-tail ["runner died"] :started-ms (- t 10) :ended-ms t})
@@ -89,7 +90,13 @@
             (.mkdirs dir)
             (spit (java.io.File. dir "junit.xml")
                   (or raw (junit (get-in spec [:cell :suite/id]) (or passed 0) (or failed 0))))))
-        (r/ok {:exit exit :started-ms (- t 10) :ended-ms t :log-tail [(str "exit " exit)]})))))
+        (r/ok (cond-> {:exit exit :started-ms (- t 10) :ended-ms t :log-tail [(str "exit " exit)]}
+                scrub (assoc :scrub scrub-fn)))))))
+
+(defn script!
+  "Replace the scripts of stub suite runner `sr`."
+  [sr scripts]
+  (swap! (:world sr) assoc :scripts scripts))
 
 (defrecord StubSuiteRunner [world]
   port/ISuiteRunner
@@ -98,7 +105,8 @@
 
 (defn suite-runner
   "StubSuiteRunner over `scripts` ({test-id-or-suite-id {:exit n :passed n
-   :failed n} | {:error kw} | {:exit n :raw text}}); a script with neither
+   :failed n} | {:error kw} | {:exit n :raw text}}, any with :scrub {value
+   rendering}, answered as the runner's :scrub fn); a script with neither
    :passed, :failed nor :raw writes no report."
   ([] (suite-runner {}))
   ([scripts] (->StubSuiteRunner (atom {:scripts scripts :runs [] :clock 1000}))))

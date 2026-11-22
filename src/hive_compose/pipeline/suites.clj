@@ -21,6 +21,7 @@
 
    Every entry point answers a Result and never throws."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [hive-compose.boundary.report :as report]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.port :as port]
@@ -212,28 +213,74 @@
         {:recorded (:ok res)}
         {:record-error (select-keys res [:error :message :hint])}))))
 
+(def claim-agent-prefix
+  "test! holds the run it works on under the claim `test:<run>`, renewed per
+   cell, so the reaper never takes a matrix down mid-run."
+  "test:")
+
+(defn- claim-agent [run] (str claim-agent-prefix run))
+
+(defn- owned-dir?
+  "True when `dir` lies under hive-compose's state directory: its reports
+   are ours to clear before an attempt."
+  [ctx dir]
+  (let [root (str (.getCanonicalPath (io/file (state-dir ctx))) "/")]
+    (str/starts-with? (str (.getCanonicalPath (io/file dir)) "/") root)))
+
+(defn- scrub-report
+  "`report` (a Result<Report>) with every case's message and output passed
+   through `scrub`, the runner's own (closed over the values it resolved)."
+  [report scrub]
+  (if (and scrub (r/ok? report))
+    (update-in report [:ok :report/cases]
+               (fn [cs] (mapv (fn [c] (cond-> c
+                                        (string? (:case/message c)) (update :case/message scrub)
+                                        (string? (:case/output c)) (update :case/output scrub)))
+                              cs)))
+    report))
+
 (defn- run-cell!
   "The cell result of `spec` (promote.suite cell-result) plus what the run
    left behind: :test-id :trace-id :log-tail, and :runner-error when the
-   runner could not run it to the end."
+   runner could not run it to the end. The reports dir is cleared first when
+   hive-compose owns it; a declared one is read only for files written since
+   the attempt started. Case texts are scrubbed of resolved secrets."
   [ctx spec]
+  (stacks/claim! ctx (:run spec) (claim-agent (:run spec)) {:note "compose test"})
   (let [t0 ((:now ctx))
-        out (run-runner (:suite-runner ctx) spec)
+        cleared (when (owned-dir? ctx (:reports-dir spec)) (report/clear-reports! (:reports-dir spec)))
+        out (if (and cleared (r/err? cleared)) cleared (run-runner (:suite-runner ctx) spec))
         ok (when (r/ok? out) (:ok out))
-        rep (report/read-reports (:reports-dir spec) (:report-format spec :auto))
+        scrub (or (:scrub ok) (:scrub out))
+        started (or (:started-ms ok) (:started-ms out) t0)
+        rep (scrub-report (report/read-reports (:reports-dir spec) (:report-format spec :auto)
+                                               ;; our own clock, not the runner's: files older than this attempt
+                                               (when-not cleared t0))
+                          scrub)
         result (suite/cell-result (:run spec) (:cell spec)
                                   {:exit (:exit ok)
                                    :report rep
-                                   :started-at (or (:started-ms ok) (:started-ms out) t0)
+                                   :started-at started
                                    :finished-at (or (:ended-ms ok) (:ended-ms out) ((:now ctx)))})
+        tail (or (:log-tail ok) (:log-tail out))
         result (cond-> (assoc result :test-id (:test-id spec) :trace-id (:trace-id spec)
                               :reports-dir (:reports-dir spec))
-                 (seq (or (:log-tail ok) (:log-tail out))) (assoc :log-tail (vec (or (:log-tail ok) (:log-tail out))))
+                 (seq tail) (assoc :log-tail (vec tail))
                  (r/err? out) (assoc :runner-error (select-keys out [:error :message :reason :var :hint :exit])))]
     (merge result (record! ctx result))))
 
 ;; ---------------------------------------------------------------------------
 ;; test!
+
+(defn- unclaim!
+  "Drop test!'s claim on `run` and touch it: a run kept for inspection gets a
+   full idle TTL from the end of the matrix, not from its stack-up. A run
+   that is gone (taken down) is left alone."
+  [ctx run]
+  (when (contains? (:stacks @(:state ctx)) run)
+    (swap! (:state ctx) update-in [:stacks run]
+           #(-> % (update :claims dissoc (claim-agent run)) (assoc :last-touch ((:now ctx)))))
+    (persist! ctx)))
 
 (defn- finish!
   "The summary of `results` and `phases`. A run this call created is taken
@@ -246,6 +293,7 @@
                              :error (select-keys (:result p) [:error :message :hint])}))
         status (if (seq phase-errors) :error (:status summary))
         down? (and (= :passed status) (not keep-up?) (not reuse?))
+        _ (unclaim! ctx run)
         down (when down? (stacks/stack-down! ctx {:run run}))]
     (r/ok (cond-> {:run run :stack stack-id :reused? (boolean reuse?)
                    :status status :exit (if (= :passed status) 0 1)
