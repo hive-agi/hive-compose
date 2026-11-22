@@ -7,7 +7,9 @@
 
      {:why/test-id :why/run :why/window [start-ms end-ms]
       :why/case {:case/id :case/name :case/status :case/message ..}
-      :why/cell {:suite/id :project :status :exit}
+      :why/cell {:suite/id :project :status :exit
+                 :oom/service :oom/cap :oom/line}   the :oom keys only when
+                                                    the runner was OOM-killed
       :why/failing-span {:span/id :trace/id :span/service :span/name
                          :span/status :span/status-message :span/attrs}?
       :why/span-path [{:span/id :span/service :span/name :span/status
@@ -181,12 +183,24 @@
     (if (> n max-log-lines) (subvec lines (- n max-log-lines)) lines)))
 
 (defn summary-line
-  "One line: what failed and the span that explains it."
-  [{:why/keys [test-id case failing-span]}]
-  (str (or test-id (:case/id case) "?") " " (name (or (:case/status case) :failed))
-       (if failing-span
-         (str ": " (trace/describe-span failing-span))
-         (when-let [m (:case/message case)] (str ": " (first (str/split-lines m)))))))
+  "One line: what failed, the span that explains it and, when the cell's
+   runner was OOM-killed, its why line ('<service> OOM-killed at <cap>')."
+  [{:why/keys [test-id case failing-span cell]}]
+  (let [base (str (or test-id (:case/id case) "?") " " (name (or (:case/status case) :failed))
+                  (if failing-span
+                    (str ": " (trace/describe-span failing-span))
+                    (when-let [m (:case/message case)] (str ": " (first (str/split-lines m))))))
+        oom (:oom/line cell)]
+    (if (and oom (not (str/includes? base oom)))
+      (str base "; " oom)
+      base)))
+
+(defn cell-row
+  "A cell result in a bundle: suite, project, status, exit and, when its
+   runner was OOM-killed (hc-16b), the finding's service, cap and line."
+  [cell-result]
+  (merge (select-keys cell-result [:suite/id :project :status :exit])
+         (select-keys (:oom cell-result) [:oom/service :oom/cap :oom/line])))
 
 (defn bundle
   "The FailureBundle of one failed case (see the ns doc). `in`:
@@ -210,7 +224,7 @@
            :why/window w
            :why/case (select-keys case [:case/id :case/name :case/classname :case/status
                                         :case/message :case/time-s])
-           :why/cell (select-keys cell-result [:suite/id :project :status :exit])
+           :why/cell (cell-row cell-result)
            :why/traces (mapv trace-row (sort-by :trace/id traces))
            :why/logs (into (sorted-map)
                            (keep (fn [[svc text]]
@@ -257,6 +271,7 @@
                       (line "suite" (:suite/id cell))
                       (line "project" (:project cell))
                       (line "exit" (:exit cell))
+                      (line "oom" (:oom/line cell))
                       (line "window" (str (first window) " .. " (second window)))])
       (when-let [m (:case/message case)] ["" (fence m)])
       ["" "## Failing span" ""]

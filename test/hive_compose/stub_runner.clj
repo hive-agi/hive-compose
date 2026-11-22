@@ -2,6 +2,7 @@
   "An in-memory IProgramRunner: directories with build-file facts, a set of live
    pids, a recording of every start and stop, and faults injectable per method."
   (:require [hive-compose.port :as port]
+            [hive-compose.promote.oom :as oom]
             [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
@@ -70,3 +71,34 @@
         (r/ok {:exit 0 :out ""}))))
 
 (defn runs [rn] (filterv #(= :run (first %)) (calls rn)))
+
+;; ISuiteRunner (hc-16b): a runner per test id `<suite>/<project>` that
+;; allocates `:peak-mem` bytes. Over its spec's `:resources :mem` cap it is
+;; OOM-killed as the real container runner reports it: exit 137 and the
+;; finding `hive-compose.promote.oom/finding` builds. Under the cap (or with
+;; no cap) it exits `:exit` (default 0).
+
+(defrecord CappedSuiteRunner [world]
+  port/ISuiteRunner
+  (-run! [_ spec]
+    (swap! world update :suite-runs conj spec)
+    (let [{:keys [peak-mem exit] :or {exit 0}} (get-in @world [:scripts (:test-id spec)])
+          cap (oom/mem-bytes (get-in spec [:resources :mem]))
+          t (:clock (swap! world update :clock + 10))
+          killed? (and cap peak-mem (> peak-mem cap))]
+      (r/ok (cond-> {:exit (if killed? 137 exit)
+                     :started-at (- t 10) :finished-at t
+                     :output (if killed? ["Killed"] [(str "exit " exit)])
+                     :timed-out? false
+                     :cap (cond-> {:mode (if cap :docker :none)} cap (assoc :mem cap))}
+              killed? (assoc :oom (oom/finding (:test-id spec) cap :container 137)))))))
+
+(defn capped-suite-runner
+  "CappedSuiteRunner over `scripts` ({test-id {:peak-mem bytes :exit n}})."
+  ([] (capped-suite-runner {}))
+  ([scripts] (->CappedSuiteRunner (atom {:scripts scripts :suite-runs [] :clock 1795367920000}))))
+
+(defn suite-runs
+  "Every runner spec the capped suite runner ran, in order."
+  [sr]
+  (:suite-runs @(:world sr)))
