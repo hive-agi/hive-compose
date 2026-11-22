@@ -157,6 +157,15 @@
      names) mounted by `services` of the profile's project and the host ports
      they publish."))
 
+(defprotocol IServiceImages
+  "Optional engine capability: what services of a project run, so a stack
+   can tell a JVM image and keep its own JVM flags (hc-16a). An engine
+   without it is treated as knowing nothing: only `:jvm? true` injects."
+  (-service-facts [e profile services]
+    "Result<{service {:image string :java-tool-options string? :mem-limit
+     MemSize?}}>: the image each of `services` runs, the JAVA_TOOL_OPTIONS
+     and the memory limit its compose file sets."))
+
 (defprotocol IFlakeHistory
   "Append-only history of test case outcomes across runs (CaseOutcome rows,
    see `hive-compose.schema`), read by `hive-compose.promote.flaky`."
