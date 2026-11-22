@@ -350,9 +350,9 @@
                              {:suite (some-> (param params "suite") str)
                               :project (some-> (param params "project") str)}
                              (let [l (param params "limit")]
-                               (cond (number? l) (long l)
-                                     (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
-                                     :else 20)))
+                               (max 1 (cond (number? l) (long l)
+                                            (and (string? l) (re-matches #"\d+" l)) (Long/parseLong l)
+                                            :else 20))))
         "faults" (r/bind (faults-request params) #(faults/faults! ctx %))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands

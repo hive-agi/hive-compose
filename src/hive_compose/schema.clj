@@ -509,12 +509,6 @@
   "How one test case ended in one run, as JUnit XML and TAP report it."
   [:enum :passed :failed :error :skipped])
 
-(def RunIdLocal
-  "A run id: hc-2's RunId rule (PR #37), copied so flake history does not
-   depend on that branch.
-   TODO(hc-2): once #37 lands, replace this with schema/RunId."
-  [:re #"^[a-z0-9]{3,40}\z"])
-
 (def CaseOutcome
   "One row of flake history: how case `:case/id` of suite `:suite/id` ended in
    run `:run/id` against `:project`, recorded at `:at` (epoch ms). `:run/sha`,
@@ -525,7 +519,7 @@
    ids `<suite>/<classname>.<name>`), so this layer can be reconciled with it
    later without depending on it."
   [:map
-   [:run/id RunIdLocal]
+   [:run/id RunId]
    [:suite/id [:string {:min 1}]]
    [:project {:optional true} [:string {:min 1}]]
    [:case/id [:string {:min 1}]]

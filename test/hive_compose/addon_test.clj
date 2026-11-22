@@ -130,6 +130,8 @@
         (is (not error?))
         (is (= ["api/T.flap" "api/(run)"] (mapv :case (:cases body))))
         (is (= "flaky" (:class (first (:cases body))))))
+      (is (= 1 (count (:cases (:body (call a {"command" "flaky" "suite" "api" "limit" 0})))))
+          "a limit below 1 still answers one case")
       (is (= 0 (:total (:body (call a {"command" "flaky" "project" "blog"})))))
       (finally (addon/shutdown! a)))))
 
