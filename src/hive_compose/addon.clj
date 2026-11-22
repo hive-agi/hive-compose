@@ -19,6 +19,7 @@
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
             [hive-compose.boundary.files :as files]
+            [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.pipeline.why :as why]
@@ -110,7 +111,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]
@@ -124,6 +125,8 @@
                   (when (get cfg :compose/orphan-guard? true) (procfs/make-process-table)))
      :settings settings
      :state state
+     :faults (atom {})
+     :toxiproxy (:compose/toxiproxy cfg)
      :now (or (:compose/now cfg) now-ms)
      :save! (or (:compose/save! cfg) (fn [_] (sync!)))
      :sync! (when-not (:compose/save! cfg) sync!)
@@ -199,6 +202,7 @@
    "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
+   "faults" "fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer, attributes {name number}, stream upstream|downstream, toxicity 0..1, name}"
    "reload" "re-read the config"
    "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
    "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
@@ -261,6 +265,21 @@
       (cond-> res (and n (r/ok? n)) (assoc-in [:ok :announced] true)))
     res))
 
+(defn- faults-request
+  "Result<request> of the `faults` command's params: run, op, proxy and toxic
+   ({type attributes stream toxicity name}, keys as JSON gives them)."
+  [params]
+  (let [toxic (param params "toxic")]
+    (if (and (some? toxic) (not (map? toxic)))
+      (r/err :compose/invalid-param {:param "toxic" :hint "an object {type, attributes, stream, toxicity, name}"})
+      (r/ok {:run (some-> (param params "run") str)
+             :op (some-> (param params "op") str)
+             :proxy (some-> (param params "proxy") str)
+             :toxic (when toxic
+                      (let [t (into {} (map (fn [[k v]] [(keyword (name k)) v])) toxic)]
+                        (cond-> t
+                          (map? (:attributes t)) (update :attributes #(into {} (map (fn [[k v]] [(name k) v])) %)))))}))))
+
 (defn- dispatch [a command params]
   (let [ctx (:ctx @(:state a))
         id (some-> (param params "profile") str)
@@ -320,6 +339,7 @@
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
         "projects" (ops/projects ctx)
+        "faults" (r/bind (faults-request params) #(faults/faults! ctx %))
         "reload" (reload! a)
         (r/err :compose/unknown-command {:command command :known commands
                                          :hint "command=help lists what each does"})))))
@@ -366,7 +386,10 @@
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
                               "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|why] run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
+                              "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
+                              "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
+                              "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}
                  :required ["command"]}
    :handler (fn [params]
               (result->content (dispatch a (str (param params "command")) params)))})

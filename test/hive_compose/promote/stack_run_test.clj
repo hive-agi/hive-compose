@@ -1,5 +1,5 @@
 (ns hive-compose.promote.stack-run-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -37,7 +37,32 @@
   (is (run/container-consumer? "shop/api"))
   (is (not (run/container-consumer? "stack:shop")))
   (is (not (run/container-consumer? "suite:smoke")))
-  (is (= "shop-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop/api" "r1x"))))
+  (is (= "shop-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop" "r1x")))
+  (is (= "shop-api-r1x" (run/consumer-compose-project {:compose/projects {"shop" {:project/dir "/w/Shop"}}} "shop/api" "r1x"))
+      "two sections of one project never share a compose project"))
+
+(deftest otlp-endpoint-follows-the-bound-alias
+  (let [res {:resolution/instances {"tel/otel" {:instance/aliases ["collector"]}}
+             :resolution/bindings {"a" {"otel" "tel/otel"} "b" {"kafka" "x/kafka"}}}
+        f (run/otlp-envs res "r1x")]
+    (is (= "http://collector:4317" (get (first (f "a")) "OTEL_EXPORTER_OTLP_ENDPOINT")))
+    (is (= "grpc" (get (first (f "a")) "OTEL_EXPORTER_OTLP_PROTOCOL")))
+    (is (nil? (f "b")) "no otel bound, nothing injected")))
+
+(deftest preexistence-marks
+  (testing "marked per provider project as a service set"
+    (is (= {"infra" #{"kafka" "zookeeper"}}
+           (run/mark-preexisting {} {"infra" #{"kafka" "zookeeper"}} {} "r1" {}))))
+  (testing "what another live run holds is not the world's"
+    (let [other {:stack/instances {"infra/kafka" {:instance/compose-project "infra"
+                                                  :instance/services ["kafka"] :instance/needs ["zookeeper"]}}}]
+      (is (= {} (run/mark-preexisting {} {"infra" #{"kafka" "zookeeper"}} {"r0" other} "r1" {})))))
+  (testing "what an active section holds is not marked either"
+    (is (= {"infra" #{"zookeeper"}}
+           (run/mark-preexisting {} {"infra" #{"kafka" "zookeeper"}} {} "r1" {"infra" #{"kafka"}}))))
+  (testing "marks only grow"
+    (is (= {"infra" #{"kafka" "x"}} (run/mark-preexisting {"infra" #{"x"}} {"infra" #{"kafka"}} {} "r1" {})))
+    (is (= {"infra" #{"x"}} (run/mark-preexisting {"infra" #{"x"}} {} {} "r1" {})))))
 
 (deftest sparing
   (is (= {:services ["b"] :kept {"a" [[:preexisting]]}}

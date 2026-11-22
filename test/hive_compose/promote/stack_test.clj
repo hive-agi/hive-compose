@@ -23,6 +23,16 @@
                       "billing" {:project/id "billing" :project/dir "/w/billing"}
                       "legacy" {:project/id "legacy" :project/dir "/w/legacy"}}})
 
+(deftest malformed-resolutions-are-results-never-exceptions
+  (testing "the input is checked before the private-project fill, so a malformed one is a Result (hc4-rereviewer MAJOR)"
+    (doseq [bad [{:resolution/instances {"infra/kafka" 42} :resolution/bindings {}}
+                 {:resolution/instances {"infra/kafka" {:instance/id "infra/kafka" :instance/share? false
+                                                        :instance/consumers 7}}
+                  :resolution/bindings {}}
+                 {:resolution/instances [] :resolution/bindings {}}
+                 nil]]
+      (is (= :compose/invalid-resolution (:error (stack/stack-plan settings bad "r01" {}))) (pr-str bad)))))
+
 (defn- inst [provider cap consumers share? & {:as extra}]
   (merge {:instance/id (if share? (str provider "/" cap) (str provider "/" cap "@" (first consumers)))
           :instance/capability cap :instance/provider provider :instance/service cap
