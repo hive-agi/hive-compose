@@ -333,7 +333,12 @@
                             (filter #(str/starts-with? % "0 ")) first (#(subs % 2)))
             prov-started (:out (docker "inspect" "-f" "{{.State.StartedAt}}" prov))
             cons-started (:out (docker "inspect" "-f" "{{.State.StartedAt}}" cons))
-            t #(java.time.Instant/parse (str/replace (first (str/split % #" ")) #"(\.\d{9})\d*" "$1"))]
+            ;; StartedAt is RFC 3339; a health log End is Go's default
+            ;; "2026-11-22 16:28:48.684396359 -0300 -03"
+            t (fn [s] (if-let [[_ d tm off] (re-matches #"(\S+) (\S+) ([+-]\d{2})(\d{2}).*" s)]
+                        (.toInstant (java.time.OffsetDateTime/parse
+                                     (str d "T" tm off ":" (second (re-matches #"\S+ \S+ [+-]\d{2}(\d{2}).*" s)))))
+                        (java.time.Instant/parse s)))]
         (evidence! :s5 {:provider-started prov-started :provider-first-healthy healthy-at :consumer-started cons-started})
         (is (r/ok? up) (pr-str up))
         (is (some? healthy-at))
