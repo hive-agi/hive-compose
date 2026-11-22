@@ -1,0 +1,8 @@
+TAP version 14
+1..5
+ok 1 - connects
+not ok 2 - migrates
+  ---
+  message: relation "orders" does not exist
+  ...
+Bail out! database unreachable
