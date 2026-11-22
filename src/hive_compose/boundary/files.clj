@@ -42,6 +42,19 @@
                                           StandardCopyOption/ATOMIC_MOVE]))
       path)))
 
+(defn read-lock
+  "Result<Lock-or-nil> from the stack lockfile at `path`
+   (hive-compose.promote.stack/lock-path); nil when there is none."
+  [path]
+  (read-edn path :compose/lock-unreadable nil))
+
+(defn write-lock!
+  "Write lockfile value `lock` (hive-compose.promote.stack/lock) to `path`
+   atomically, creating its directory. Result<path>."
+  [path lock]
+  (let [res (save-state! path lock)]
+    (if (r/err? res) (assoc res :error :compose/lock-unwritable) res)))
+
 (defn- persisted [st]
   {:active (or (:active st) {}) :current (:current st)})
 
