@@ -22,6 +22,8 @@
             [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
+            [hive-compose.pipeline.why :as why]
+            [hive-compose.adapter.tempo :as tempo]
             [hive-compose.promote.config :as config]
             [hive-compose.promote.env :as env]
             [hive-compose.port :as port]
@@ -35,7 +37,8 @@
             [hive-compose.adapter.procfs :as procfs]
             [hive-compose.pipeline.orphans :as orphans]
             [hive-compose.pipeline.ownership :as ownership]
-            [hive-addon.host :as addon-host])
+            [hive-addon.host :as addon-host]
+            [hive-compose.adapter.exec])
   (:import (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean)))
 
@@ -44,6 +47,11 @@
 (def addon-id-value "hive.compose")
 
 (defn- now-ms [] (System/currentTimeMillis))
+
+(def default-tempo-url
+  "Where `why` reads traces when `:compose/tempo-url` names none: the otel
+   provider's Tempo port as published on the host."
+  "http://127.0.0.1:3200")
 
 (defn- daemon-scheduler ^ScheduledExecutorService []
   (Executors/newSingleThreadScheduledExecutor
@@ -122,7 +130,12 @@
      :toxiproxy (:compose/toxiproxy cfg)
      :now (or (:compose/now cfg) now-ms)
      :save! (or (:compose/save! cfg) (fn [_] (sync!)))
-     :sync! (when-not (:compose/save! cfg) sync!)}))
+     :sync! (when-not (:compose/save! cfg) sync!)
+     ;; hc-10 why: the trace store the otel provider runs (Tempo on its host port)
+     :trace-query (or (:compose/trace-query cfg)
+                      (tempo/make-query {:base-url (or (:compose/tempo-url cfg) default-tempo-url)}))
+     :state-dir (:compose/runs-dir cfg)
+     :note! (:compose/why-note! cfg)}))
 
 ;; ---------------------------------------------------------------------------
 ;; reaper
@@ -195,7 +208,8 @@
    "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
    "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
    "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
-   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"))
+   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
+   "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"))
 
 (def commands
   (vec (keys command-help)))
@@ -307,6 +321,9 @@
         "stack-down" (stacks/stack-down! ctx (stack-opts params))
         "stack-status" (stacks/stack-status ctx (stack-opts params))
         "plan" (stacks/plan ctx (stack-opts params))
+        "why" (r/map-ok (why/why! ctx {:test (some-> (param params "test") str)
+                                       :run (some-> (param params "run") str)})
+                        #(dissoc % :why/markdown))
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
@@ -369,7 +386,8 @@
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
+                              "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}

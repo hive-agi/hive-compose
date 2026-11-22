@@ -83,8 +83,17 @@
       (into (if recreate? ["up" "-d" "--force-recreate" "--no-deps"] ["restart"]))
       (into services)))
 
-(defn logs-argv [p services tail]
-  (-> (base-argv p) (into ["logs" "--no-color" "--tail" (str tail)]) (into services)))
+(defn logs-argv
+  "`compose logs` of `services` (all when empty), the last `tail` lines each;
+   with `:profile/timestamps?` every line carries docker's RFC 3339 time, so
+   a time window can be cut from it (hc-10 why)."
+  [p services tail]
+  (-> (base-argv p)
+      (into ["logs" "--no-color" "--tail" (str tail)])
+      (cond-> (:profile/timestamps? p) (conj "--timestamps"))
+      (cond-> (:profile/since p) (into ["--since" (str (:profile/since p))]))
+      (cond-> (:profile/until p) (into ["--until" (str (:profile/until p))]))
+      (into services)))
 
 (defn containers-argv
   "Every container of `p`'s compose project, running or not, found by its
