@@ -21,6 +21,7 @@
             [hive-compose.boundary.files :as files]
             [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.ops :as ops]
+            [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.promote.config :as config]
             [hive-compose.promote.env :as env]
             [hive-compose.port :as port]
@@ -103,7 +104,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]
@@ -142,7 +143,10 @@
               observed (swarm/observe! ctx)
               reaped (ops/reap! ctx)
               _ (swarm/announce-reaped! ctx (:reaped reaped))
-              pass (cond-> (assoc reaped :observed observed) (seq adopted) (assoc :adopted adopted))]
+              stack-runs (:reaped (stacks/reap! ctx))
+              pass (cond-> (assoc reaped :observed observed)
+                     (seq adopted) (assoc :adopted adopted)
+                     (seq stack-runs) (assoc :stacks-reaped stack-runs))]
           (swap! state assoc :adopted? true :last-pass (assoc pass :at ((:now ctx))))
           pass)
         (catch Throwable t
@@ -187,7 +191,11 @@
    "adopt" "take charge of running containers no section owns"
    "projects" "every compose project on the host"
    "faults" "fault injection on a stack run whose needs go :via :toxiproxy: op add|remove|reset|list (default list); run (run id); proxy (<consumer>.<capability>, see TOXIPROXY_PROXIES); toxic {type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer, attributes {name number}, stream upstream|downstream, toxicity 0..1, name}"
-   "reload" "re-read the config"))
+   "reload" "re-read the config"
+   "stack-up" "run a stack (:compose/stacks): resolve capabilities, start shared and private instances in order, each waited and health-gated, join them to each consumer's view network hive-<run>-<consumer>, then start the consumers with their wiring env. stack; run (default <stack><6 hex>); wait (default true)"
+   "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
+   "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
+   "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"))
 
 (def commands
   (vec (keys command-help)))
@@ -225,6 +233,15 @@
   "The claiming agent: `agent`, else the `agent_id` the host stamps on a call."
   [params]
   (some-> (or (param params "agent") (param params "agent_id")) str))
+
+(defn- stack-opts
+  "The options of `stack-up`/`stack-down`/`stack-status`/`plan` from the tool
+   params: stack, run, wait (stack-up waits by default)."
+  [params]
+  (cond-> {}
+    (param params "stack") (assoc :stack (str (param params "stack")))
+    (param params "run") (assoc :run (str (param params "run")))
+    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
 
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
@@ -278,10 +295,18 @@
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
         "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
-        "claim" (on-subject #(swarm/claim! ctx % (agent-param params)
-                                            {:note (some-> (param params "note") str)}))
-        "release" (on-subject #(swarm/release-claim! ctx % (agent-param params)
-                                                     {:stop? (flag params "stop")}))
+        "claim" (if-let [run (stacks/claim-run tgt)]
+                  (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
+                  (on-subject #(swarm/claim! ctx % (agent-param params)
+                                              {:note (some-> (param params "note") str)})))
+        "release" (if-let [run (stacks/claim-run tgt)]
+                    (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
+                    (on-subject #(swarm/release-claim! ctx % (agent-param params)
+                                                       {:stop? (flag params "stop")})))
+        "stack-up" (stacks/stack-up! ctx (stack-opts params))
+        "stack-down" (stacks/stack-down! ctx (stack-opts params))
+        "stack-status" (stacks/stack-status ctx (stack-opts params))
+        "plan" (stacks/plan ctx (stack-opts params))
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
@@ -324,6 +349,8 @@
                      "starting its own JVM; nrepl path=<file> answers which port drives that file. The reaper keeps "
                      "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
+                     "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
+                     "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -341,7 +368,8 @@
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
-                              "run" {:type "string" :description "[faults] the stack run id"}
+                              "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}

@@ -50,5 +50,11 @@
    `theirs` (the file now). Each is {:active {..} :current id-or-nil}."
   [base mine theirs]
   (let [bc (:current base) mc (:current mine) tc (:current theirs)]
-    {:active (merge3 (:active base) (:active mine) (:active theirs) merge-entry)
-     :current (if (= tc bc) mc (if (= mc bc) tc mc))}))
+    (cond-> {:active (merge3 (:active base) (:active mine) (:active theirs) merge-entry)
+             :current (if (= tc bc) mc (if (= mc bc) tc mc))}
+      ;; stack runs (hc-6), merged like active entries; absent when no side has any
+      (some :stacks [base mine theirs])
+      (assoc :stacks (merge3 (:stacks base) (:stacks mine) (:stacks theirs) merge-entry))
+      ;; preexistence marks only grow: the union of every side, never a removal
+      (some :preexisting [base mine theirs])
+      (assoc :preexisting (merge-with into (:preexisting base) (:preexisting mine) (:preexisting theirs))))))
