@@ -95,8 +95,12 @@
       (is (= 403 (:status (api/route d (req "GET" "/v1/health" "" {"host" "evil.example:7781"})))))
       (is (= 403 (:status (api/route d (req "POST" "/v1/status" "{}" {"content-type" "application/json"}))))))
     (testing "loopback names pass"
-      (doseq [h ["localhost" "localhost:9" "127.0.0.1" "[::1]:9"]]
+      (doseq [h ["localhost" "localhost:9" "127.0.0.1" "127.0.0.2:9" "[::1]:9" "[0:0:0:0:0:0:0:1]:9"]]
         (is (= 200 (:status (api/route d (req "GET" "/v1/health" "" {"host" h})))) h)))
+    (testing "malformed or look-alike hosts fail closed with 403, never a 500"
+      (doseq [h ["/" "" "127.0.0.1.evil.example" "localhost.evil.example" "[::2]" "[fe80::1]"]]
+        (is (= 403 (:status (api/route d (req "GET" "/v1/health" "" {"host" h})))) h))
+      (is (= 403 (:status (api/route d (req "GET" "/v1/health" "" (assoc local "origin" "http:///")))))))
     (is (= 1 @ran) "only the loopback-origin POST reached dispatch")))
 
 (deftest a-throw-is-answered-without-its-data

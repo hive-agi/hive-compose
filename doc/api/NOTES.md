@@ -27,7 +27,7 @@ python3 assemble.py        # writes ../../../resources/hive_compose/openapi.yaml
 ```
 - `:port 0` binds an ephemeral port. `compose status` answers `api {host port url}`, and so does the initialize! metadata. A bind failure, or a non-loopback `:host` (refused), leaves the addon running and puts `api {error detail}` in its state.
 - The server starts in `initialize!` after the reaper and stops in `shutdown!`, 4 daemon threads, request bodies are capped at 1 MiB (413).
-- `curl -s -XPOST 127.0.0.1:$PORT/v1/status -d '{}'`, `curl 127.0.0.1:$PORT/v1/openapi.yaml`, `curl 127.0.0.1:$PORT/v1/health`.
+- `curl -s -XPOST -H 'Content-Type: application/json' 127.0.0.1:$PORT/v1/status -d '{}'` (a POST without that header is 415), `curl 127.0.0.1:$PORT/v1/openapi.yaml`, `curl 127.0.0.1:$PORT/v1/health`.
 
 ## Implementation
 
@@ -146,3 +146,13 @@ POST /v1/{op}        ==  the same, plus api/http-status for the code
   - **A jolt .so loaded INTO a JVM crashes the JVM** (Chez signal handlers clobber the JVM's) unless the JVM is started with `LD_PRELOAD=$JAVA_HOME/lib/libjsig.so`. hive-cabi's JVM loader must set or require that for jolt libraries (see the hive-cabi README). Inside hive-mcp, prefer the HTTP API or a subprocess.
 - Blocking: hive_call is synchronous, as HTTP is. `up --wait` can take `:compose/up-timeout-ms` (10 min), so a native caller runs it on its own thread. A deadline param (`timeout_ms` in the body) is a later addition for both transports at once.
 - Identity: the MCP host stamps `agent_id`. Over HTTP and hive_call, `claim`/`release` need `agent` in the body (otherwise `compose/missing-param`). There is no auth: the API binds loopback only.
+
+## Follow-ups (from review, not in this PR)
+
+- `(str t)` of an ExceptionInfo still prints its ex-data in `addon/tick!` last-pass (`status`, `reap`), `ops` release-threw, `orphans`/`ownership` check-failed. This predates hc-14 but now reaches HTTP: switch to class + ex-message.
+- The pool has 4 threads with an unbounded queue and no read timeout. A slow client or four `up --wait` calls starve `/v1/health`. Bound the queue (503) and set `sun.net.httpserver.maxReqTime`.
+- A changed `:compose/api` is only reported by reload, not rebound, and the comparison is against the last reload's cfg, not the config the server started with.
+- `check-params` runs before the unknown/planned check, so a badly typed param on `/v1/bogus` answers 400, not 404.
+- The spec does not declare 405/413 responses yet.
+- `gen/hc2.*.json` came from the uncommitted hc-2 worktree. Regenerate it from `origin/feat/hc-2-stack-schema` b55bf75 (or staging, once hc-2 merges) and pin the commit in assemble.py.
+- When hc-6 (PR #47) lands: `stack-up`, `stack-down`, `stack-status` and `plan` become real paths, and the contract test picks them up from the command enum.

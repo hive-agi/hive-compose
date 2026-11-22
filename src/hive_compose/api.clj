@@ -161,17 +161,29 @@
     (r/err :compose/invalid-param {:param k :hint (str "expected " t)})
     (r/ok params)))
 
-(def ^:private loopback-hosts #{"127.0.0.1" "localhost" "[::1]" "::1"})
-
 (defn- host-part
-  "The host of a Host header or an Origin URL, lower-cased, port dropped."
+  "The host of a Host header or an Origin URL, lower-cased, port dropped;
+   \"\" when there is none."
   [s]
   (when s
     (let [s (str/lower-case (str/replace s #"^[a-z][a-z0-9+.-]*://" ""))
-          s (first (str/split s #"/"))]
+          s (or (first (str/split s #"/")) "")]
       (if (str/starts-with? s "[")
         (subs s 0 (inc (or (str/index-of s "]") (dec (count s)))))
-        (first (str/split s #":"))))))
+        (or (first (str/split s #":")) "")))))
+
+(defn- loopback-name?
+  "Whether host `h` (from `host-part`) names this machine with no DNS lookup:
+   localhost, any 127/8 literal, or a bracketed IPv6 loopback literal ([::1],
+   [0:0:0:0:0:0:0:1]); every address `adapter.http/start!` may bind."
+  [h]
+  (boolean
+   (when h
+     (or (= "localhost" h)
+         (re-matches #"127(\.\d{1,3}){3}" h)
+         (when-let [[_ v6] (re-matches #"\[([0-9a-f:]+)\]" h)]
+           ;; an IPv6 literal: parsed, never resolved
+           (try (.isLoopbackAddress (java.net.InetAddress/getByName v6)) (catch Exception _ false)))))))
 
 (defn browser-guard
   "nil when request headers `hs` (lower-cased names) may reach the API, else
@@ -182,10 +194,10 @@
    preflight this server never grants)."
   [method hs]
   (cond
-    (not (contains? loopback-hosts (host-part (get hs "host"))))
-    (r/err :compose/forbidden-origin {:hint "Host must be 127.0.0.1, localhost or [::1]"})
+    (not (loopback-name? (host-part (get hs "host"))))
+    (r/err :compose/forbidden-origin {:hint "Host must be localhost, a 127/8 address or [::1]"})
 
-    (and (contains? hs "origin") (not (contains? loopback-hosts (host-part (get hs "origin")))))
+    (and (contains? hs "origin") (not (loopback-name? (host-part (get hs "origin")))))
     (r/err :compose/forbidden-origin {:hint "requests from a web page are refused"})
 
     (and (= "POST" method)
