@@ -27,8 +27,6 @@ tags:
   description: existing claim / nREPL routing commands
 - name: stacks
   description: stack runs, fault injection, failure explanation and flaky ranking (hc-4/6/10/12/13)
-- name: stacks (planned)
-  description: hc-8 placeholder (test)
 - name: meta
   description: health and this document
 security: []
@@ -1302,16 +1300,24 @@ paths:
   /v1/test:
     post:
       operationId: test
-      summary: Expand suites x projects to the minimal union stack, run each runner (container or command) with
-        TRACEPARENT a
-      description: Expand suites x projects to the minimal union stack, run each runner (container or command) with
-        TRACEPARENT and baggage test.id, collect exit code plus JUnit XML or TAP.
+      summary: 'run the suite x project matrix (:compose/suites): one stack for the union of what the cells need
+        (or the live '
+      description: 'run the suite x project matrix (:compose/suites): one stack for the union of what the cells
+        need (or the live run named by run), each suite''s runner (a container on the projects'' view networks,
+        or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir;
+        a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection
+        when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default
+        test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait
+        (default true)'
       tags:
-      - stacks (planned)
-      x-status: planned
-      x-plan-step: hc-8-suites
+      - stacks
       x-hive-call-op: test
+      x-mcp:
+        tool: compose
+        command: test
+      x-mutates: true
       requestBody:
+        required: false
         content:
           application/json:
             schema:
@@ -1327,17 +1333,25 @@ paths:
                 - type: object
                   properties:
                     value:
-                      $ref: '#/components/schemas/Res_test'
+                      $ref: '#/components/schemas/TestResult'
                   required:
                   - value
         '400':
           $ref: '#/components/responses/BadRequest'
-        '501':
-          description: not implemented yet (planned)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
   /v1/health:
     get:
       operationId: health
@@ -3269,6 +3283,9 @@ components:
                 timeout-ms:
                   type: integer
                   minimum: 1000
+                pull-timeout-ms:
+                  type: integer
+                  minimum: 1000
                 resources:
                   anyOf:
                   - const: unbounded
@@ -3524,6 +3541,9 @@ components:
           timeout-ms:
             type: integer
             minimum: 1000
+          pull-timeout-ms:
+            type: integer
+            minimum: 1000
           resources:
             anyOf:
             - const: unbounded
@@ -3680,8 +3700,8 @@ components:
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         note:
           type: string
           description: '[claim] what the agent works on'
@@ -3691,12 +3711,21 @@ components:
         wait:
           type: boolean
           description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
+        keep_up:
+          type: boolean
+          description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
+        dry_run:
+          type: boolean
+          description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>'
           allOf:
           - $ref: '#/components/schemas/Env'
+        suites:
+          type: string
+          description: '[test] suite ids under :compose/suites, X,Y (default all)'
         no_deps:
           type: boolean
           description: '[up|switch] start only the named services, not their depends_on (which must already run)'
@@ -3704,6 +3733,9 @@ components:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
+        projects:
+          type: string
+          description: '[test] projects under test, A,B (default every project a selected suite applies to)'
         op:
           type: string
           enum:
@@ -3791,10 +3823,13 @@ components:
       - compose/alias-clash
       - compose/alias-shadows-service
       - compose/api-bind-failed
+      - compose/attach-threw
       - compose/bundle-unwritable
+      - compose/cell-threw
       - compose/command-failed
       - compose/consumer-name-collision
       - compose/data-exec-unsupported
+      - compose/data-phase-threw
       - compose/data-runner-unsupported
       - compose/data-step-failed
       - compose/dependency-cycle
@@ -3816,6 +3851,7 @@ components:
       - compose/instance-not-ready
       - compose/instance-unhealthy
       - compose/internal
+      - compose/interrupted
       - compose/invalid-config
       - compose/invalid-consumer
       - compose/invalid-data-lifecycle
@@ -3846,6 +3882,7 @@ components:
       - compose/no-projects
       - compose/no-results
       - compose/no-runs
+      - compose/no-suite-runner
       - compose/no-trace-query
       - compose/not-active
       - compose/not-claimed
@@ -3868,19 +3905,28 @@ components:
       - compose/program-needs-command
       - compose/program-stop-failed
       - compose/program-unreadable
+      - compose/project-not-in-run
+      - compose/record-threw
       - compose/release-threw
+      - compose/reports-unwritable
       - compose/result-run-mismatch
       - compose/result-unreadable
       - compose/result-unwritable
+      - compose/run-busy
       - compose/run-exists
+      - compose/run-not-up
       - compose/runner-failed
+      - compose/runner-threw
       - compose/secret-unresolved
       - compose/shared-reset-without-tenancy
       - compose/stack-down-incomplete
       - compose/stacks-unsupported
       - compose/state-unreadable
       - compose/state-unwritable
+      - compose/suite-needs-not-in-run
+      - compose/summary-unwritable
       - compose/swarm-failed
+      - compose/test-threw
       - compose/toxiproxy-failed
       - compose/toxiproxy-proxy-conflict
       - compose/toxiproxy-unparseable
@@ -3900,10 +3946,13 @@ components:
       - compose/unknown-test
       - compose/unknown-via
       - compose/unparseable
+      - compose/unsafe-reports-dir
       - compose/unsupported-media-type
       - compose/volume-removal-refused
       - report/malformed
       - report/none
+      - report/unclearable
+      - report/uncollectable
       - report/unreadable
       - secrets/unknown-backend
       - trace/bad-id
@@ -4953,6 +5002,12 @@ components:
       additionalProperties: true
       description: 'pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files'
       x-source: hand
+    TestResult:
+      type: object
+      additionalProperties: true
+      description: 'pipeline.suites/test!: run, stack, status, exit, summary, one cell per suite x project (report
+        cut to totals and failed cases), stack-kept?, summary-file'
+      x-source: hand
     Req_help:
       type: object
       additionalProperties: true
@@ -5298,8 +5353,8 @@ components:
           description: '[faults] proxy name <consumer>.<capability>'
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         toxic:
           type: object
           description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
@@ -5316,8 +5371,8 @@ components:
       properties:
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5332,8 +5387,8 @@ components:
       properties:
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5345,8 +5400,8 @@ components:
       properties:
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5358,8 +5413,8 @@ components:
       properties:
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5371,11 +5426,33 @@ components:
       properties:
         run:
           type: string
-          description: '[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up
-            default <stack><6 hex>); claim/release a run with target=stack:<run>'
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
         test:
           type: string
           description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
+    Req_test:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
+        keep_up:
+          type: boolean
+          description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
+        projects:
+          type: string
+          description: '[test] projects under test, A,B (default every project a selected suite applies to)'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+        suites:
+          type: string
+          description: '[test] suite ids under :compose/suites, X,Y (default all)'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
@@ -5430,47 +5507,8 @@ components:
       - format
       - cases
       - totals
-      description: hc-8 Report as relayed by hc-lane-core (branch feat/hc8-report, promote/report.clj, uncommitted);
-        hand-copied, regenerate once merged
+      description: hc-8 Report (promote/report.clj); hand-copied
       x-source: hand
-      x-status: planned
-    Req_test:
-      type: object
-      properties:
-        suites:
-          type: array
-          items:
-            type: string
-        projects:
-          type: array
-          items:
-            type: string
-        run:
-          $ref: '#/components/schemas/RunId'
-      x-source: hand
-      x-status: planned
-      x-params-from: plan step description
-    Res_test:
-      type: object
-      properties:
-        run:
-          $ref: '#/components/schemas/RunId'
-        cells:
-          type: array
-          items:
-            type: object
-            properties:
-              suite:
-                type: string
-              project:
-                type: string
-              exit:
-                type: integer
-              report:
-                $ref: '#/components/schemas/Report'
-            x-source: hand
-      x-source: hand
-      x-status: planned
     HealthResult:
       type: object
       properties:
