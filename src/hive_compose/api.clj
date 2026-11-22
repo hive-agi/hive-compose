@@ -37,7 +37,7 @@
 
 (def status-by-category
   "HTTP status of a Result error category. Every category the source answers
-   (r/err :ns/name ..) is mapped, which api-test checks against src/; any
+   with an r/err literal is mapped, which api-test checks against src/; any
    other answers 500. 400 the request or the stack it names is invalid, 404 a
    named thing is not there, 409 it conflicts with what runs, 502 a backend
    (docker, toxiproxy, the trace store) failed, 503 the addon or a backend is
