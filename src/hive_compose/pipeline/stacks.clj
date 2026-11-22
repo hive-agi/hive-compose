@@ -255,6 +255,11 @@
                                                (up-instance! ctx engine (get-in sp [:stack/instances id]) wait?))
                                              (filter #(= :instance (:step/kind %)) (:stack/start-order sp)))
                            cs (all-ok (fn [c]
+                                        ;; recorded BEFORE its up: a failed up leaves
+                                        ;; containers that stack-down must still remove
+                                        (record! ctx rid #(assoc-in % [:consumers c]
+                                                                    {:compose-project (run/consumer-compose-project
+                                                                                       (:settings ctx) c rid)}))
                                         (r/map-ok (up-consumer! ctx engine sp ws c wait?)
                                                   (fn [row] (record! ctx rid #(assoc-in % [:consumers c]
                                                                                         (select-keys row [:compose-project :services])))

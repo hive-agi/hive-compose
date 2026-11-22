@@ -52,10 +52,15 @@
 
 (defn consumer-compose-project
   "The compose project consumer `consumer` runs under in `run`:
-   `<its project's compose name>-<run>`."
+   `<its project's compose name>-<run>` for a project, `<compose name>-<slug
+   target>-<run>` for a section `<project>/<target>`, so two sections of one
+   project in one run never share a compose project (nor its override)."
   [settings consumer run]
-  (let [proj (get-in settings [:compose/projects (consumer-project-id consumer)])]
-    (str (stack/project-compose-name proj) "-" run)))
+  (let [proj (get-in settings [:compose/projects (consumer-project-id consumer)])
+        [_ tgt] (str/split (str consumer) #"/" 2)]
+    (str (stack/project-compose-name proj)
+         (when (seq tgt) (str "-" (schema/slug tgt)))
+         "-" run)))
 
 (defn- project-base [proj]
   (cond-> {:dir (:project/dir proj)}
