@@ -1,0 +1,23 @@
+{
+  "name": "hive-compose-e2e-billing",
+  "version": "0.1.0",
+  "private": true,
+  "description": "hive-compose e2e fixture: billing service (Kafka consumer, OTel traced)",
+  "main": "index.js",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --require ./tracing.js index.js"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.10.0",
+    "@opentelemetry/auto-instrumentations-node": "0.83.1",
+    "@opentelemetry/core": "3.1.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.301.2",
+    "@opentelemetry/sdk-node": "0.301.2",
+    "@opentelemetry/sdk-trace": "3.1.1",
+    "kafkajs": "2.2.4"
+  }
+}
