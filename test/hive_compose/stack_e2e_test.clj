@@ -62,6 +62,14 @@
 
 ;; ---------------------------------------------------------------- config
 
+(def otlp-http
+  "Both fixtures export with an OTLP/HTTP SDK, so each consumer declares the
+   protocol it speaks in its own env, the layer that replaces the injected
+   endpoint and protocol as one pair. The host name is the alias otel joins
+   every consumer's view network under."
+  {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://otel:4318"
+   "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"})
+
 (defn settings
   "The projects and the stack of the scenario, every compose project name
    carrying `tag` so nothing on the host is touched."
@@ -81,15 +89,15 @@
             :project/env (into {} (map (fn [v] [v "0"]))
                                ["HIVE_OTEL_OTLP_GRPC_PORT" "HIVE_OTEL_OTLP_HTTP_PORT" "HIVE_OTEL_GRAFANA_PORT"
                                 "HIVE_OTEL_TEMPO_PORT" "HIVE_OTEL_LOKI_PORT" "HIVE_OTEL_PROMETHEUS_PORT"])
-            :project/provides {"otel" {:service "otel" :version "0.41.1"
-                                       :env {"OTEL_EXPORTER_OTLP_ENDPOINT" "http://otel:4318"
-                                             "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"}}}}
+            :project/provides {"otel" {:service "otel" :version "0.41.1"}}}
     "orders" {:project/id "orders" :project/dir (fixture "orders") :project/name (str tag "orders")
+              :project/env otlp-http
               :project/needs {"kafka" {:version "^3"} "otel" {}}}
     "billing" {:project/id "billing" :project/dir (fixture "billing") :project/name (str tag "billing")
+               :project/env otlp-http
                :project/needs {"kafka" {:version "^3"} "otel" {}}}
     "billing-c" {:project/id "billing-c" :project/dir (fixture "billing") :project/name (str tag "billingc")
-                 :project/env {"OTEL_SERVICE_NAME" "billing-c"}
+                 :project/env otlp-http
                  :project/needs {"kafka" {:version "^3" :share? false} "otel" {}}}}
    :compose/stacks {"e2e" {:stack/id "e2e" :stack/consumers ["orders" "billing" "billing-c"]}}})
 
@@ -206,6 +214,7 @@
                       env (into {} (keep #(let [[k v] (str/split % #"=" 2)] (when v [k v]))) (str/split-lines out))]
                   (is (= "http://otel:4318" (get env "OTEL_EXPORTER_OTLP_ENDPOINT")) cp)
                   (is (= run (get env "HIVE_RUN_ID")) cp)
+                  (is (str/includes? (str (get env "OTEL_RESOURCE_ATTRIBUTES")) "service.name=") cp)
                   (is (str/includes? (str (get env "OTEL_RESOURCE_ATTRIBUTES")) (str "hive.run.id=" run)) cp)
                   (is (= "kafka:9092" (get env "KAFKA_BOOTSTRAP")) cp)
                   (is (= (str run ".") (get env "TOPIC_PREFIX")) cp))))
