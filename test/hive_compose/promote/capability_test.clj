@@ -4,7 +4,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [hive-compose.promote.capability :as cap]))
+            [hive-compose.promote.capability :as cap]
+            [hive-compose.schema :as schema]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -243,3 +244,10 @@
           consumers' (shuffle* (:consumers w))]
       (= (resolve-world w)
          (resolve-world {:projects projects' :consumers consumers'})))))
+
+(defspec inputs-and-resolutions-conform-to-the-schema 200
+  (prop/for-all [w gen-world]
+    (let [r (resolve-world w)]
+      (and (every? #(nil? (schema/explain schema/Project %)) (vals (:projects w)))
+           (or (contains? r :error)
+               (nil? (schema/explain schema/Resolution (:ok r))))))))
