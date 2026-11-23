@@ -166,6 +166,20 @@ volumes:
           (is (= (str "http://localhost:" (+ (:web ports) offset))
                  (exec-out (run-container prefix rid "web") "printenv" "PUBLIC_URL")))
           (is (= (str offset) (exec-out (run-container prefix rid "web") "printenv" "OFFSET"))))
+        (testing "B1: the run's volumes carry the ownership labels"
+          (doseq [v (get-in (first (:runs (isolated/status c))) [:volumes :created])]
+            (is (= [rid prefix] (str/split (str/trim (:out (sh! "docker" "volume" "inspect" v "--format"
+                                                                 "{{index .Labels \"hive.compose.run\"}} {{index .Labels \"hive.compose.base\"}}")))
+                                           #" "))
+                v)))
+        (testing "B1: a pre-existing project with the colliding name is refused and left untouched"
+          (let [squat (str prefix "-squat")]
+            (sh! "docker" "volume" "create" "--label" (str "com.docker.compose.project=" squat)
+                 "--label" "com.docker.compose.volume=data" (str squat "_data"))
+            (let [x (isolated/up! c (preset c "web") {:run "squat" :ports {:offset (+ offset 50)}})]
+              (is (= :project-exists (:reason x)) (pr-str x)))
+            (is (some #{(str squat "_data")} (:volumes (objects prefix))) "the squatter's volume is untouched")
+            (is (empty? (filter #(str/starts-with? % squat) (:containers (objects prefix)))) "nothing started")))
         (testing "3. a second section joins the same compose project; the native profile's service runs"
           (let [x (isolated/up! c (preset c "extra") {:run rid})]
             (is (r/ok? x) (pr-str x))
