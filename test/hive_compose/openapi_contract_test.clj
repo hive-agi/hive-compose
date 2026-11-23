@@ -7,7 +7,9 @@
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [hive-compose.addon :as addon]
-            [hive-compose.api :as api])
+            [hive-compose.api :as api]
+            [hive-compose.stub :as stub]
+            [hive-compose.stub-runner :as stub-runner])
   (:import (com.networknt.schema InputFormat SchemaRegistry SpecificationVersion)
            (tools.jackson.dataformat.yaml YAMLMapper)))
 
@@ -80,6 +82,50 @@
              "components" (get @spec "components")}
         s (.getSchema ^SchemaRegistry @registry ^String (json/write-str doc) InputFormat/JSON)]
     (mapv str (.validate s ^String (json/write-str params) InputFormat/JSON))))
+
+(defn- response-problems
+  "Validation messages of answer `value` (as the API sends it, JSON) against
+   response schema `schema-name`."
+  [schema-name value]
+  (let [doc {"$schema" "https://json-schema.org/draft/2020-12/schema"
+             "$ref" (str "#/components/schemas/" schema-name)
+             "components" (get @spec "components")}
+        s (.getSchema ^SchemaRegistry @registry ^String (json/write-str doc) InputFormat/JSON)]
+    (mapv str (.validate s ^String (json/write-str value) InputFormat/JSON))))
+
+(deftest claim-answers-validate-against-ClaimResult
+  ;; a first claim and a renewal through the real dispatch, over the stub engine
+  ;; and runner: :nrepl stays a list of routes in both (review #62 round 2, N2)
+  (let [rn (stub-runner/runner)
+        _ (stub-runner/listen! rn 17888)
+        state-file (str (System/getProperty "java.io.tmpdir") "/hc-claim-contract-" (System/nanoTime) ".edn")
+        a (addon/make-addon {:compose/engine (stub/engine {} {} {"shop" {"api" {} "web" {}}})
+                             :compose/runner rn :compose/process-table nil
+                             :compose/state-file state-file :compose/config-source (constantly {})
+                             :compose/profiles-file "/nonexistent/profiles.edn"
+                             :compose/projects [{:project/id "shop" :project/dir "/w/shop"
+                                                 :project/programs [{:program/id "api-repl" :program/dir "/w/shop/api"
+                                                                     :program/command ["clojure"] :program/nrepl-port 17888
+                                                                     :program/with ["api"]}
+                                                                    {:program/id "web-repl" :program/dir "/w/shop/web"
+                                                                     :program/command ["clojure"] :program/nrepl-port 17889
+                                                                     :program/with ["web"]}]}]
+                             :compose/swarm? false :compose/notify? false :compose/adopt? false
+                             :compose/initial-delay-ms 3600000})
+        answer (fn [] (-> (addon/dispatch a "claim" {"target" "shop/api" "agent" "ling-1"})
+                          :ok json/write-str json/read-str))]
+    (try
+      (.initialize! ^hive_addon.protocol.IAddon a {})
+      (let [first-claim (answer)
+            renewal (answer)]
+        (is (vector? (get first-claim "nrepl")))
+        (is (= [] (response-problems "ClaimResult" first-claim)) "a first claim")
+        (is (contains? renewal "renewed"))
+        (is (vector? (get renewal "nrepl")) "a renewal keeps the list")
+        (is (= [] (response-problems "ClaimResult" renewal)) "a renewal"))
+      (finally
+        (.shutdown! ^hive_addon.protocol.IAddon a)
+        (.delete (java.io.File. state-file))))))
 
 (deftest request-schemas-validate-sample-params
   (doseq [[c params] {"up" {"target" "dc/web" "no_deps" true "wait" false "allow_shared" true

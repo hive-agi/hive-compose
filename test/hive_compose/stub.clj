@@ -62,6 +62,32 @@
                                  (into (get-in model [s :optional])))))
       (vec seen))))
 
+(defn- inputs-of
+  "What compose hashes service `s`'s config from, as the stub models it: dir,
+   files and the env it reads (every var, unless `reads!` named its vars)."
+  [w p s]
+  (let [reads (get-in w [:reads (profile/project p) s])]
+    [(:profile/dir p) (vec (:profile/files p))
+     (cond-> (:profile/env p) reads (select-keys reads))]))
+
+(defn- recreate-changed!
+  "As compose: a service whose inputs changed (or that has no container, or
+   any when `force?`) gets a new container id; the others keep theirs."
+  [world p services force?]
+  (let [project (profile/project p)]
+    (swap! world
+           (fn [w]
+             (reduce (fn [w s]
+                       (let [cur (get-in w [:cids project s])
+                             in (inputs-of w p s)]
+                         (if (and cur (not force?) (= in (get-in w [:cinputs project s])))
+                           w
+                           (-> w
+                               (update :cid-seq (fnil inc 0))
+                               (as-> w (assoc-in w [:cids project s] (str s "-" (:cid-seq w))))
+                               (assoc-in [:cinputs project s] in)))))
+                     w services)))))
+
 (defrecord StubEngine [world]
   port/IComposeEngine
   (-version [_] (or (fault world :version) (r/ok (get @world :version "stub-2.29.0"))))
@@ -92,10 +118,12 @@
   (-up! [_ p services]
     (record! world [:up (profile/project p) (vec services)])
     (swap! world assoc :last-up-no-deps? (boolean (:profile/no-deps? p)))
+    (swap! world update :ups (fnil conj []) {:profile p :services (vec services)})
     (or (fault world :up)
         (when-let [stderr (get @world :up-stderr)]
           (r/err :compose/command-failed {:exit 1 :stderr stderr}))
-        (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
+        (do (recreate-changed! world p services false)
+            (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
             (when (:profile/run p) ((resolve 'hive-compose.stub/create-run-volumes!) (->StubEngine world) p))
             (r/ok {:out ""}))))
   (-stop! [_ p services]
@@ -114,8 +142,10 @@
             (r/ok {:out ""}))))
   (-restart! [_ p services recreate?]
     (record! world [(if recreate? :recreate :restart) (profile/project p) (vec services)])
+    (swap! world update :restarts (fnil conj []) {:profile p :services (vec services) :recreate? recreate?})
     (or (fault world :restart)
-        (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
+        (do (when recreate? (recreate-changed! world p services true))
+            (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
             (r/ok {:out ""}))))
   (-logs [_ p services tail]
     (record! world [:logs (profile/project p) (vec services) tail])
@@ -391,6 +421,53 @@
                                                (:exec-fails @world)))]
               (r/err :compose/command-failed {:exit 1 :stderr stderr})
               (r/ok {:exit 0 :out ""})))))))
+
+(extend-type StubEngine
+  port/IDirProbe
+  ;; every dir exists unless `remove-dir!` named it
+  (-dir-exists? [{:keys [world]} dir] (not (contains? (:missing-dirs @world #{}) dir))))
+
+(defn remove-dir!
+  "Make `dir` count as removed (a checkout deleted under a running section)."
+  [e dir]
+  (swap! (:world e) update :missing-dirs (fnil conj #{}) dir))
+
+(extend-type StubEngine
+  port/IContainerIds
+  (-container-ids [{:keys [world]} p services]
+    (or (fault world :container-ids)
+        (r/ok (select-keys (get-in @world [:cids (profile/project p)] {}) services)))))
+
+(defn ups
+  "[{:profile :services}] of every -up! so far: the Profile each ran with."
+  [e]
+  (:ups @(:world e) []))
+
+(defn restarts
+  "[{:profile :services :recreate?}] of every -restart! so far."
+  [e]
+  (:restarts @(:world e) []))
+
+(defn run-outside!
+  "Make `services` of `project` run, as started outside the addon."
+  [e project services]
+  (swap! (:world e) update-in [:running project] (fnil into #{}) services))
+
+(defn halt!
+  "Make `services` of `project` stop running (a container that died)."
+  [e project services]
+  (swap! (:world e) update-in [:running project] #(reduce disj (or % #{}) services)))
+
+(defn reads!
+  "Make service `s` of `project` read only env vars `vars`: a call whose
+   other vars differ leaves its container as it is."
+  [e project s vars]
+  (swap! (:world e) assoc-in [:reads project s] (vec vars)))
+
+(defn container-ids
+  "{service id} of compose project `project` in the stub world."
+  [e project]
+  (get-in @(:world e) [:cids project] {}))
 
 (defn exec-fails!
   "Make every exec whose argv holds `text` in an argument fail with `stderr`."

@@ -18,7 +18,10 @@
   "Restart the services `p` names in place, or recreate them when `recreate?`.
    Their own dependencies are not touched. Services: the ones `p` names, else
    the active entry's, else its depends_on closure. The active map is
-   unchanged; an active `p` has its idle clock reset."
+   unchanged; an active `p` has its idle clock reset. The caller resolves
+   `p` through `ops/effective-subject` (the holding section's inputs) and
+   remembers a recreate's call env on that section (`ops/remember-call-env!`);
+   an in-place restart recreates nothing, so its env is not remembered."
   [ctx p recreate?]
   (let [id (:profile/id p)]
     (r/let-ok [services (if-let [s (seq (:profile/services p))]

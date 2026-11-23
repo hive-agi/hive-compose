@@ -18,8 +18,7 @@
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
             [hive-compose.promote.config :as config]
-            [hive-compose.promote.env :as env]
-            [hive-compose.promote.isolated :as isolated]
+            [hive-compose.promote.ownership :as ownership]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
@@ -49,9 +48,13 @@
    entry (a preset or a section) ran with. The snapshot of a section whose
    project is still configured is re-based on the project as configured now, so
    a release that follows a restart interpolates the files it names with the
-   variables they need. What the snapshot's env says wins over the project's."
+   variables they need. What the snapshot's env says wins over the project's.
+   A configured preset that is active keeps the env a call gave it
+   (:profile/call-env of its snapshot), so a later up, restart or reaper pass
+   never falls back to weaker env."
   [ctx id]
-  (if-let [p (or (configured ctx id)
+  (if-let [p (or (when-let [c (configured ctx id)]
+                   (target/with-call-env c (get-in (active-entry ctx id) [:profile :profile/call-env])))
                  (when-let [snap (:profile (active-entry ctx id))]
                    (let [[pid section?] (str/split id #"/" 2)
                          proj (get-in ctx [:settings :compose/projects pid])]
@@ -142,6 +145,165 @@
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
+
+(defn- peeled
+  "`p` (as `lookup` answers it for `id`) with its remembered call env taken
+   off :profile/env, so a var a call forgets falls back to what `id` declares."
+  [ctx id p]
+  (target/peel-call-env p (target/declared-env (:settings ctx) id (:profile/inputs-from p))))
+
+(defn- dir-exists?
+  "Whether `dir` exists, through the engine's IDirProbe; an engine without
+   one counts every dir as present."
+  [ctx dir]
+  (let [e (:engine ctx)]
+    (if (satisfies? port/IDirProbe e) (boolean (port/-dir-exists? e dir)) true)))
+
+(defn- holder-of
+  "{:holder Profile :section id} | {:none true} | {:disagree [..]}: the active
+   section other than `self` whose compose inputs a call on `services` of
+   compose project `project` runs with (`promote.ownership/pick-holder`), its
+   remembered call env peeled off. `only` narrows to one section id."
+  [ctx self project services only]
+  (let [active (dissoc (:active @(:state ctx)) self)
+        pick (ownership/pick-holder active project services (when-not (= only self) only))
+        h (:holder pick)]
+    (cond
+      (nil? h) pick
+      ;; its checkout was removed: it says nothing about where a recreate comes from
+      (and (:profile/dir h) (not (dir-exists? ctx (:profile/dir h))))
+      {:none true :holder-skipped {:section (:section pick) :dir (:profile/dir h)
+                                   :reason "its dir no longer exists"}}
+      :else (assoc pick :holder (peeled ctx (:section pick) h)))))
+
+(defn effective-subject
+  "Result<{:profile Profile :section holder-id-or-nil :holder-skipped ..}>:
+   the subject of an engine-reaching call (up, switch, restart; claim's start)
+   with the compose inputs it must run with, through
+   `promote.target/effective-profile`:
+   - `id` (profile=): the preset or active snapshot (`lookup`), its remembered
+     call env re-applied under this call's `env`;
+   - `target`, ACTIVE: its own snapshot is its holder (the dir, files and env
+     it was created from, its remembered call env), unless its inputs are
+     only assumed (an adoption nothing explained), when the active section
+     holding its services decides as below;
+   - `target`, not active: the section resolved from the project as configured
+     now, re-addressed at the active section that holds the services it names
+     (orphaned ones too: they still run that code), whose dir, files and env
+     it then uses and whose id it records under :profile/inputs-from. A holder
+     whose dir no longer exists is skipped (:holder-skipped names it). Holders
+     that disagree are :compose/holders-disagree naming them; `id` beside a
+     target names the one to use. Held by none: the project defaults.
+   `env` is this call's env; a nil value forgets that var. :section names the
+   holder the call ran from, nil when none."
+  [ctx {:keys [target id env]}]
+  (if-not (seq target)
+    (r/let-ok [p (subject ctx {:id id})]
+      (r/ok {:profile (target/effective-profile (peeled ctx id p) {:call-env env})}))
+    (r/let-ok [p0 (subject ctx {:target target :env (target/set-values env)})]
+      (let [sid (:profile/id p0)
+            entry (active-entry ctx sid)
+            own (:profile entry)
+            services (vec (:profile/services p0))
+            self? (and own (not= :assumed (:inputs entry)) (or (nil? id) (= id sid)))]
+        (if self?
+          ;; an active section is its own holder: what it was created from
+          (r/ok {:profile (assoc (target/effective-profile (peeled ctx sid own) {:call-env env})
+                                 :profile/services services)})
+          (let [p (cond-> (peeled ctx sid p0) (seq (:profile/call-env own)) (assoc :profile/call-env (:profile/call-env own)))
+                pick (holder-of ctx sid (profile/project p) services id)
+                skipped (:holder-skipped pick)]
+            (cond
+              (:holder pick) (r/ok {:profile (assoc (target/effective-profile p {:holder (:holder pick) :call-env env})
+                                                    :profile/services services
+                                                    :profile/inputs-from (:section pick))
+                                    :section (:section pick)})
+              (:disagree pick) (r/err :compose/holders-disagree
+                                      {:target sid :services services :holders (:disagree pick)
+                                       :message (str "the active sections holding " (str/join ", " services)
+                                                     " run with different compose inputs: "
+                                                     (str/join ", " (map :section (:disagree pick))))
+                                       :hint "name the section to run from with profile=<id>"})
+              (and id (not= id sid) (not skipped)) (r/err :compose/not-a-holder
+                                                          {:profile id :services services
+                                                           :hint (str id " holds none of " (str/join ", " services))})
+              :else (r/ok (cond-> {:profile (target/effective-profile p {:call-env env})}
+                            skipped (assoc :holder-skipped skipped))))))))))
+
+(defn claim-call
+  "The `effective-subject` call of a claim on section `p` (as
+   `section-subject` resolved it from target `tgt` / profile `id`): by id when
+   `p` is active or a preset, else by the target, so a claim that starts or
+   adopts it uses the inputs an up would."
+  [ctx p tgt id]
+  (let [sid (:profile/id p)]
+    (if (or (active-entry ctx sid) (configured ctx sid))
+      {:id sid}
+      {:target tgt :id id})))
+
+(defn adopt-profile
+  "{:profile Profile :assumed? bool}: what section `p`, found running but not
+   tracked, is recorded as having been started from. The active section that
+   holds its services says (its dir, files and env, through
+   `promote.target/effective-profile`); with none, or holders that disagree,
+   nothing is known and `p` is recorded as an assumption."
+  [ctx p]
+  (let [services (vec (:profile/services p))
+        pick (when (seq services)
+               (holder-of ctx (:profile/id p) (profile/project p) services nil))]
+    (if-let [h (:holder pick)]
+      {:profile (assoc (target/effective-profile p {:holder h}) :profile/services services)
+       :assumed? false}
+      {:profile p :assumed? true})))
+
+(defn remember-call-env!
+  "Active entry `id` remembers call env `env` (a nil value forgets that var),
+   as after an up: what a recreate ran with is what the section runs with.
+   Nothing when `id` is not active or `env` is empty."
+  [ctx id env]
+  (when-let [snap (and (seq env) (:profile (active-entry ctx id)))]
+    (swap! (:state ctx) update-in [:active id :profile]
+           target/remember-call-env env (target/declared-env (:settings ctx) id (:profile/inputs-from snap)))
+    (persist! ctx)))
+
+(defn inputs-known!
+  "A recreate of active entry `id` ran with Profile `p`: when its inputs were
+   only assumed, they are now `p`'s (its services kept), no longer assumed."
+  [ctx id p]
+  (when (= :assumed (get-in @(:state ctx) [:active id :inputs]))
+    (swap! (:state ctx) update-in [:active id]
+           (fn [a] (-> a
+                       (dissoc :inputs)
+                       (assoc :profile (cond-> (assoc p :profile/id id)
+                                         (get-in a [:profile :profile/services])
+                                         (assoc :profile/services (get-in a [:profile :profile/services])))))))
+    (persist! ctx)))
+
+(defn drop-stale-call-env!
+  "After a reload from Settings `old` to the ones in `ctx`: in every active
+   entry, forget the remembered call env keys whose DECLARED value (preset
+   env, or the project env of a section) changed, since the edit is the
+   newer intent (`promote.target/stale-call-env-keys`). Answers {id [key]}
+   of what was dropped."
+  [ctx old]
+  (let [new (:settings ctx)
+        dropped (into (sorted-map)
+                      (for [[id a] (:active @(:state ctx))
+                            :let [ce (get-in a [:profile :profile/call-env])
+                                  from (get-in a [:profile :profile/inputs-from])
+                                  ks (when (seq ce)
+                                       (target/stale-call-env-keys (target/declared-env old id from)
+                                                                   (target/declared-env new id from) ce))]
+                            :when (seq ks)]
+                        [id ks]))]
+    (when (seq dropped)
+      (swap! (:state ctx) update :active
+             (fn [m] (reduce-kv (fn [m id ks]
+                                  (update-in m [id :profile] target/forget-call-env ks
+                                             (target/declared-env new id (get-in m [id :profile :profile/inputs-from]))))
+                                m dropped)))
+      (persist! ctx))
+    dropped))
 
 (defn section-subject
   "Result<Profile> for claim and release, which name a section that usually
@@ -698,8 +860,11 @@
                            :let [closure (port/-closure engine p)]
                            :when (r/ok? closure)
                            :let [running (port/-running engine p)]
-                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))]
-                       (adopt-entry p (:ok closure) now)))
+                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))
+                           ;; what a holder says it runs from, else assumed
+                           :let [{p' :profile assumed? :assumed?} (adopt-profile ctx p)]]
+                       (cond-> (adopt-entry p' (:ok closure) now)
+                         assumed? (assoc :inputs :assumed))))
         _ (swap! (:state ctx) update :active into (map (juxt :profile/id identity)) presets)
         owned (fn [project taken]
                 (into #{} (comp (filter #(= project (:project %))) (mapcat :services))
@@ -717,8 +882,10 @@
                            (if (seq unowned)
                              (let [closure (port/-closure engine (assoc whole :profile/services unowned))
                                    needs (if (r/ok? closure) (:ok closure) unowned)]
-                               (conj taken (adopt-entry (target/section proj ["adopted"] unowned)
-                                                        unowned needs now)))
+                               ;; nothing says which checkout a stray came from
+                               (conj taken (assoc (adopt-entry (target/section proj ["adopted"] unowned)
+                                                               unowned needs now)
+                                                  :inputs :assumed)))
                              taken)))
                        []
                        (sort-by key (:compose/projects settings)))
@@ -784,7 +951,13 @@
                          :idle-action (profile/idle-action settings p)
                          :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
-                  (:profile/run p) (merge (isolated/section-row p (env/rendered (:profile/env p))))
+                  ;; an isolated run's section: the run it belongs to
+                  (:profile/run p) (assoc :run (:profile/run p))
+                  ;; the checkout, files and env NAMES the section runs with (values of *_SRC only)
+                  (:profile a) (merge (target/inputs-summary (:profile a)))
+                  ;; adopted running with nothing to say how it was started
+                  (= :assumed (:inputs a)) (assoc :inputs "assumed")
+                  (get-in a [:profile :profile/inputs-from]) (assoc :inputs-from (get-in a [:profile :profile/inputs-from]))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)

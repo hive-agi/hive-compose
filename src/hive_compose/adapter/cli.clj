@@ -674,6 +674,37 @@
         (r/map-ok (run exec nil (stats-argv (keys names)) timeout-ms)
                   #(service-cpu names %))))))
 
+(defn container-ids-argv
+  "Every container of `p`'s compose project, running or not, by label, one
+   `<id>\t<service>` line each. Loads no compose file."
+  [p]
+  ["docker" "ps" "-a" "--no-trunc" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   ;; a `compose run` one-off carries the same service label: never the service's container
+   "--filter" "label=com.docker.compose.oneoff=False"
+   "--format" "{{.ID}}\t{{.Label \"com.docker.compose.service\"}}"])
+
+(defn service-container-ids
+  "{service id} of `container-ids-argv` output for `services`. Pure."
+  [s services]
+  (let [wanted (set services)]
+    (into (sorted-map)
+          (for [line (lines s)
+                :let [[id svc] (str/split line #"\t" 2)]
+                :when (and (seq id) (wanted svc))]
+            [svc id]))))
+
+(extend-type CliEngine
+  port/IDirProbe
+  (-dir-exists? [_ dir] (.isDirectory (io/file (str dir)))))
+
+(extend-type CliEngine
+  port/IContainerIds
+  (-container-ids [{:keys [exec timeout-ms]} p services]
+    (if (empty? services)
+      (r/ok {})
+      (r/map-ok (run exec nil (container-ids-argv p) timeout-ms)
+                #(service-container-ids % services)))))
+
 (defn- write-override!
   "Result<path-or-nil>: the override of `spec` written under `dir`, nil when
    `spec` needs none. Holds no value, only names (see `override-doc`)."

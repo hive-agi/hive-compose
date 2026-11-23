@@ -77,6 +77,12 @@
    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
    [:profile/programs {:optional true} [:vector Program]]
    [:profile/env {:optional true} Env]
+   ;; the env a call gave (up/switch/restart env=), kept so a later call on the
+   ;; same section never falls back to weaker env; references stay references
+   [:profile/call-env {:optional true} Env]
+   ;; a target section that runs from another (holding) section's dir, files
+   ;; and env: its id; a reload then keeps those and rebases only the rest
+   [:profile/inputs-from {:optional true} ProfileId]
    [:profile/wait? {:optional true} :boolean]
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
@@ -142,6 +148,9 @@
    [:profile {:optional true} Profile]
    [:claims {:optional true} [:map-of :string Claim]]
    [:orphaned-at {:optional true} :int]
+   ;; :assumed: adopted running with nothing saying how it was started; its
+   ;; :profile is the preset or project default, never trusted as a holder
+   [:inputs {:optional true} [:enum :assumed]]
    [:usage {:optional true} Usage]])
 
 (def ActiveMap [:map-of :string Active])
