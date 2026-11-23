@@ -450,7 +450,7 @@
         ;; m1: a failed `down` may leave containers: never remove then
         volumes? (and volumes? (r/ok? leftovers))
         vols (when volumes? (remove-volumes! ctx rid))]
-    (cond-> {:run rid :ended? true}
+    (cond-> {:run rid :ended? (r/ok? leftovers)}
       (r/err? leftovers) (assoc :leftovers-error (select-keys leftovers [:error :stderr])
                                 :volumes-kept-why :leftovers-error)
       (and vols (r/ok? vols)) (assoc :volumes (:ok vols))
