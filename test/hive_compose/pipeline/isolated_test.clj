@@ -10,6 +10,7 @@
             [hive-compose.adapter.cli :as cli]
             [hive-compose.addon]
             [hive-compose.pipeline.swarm]
+            [hive-compose.promote.ownership]
             [hive-compose.schema]
             [hive-compose.promote.config]
             [hive-compose.pipeline.isolated :as isolated]
@@ -532,3 +533,15 @@
         b (get-in (isolated/plan ctx (preset ctx "flow-sync") {:ports {:offset 2000}}) [:ok :config-digest])]
     (is (string? a))
     (is (= a b))))
+
+(deftest a-run-section-and-the-shared-project-never-hold-each-other
+  (let [{:keys [ctx]} (world)
+        _ (ops/up-profile! ctx (preset ctx "flow-payment"))
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+        active (:active @(:state ctx))
+        holders (fn [self project] (hive-compose.promote.ownership/holders active self project ["web" "postgres"]))]
+    (is (r/ok? (ops/lookup ctx (str "flow-payment@" rid))))
+    (is (empty? (filter #(= (str "flow-payment@" rid) (:section %)) (holders "flow-payment" "dc")))
+        "the run's section is no holder of the shared project's services")
+    (is (empty? (filter #(= "flow-payment" (:section %)) (holders (str "flow-payment@" rid) (str "dc-" rid))))
+        "the shared section is no holder of the run's services")))
