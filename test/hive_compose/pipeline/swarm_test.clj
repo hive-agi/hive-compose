@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.swarm :as swarm]
+            [hive-compose.port :as port]
             [hive-compose.stub :as stub]
             [hive-compose.stub-runner :as stub-runner]
             [hive-compose.stub-swarm :as stub-swarm]
@@ -81,6 +82,212 @@
     (is (= "fix login" (get-in @(:state c) [:active "shop/api" :claims "ling-1" :note])))
     (testing "a claim without an agent is refused"
       (is (r/err? (swarm/claim! c (section c "shop/api") "" {}))))))
+
+(defn- ups [c] (filterv #(#{:up :restart :recreate} (first %)) (stub/calls (:engine c))))
+
+(deftest a-claim-on-an-active-section-never-starts-anything
+  ;; staging already skipped up for a section in THIS instance's map: the
+  ;; up-count assertions here are regression guards; :renewed and the
+  ;; target= lookups are red on staging. The D1 red tests proper are
+  ;; a-claim-on-a-running-untracked-section-takes-it-without-an-up and
+  ;; a-claim-sees-a-section-another-instance-brought-up.
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (is (contains? (:ok (swarm/claim! c p "ling-1" {})) :started) "the first claim brings it up")
+    (let [before (ups c)
+          res (:ok (swarm/claim! c p "ling-2" {:note "renew"}))]
+      (is (= before (ups c)) "no up, restart or recreate on a renewal")
+      (is (not (contains? res :started)))
+      (is (= {:profile "shop/api" :services ["api" "postgres"]} (:renewed res))))
+    (testing "the same by preset id: profile= and target= both find the active section"
+      (let [c (ctx)
+            c (assoc-in c [:settings :compose/profiles "flow"]
+                        {:profile/id "flow" :profile/dir "/w/shop" :profile/project "shop" :profile/services ["api"]})
+            p (:ok (ops/section-subject c {:id "flow"}))]
+        (swarm/claim! c p "ling-1" {})
+        (let [before (ups c)]
+          (doseq [call [{:id "flow"} {:target "flow"} {:target "shop/flow"}]]
+            (let [res (r/bind (ops/section-subject c call) #(swarm/claim! c % "ling-2" {}))]
+              (is (r/ok? res) (str call))
+              (is (:renewed (:ok res)) (str call))))
+          (is (= before (ups c))))))))
+
+(deftest a-claim-on-a-running-untracked-section-takes-it-without-an-up
+  (testing "its services run (another section or instance started them): claim tracks it, starts nothing"
+    (let [c (ctx)
+          _ (ops/up-profile! c (section c "shop/api"))
+          _ (swap! (:state c) update :active dissoc "shop/api")
+          before (ups c)
+          res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+      (is (= before (ups c)))
+      (is (not (contains? res :started)))
+      (is (= ["api" "postgres"] (get-in res [:adopted :services])))
+      (is (= ["ling-1"] (:claims res)))))
+  (testing "when something it needs is down, it is brought up as before"
+    (let [c (ctx)
+          res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+      (is (contains? res :started))
+      (is (= [[:up "shop" ["api" "postgres"]]] (ups c))))))
+
+(deftest an-adopted-section-starts-its-host-programs
+  (let [c (ctx)
+        _ (ops/up-profile! c (section c "shop/api"))
+        _ (swap! (:state c) update :active dissoc "shop/api")
+        starts (count (stub-runner/starts (:runner c)))
+        before (ups c)
+        res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+    (is (= before (ups c)) "still no engine start")
+    (is (= (inc starts) (count (stub-runner/starts (:runner c)))) "the paired nREPL program is started")
+    (is (= ["api-repl"] (keys (get-in @(:state c) [:active "shop/api" :programs]))) "and recorded, so release stops it")
+    (is (= [true] (mapv :started? (get-in res [:adopted :programs])))))
+  (testing "a program that cannot start: the claim still holds and says why"
+    (let [c (ctx)
+          _ (ops/up-profile! c (section c "shop/api"))
+          _ (swap! (:state c) update :active dissoc "shop/api")
+          _ (stub-runner/fail! (:runner c) :start)
+          res (swarm/claim! c (section c "shop/api") "ling-1" {})]
+      (is (r/ok? res))
+      (is (= ["ling-1"] (:claims (:ok res))))
+      (is (= "api-repl" (get-in res [:ok :adopted :programs-not-started 0 :program/id])))
+      (is (some? (get-in res [:ok :adopted :programs-not-started 0 :error]))))))
+
+(defn- gated-runner
+  "A program runner over stub runner `rn` whose -start! counts starts and, on
+   the first, waits until both claimers have entered claim! (`entered`) and
+   then up to 2 s for a second start (`second`): a claim that is not
+   serialized starts the program twice inside that window, a serialized one
+   cannot (the second claimer waits on the section lock)."
+  [rn entered starts second]
+  (reify port/IProgramRunner
+    (-facts [_ dir] (port/-facts rn dir))
+    (-start! [_ p log]
+      (swap! starts inc)
+      (.countDown ^java.util.concurrent.CountDownLatch second)
+      (.await ^java.util.concurrent.CountDownLatch entered 5 java.util.concurrent.TimeUnit/SECONDS)
+      (.await ^java.util.concurrent.CountDownLatch second 2 java.util.concurrent.TimeUnit/SECONDS)
+      (port/-start! rn p log))
+    (-alive? [_ pid] (port/-alive? rn pid))
+    (-listening? [_ port] (port/-listening? rn port))
+    (-nrepl-port [_ dir] (port/-nrepl-port rn dir))
+    (-halt! [_ pid] (port/-halt! rn pid))))
+
+(deftest concurrent-claims-on-an-untracked-running-section-start-its-programs-once
+  (let [entered (java.util.concurrent.CountDownLatch. 2)
+        second (java.util.concurrent.CountDownLatch. 2)
+        starts (atom 0)
+        c (assoc (ctx)
+                 :engine (stub/engine {} {"shop" #{"api" "postgres"}} model)
+                 :runner (gated-runner (stub-runner/runner) entered starts second))
+        p (section c "shop/api")
+        claim #(future (.countDown entered) (swarm/claim! c p % {}))
+        a (claim "ling-1")
+        b (claim "ling-2")
+        res [(deref a 10000 ::timeout) (deref b 10000 ::timeout)]]
+    (is (every? r/ok? res) (pr-str res))
+    (is (= 1 @starts) "the paired nREPL program is started once, not once per claimer")
+    (is (= #{:adopted :renewed} (set (map #(some #{:adopted :renewed} (keys (:ok %))) res)))
+        "one claimer adopts, the other finds it tracked and renews")
+    (is (= ["api-repl"] (keys (get-in @(:state c) [:active "shop/api" :programs]))) "recorded once")
+    (is (= ["ling-1" "ling-2"] (sort (keys (get-in @(:state c) [:active "shop/api" :claims])))))
+    (is (= [] (ups c)) "no engine start")))
+
+(deftest a-wave-claims-end-counts-from-after-a-slow-start
+  (let [c (ctx)
+        p (section c "shop/api")
+        res (:ok (swarm/claim! c p "coordinator:f07f8867"
+                               {:note "gate" :ttl-minutes 1
+                                :start! #(do (advance! c (* 2 minute)) (ops/up-profile! c p))}))]
+    (is (= (* 3 minute) (get-in res [:claim :until])) "now after the 2-minute up, plus 1 minute")
+    (is (= 60 (get-in res [:claim :expires-in-seconds])))))
+
+(deftest a-plain-renewal-after-the-owners-wave-ended-keeps-the-section
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 60})
+    (advance! c (* 61 minute))
+    (let [res (:ok (swarm/claim! c p "coordinator:f07f8867" {}))]
+      (is (string? (:wave-ended res)) "the answer says the wave claim had ended")
+      (is (false? (get-in res [:claim :wave?]))))
+    (let [pass (pass! c)]
+      (is (empty? (get-in pass [:observed :expired])) "the renewal holds: not dropped as :expired")
+      (is (empty? (:reaped pass))))
+    (is (active? c "shop/api"))))
+
+(deftest a-claim-never-resurrects-a-section-forgotten-meanwhile
+  ;; the section is not tracked and its start answers ok, but a reaper pass
+  ;; forgot it meanwhile (here: the start leaves no entry): the claim fails
+  ;; instead of writing an entry with only :claims and :last-touch
+  (let [c (ctx)
+        p (section c "shop/api")
+        res (swarm/claim! c p "ling-3" {:start! #(r/ok {:profile "shop/api"})})]
+    (is (= :compose/not-active (:error res)))
+    (is (nil? (get-in @(:state c) [:active "shop/api"])))))
+
+(deftest a-claim-sees-a-section-another-instance-brought-up
+  ;; two addon instances share one state file; :sync! merges it in. The second
+  ;; instance's claim must see the first's section and renew, not start it.
+  (let [c1 (ctx)
+        _ (ops/up-profile! c1 (section c1 "shop/api"))
+        c2 (ctx)
+        c2 (assoc c2 :sync! (fn [] (swap! (:state c2) assoc :active (:active @(:state c1)))))
+        res (:ok (swarm/claim! c2 (section c2 "shop/api") "ling-2" {}))]
+    (is (:renewed res) "a renewal, not a start")
+    (is (= [] (ups c2)) "no up on the second instance's engine")))
+
+(deftest claim-and-release-accept-a-section-or-preset-id-as-target
+  (let [c (assoc-in (ctx) [:settings :compose/profiles "flow"]
+                    {:profile/id "flow" :profile/dir "/w/shop" :profile/project "shop" :profile/services ["api"]})]
+    (is (= "flow" (:profile/id (:ok (ops/section-subject c {:target "flow"})))) "a preset id")
+    (is (= "flow" (:profile/id (:ok (ops/section-subject c {:target "shop/flow"})))) "behind its compose project")
+    (is (= "shop/api" (:profile/id (:ok (ops/section-subject c {:target "shop/api"})))) "a target still resolves")
+    (ops/up-profile! c (section c "blog/ghost"))
+    (is (= "blog/ghost" (:profile/id (:ok (ops/section-subject c {:target "blog/ghost"})))) "an active section id")
+    (is (= :compose/unknown-target (:error (ops/section-subject c {:target "nope"}))))))
+
+(deftest a-wave-claim-outlives-its-coordinator-and-lanes-claim-on-top
+  (let [c (ctx [{:agent/id "coordinator:f07f8867"} {:agent/id "ling-1" :agent/cwd "/elsewhere"}])
+        p (section c "shop/api")]
+    (testing "bounded, and it needs a note"
+      (is (= :compose/claim-ttl-over-max (:error (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 481}))))
+      (is (= :compose/missing-param (:error (swarm/claim! c p "coordinator:f07f8867" {:ttl-minutes 240}))))
+      (is (not (active? c "shop/api")) "a refused wave claim starts nothing"))
+    (let [res (:ok (swarm/claim! c p "coordinator:f07f8867" {:note "pv01 gate" :ttl-minutes 240}))]
+      (is (= {:note "pv01 gate" :since 0 :seen 0 :wave? true :until (* 240 minute) :expires-in-seconds (* 240 60)}
+             (:claim res))))
+    (swarm/claim! c p "ling-1" {:note "scored run"})
+    (swarm/release-claim! c p "ling-1" {})
+    (is (contains? (get-in @(:state c) [:active "shop/api" :claims]) "coordinator:f07f8867")
+        "releasing an ordinary claim leaves the wave claim")
+    (stub-swarm/agents! (:swarm c) [])
+    (dotimes [_ 7]
+      (advance! c (* 30 minute))
+      (let [pass (pass! c)]
+        (is (empty? (get-in pass [:observed :expired])) "parked or gone, unrenewed: the wave claim holds")
+        (is (empty? (:reaped pass)))))
+    (is (active? c "shop/api") "3.5 h on, past the section TTL and the claim TTL: kept")
+    (let [[s] (:sections (:ok (swarm/who c)))
+          w (get-in s [:claims "coordinator:f07f8867"])]
+      (is (:wave? w))
+      (is (= (* 30 60) (:expires-in-seconds w)))
+      (is (= "pv01 gate" (:note w))))
+    (testing "renewing moves its end"
+      (swarm/claim! c p "coordinator:f07f8867" {:note "pv01 gate" :ttl-minutes 60})
+      (is (= (* 270 minute) (get-in @(:state c) [:active "shop/api" :claims "coordinator:f07f8867" :until]))))
+    (advance! c (* 61 minute))
+    (let [pass (pass! c)]
+      (is (= [{:section "shop/api" :agent "coordinator:f07f8867" :reason :expired}] (get-in pass [:observed :expired])))
+      (is (= ["shop/api"] (get-in pass [:observed :orphaned])) "an ended wave claim orphans like any other"))
+    (advance! c (* 11 minute))
+    (pass! c)
+    (is (not (active? c "shop/api")) "then the reaper takes it like any orphan")))
+
+(deftest release-ends-a-wave-claim-at-once
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 480})
+    (let [res (:ok (swarm/release-claim! c p "coordinator:f07f8867" {}))]
+      (is (= [] (:claims res)))
+      (is (:orphaned? res)))))
 
 (deftest a-renewed-claim-keeps-the-section-past-its-ttl
   (let [c (ctx)
@@ -227,7 +434,7 @@
     (let [{:keys [sections agents]} (:ok (swarm/who c))
           [s] sections]
       (is (= "shop/api" (:id s)))
-      (is (= {"ling-1" {:note "fix login" :since 0 :seen 0}} (:claims s)))
+      (is (= {"ling-1" {:note "fix login" :since 0 :seen 0 :wave? false :expires-in-seconds (* 30 60)}} (:claims s)))
       (is (:in-use? s))
       (is (= [{:claim "ling-1"} {:agent "ling-2"}] (:used-by s)))
       (is (= {"ling-2" ["shop/api"] "ling-3" []}

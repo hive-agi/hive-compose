@@ -31,6 +31,9 @@
      :compose/cpu-busy-percent     CPU use, in percent of one core, above which a
                                    service of a :cpu section is busy (default 5)
      :compose/claim-ttl-minutes    a claim not renewed for this long ends (default 30)
+     :compose/claim-max-ttl-minutes the longest wave claim (claim ttl_minutes=..) an
+                                   agent or coordinator may hold; a longer request
+                                   is refused, never clamped (default 480)
      :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
                                    whose last claim ended, when shorter than its TTL
                                    (default 10)
@@ -67,6 +70,7 @@
    :compose/activity #{:nrepl}
    :compose/cpu-busy-percent 5
    :compose/claim-ttl-minutes 30
+   :compose/claim-max-ttl-minutes 480
    :compose/orphan-ttl-minutes 10
    :compose/program-grace-ms 3000})
 

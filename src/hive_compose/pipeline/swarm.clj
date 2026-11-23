@@ -309,35 +309,150 @@
 (defn- reap-in-seconds [ctx p a]
   (max 0 (quot (- (+ (:last-touch a) (plan/effective-ttl-ms (:settings ctx) p a)) ((:now ctx))) 1000)))
 
+(defn- synced-active
+  "The active entry `sid` after merging the state file in (`:sync!`, when the
+   context has one): another addon instance sharing the file (a hot remount,
+   the control API) may have brought the section up since this one last read."
+  [ctx sid]
+  (when-let [sync! (:sync! ctx)]
+    (try (sync!) (catch Throwable _sync-failed nil)))
+  (get-in @(:state ctx) [:active sid]))
+
+(defn- adopt-running!
+  "Result<entry-or-nil>: when the addon does not track section `p` but every
+   service it would start already runs (a section reconcile forgot while its
+   containers were being recreated, or one brought up outside this
+   instance), track it as active WITHOUT calling the engine to start
+   anything, and answer the new entry. nil when something it needs is down."
+  [ctx p]
+  (let [engine (:engine ctx)]
+    (r/let-ok [closure (port/-closure engine p)
+               running (port/-running engine p)]
+      (let [services (profile/up-services p closure)
+            now ((:now ctx))]
+        (if (and (seq services) (every? (set running) services))
+          ;; the containers run: start only the host programs they pair with
+          ;; (no engine call), as `up` would have, so the claimer gets its nREPL
+          (let [{:keys [held report]} (ops/start-section-programs! ctx p services)
+                not-started (filterv #(or (:error %) (:exited? %)) report)]
+            (swap! (:state ctx) update-in [:active (:profile/id p)]
+                   (fn [a] (or a (cond-> {:profile/id (:profile/id p) :project (profile/project p)
+                                          :services (vec services) :profile p
+                                          :started-at now :last-touch now}
+                                   (seq (remove (set services) closure)) (assoc :needs (vec closure))
+                                   (seq held) (assoc :programs held)))))
+            (r/ok {:entry (get-in @(:state ctx) [:active (:profile/id p)])
+                   :programs report
+                   :not-started not-started}))
+          (r/ok nil))))))
+
+(defn- claim-ttl-ms [ctx] (* 60000 (setting ctx :compose/claim-ttl-minutes)))
+
+(defonce ^:private section-locks
+  ;; One monitor per section id, for the life of the JVM: a claim's sync,
+  ;; adopt, start and write run under it (see `claim!`). A dedicated Object per
+  ;; id from this registry, never an interned string, which any code could
+  ;; lock. Bounded by the number of section ids ever claimed.
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- section-lock
+  "The monitor `claim!` holds for section `sid`."
+  [sid]
+  (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap section-locks sid
+                    (reify java.util.function.Function (apply [_ _] (Object.)))))
+
+(declare claim-locked!)
+
 (defn claim!
-  "Result: `agent` claims section `p`, bringing it up first when it is not
-   active. The answer carries the section's shared nREPL routes with advice,
-   so the agent drives them instead of starting its own JVM. A renewed claim
-   resets its TTL; `note` says what the agent works on."
-  [ctx p agent {:keys [note]}]
+  "Result: `agent` claims section `p` (see `claim-locked!`), serialized per
+   section id: concurrent claims on one section run their state-file sync,
+   adopt, start and claim write one after another, so the second sees the
+   section the first adopted or started and renews it instead of starting
+   its host programs or containers again. Claims on other sections are not
+   held up."
+  [ctx p agent opts]
+  (locking (section-lock (:profile/id p))
+    (claim-locked! ctx p agent opts)))
+
+(defn- claim-locked!
+  "Result: `agent` claims section `p`. The answer carries the section's shared
+   nREPL routes with advice, so the agent drives them instead of starting its
+   own JVM; `note` says what the agent works on.
+
+   A claim on an ACTIVE section never calls the engine to start, recreate or
+   restart anything: it writes the claim, touches the section and answers
+   :renewed (the services as they run). A section the addon does not track
+   whose services all run is taken in the same way (:adopted), its host
+   programs started as `up` would (host only; one that cannot start is
+   named under :programs-not-started and the claim still holds). A section
+   not (fully) running is brought up (:started) by `start!`, a thunk the
+   caller passes so the start goes through the same ownership and orphan
+   guards as `up` (the addon does; a refusal is the claim's error), else by
+   a plain `ops/up-profile!`.
+
+   `ttl-minutes` makes it a WAVE claim (see `promote.swarm/claim-end`): live
+   until now + ttl-minutes whether or not `agent` (an agent or a
+   coordinator) stays in the swarm; it needs a `note` and is bounded by
+   :compose/claim-max-ttl-minutes. Claiming again moves its end."
+  [ctx p agent {:keys [note ttl-minutes start!]}]
   (if (str/blank? agent)
     (r/err :compose/missing-param {:param "agent" :hint "the claiming agent's id"})
-    (let [sid (:profile/id p)
-          up (when-not (get-in @(:state ctx) [:active sid]) (ops/up-profile! ctx p))]
-      (if (and up (r/err? up))
-        up
-        (let [now ((:now ctx))
-              live (some->> (agents ctx) (into #{} (map :agent/id)))
-              swarm? (when live (contains? live agent))]
-          (swap! (:state ctx) update-in [:active sid]
-                 (fn [a] (-> a
-                             (update :claims sw/claim agent now {:note note :swarm? swarm?})
-                             (assoc :last-touch now)
-                             (dissoc :orphaned-at))))
-          (persist! ctx)
-          (let [a (get-in @(:state ctx) [:active sid])]
-            (r/ok (cond-> {:profile sid
-                           :agent agent
-                           :claims (vec (sort (keys (:claims a))))
-                           :claim-ttl-minutes (setting ctx :compose/claim-ttl-minutes)
-                           :renew "claim again (or touch) before the claim TTL runs out; release when done"
-                           :nrepl (with-advice (section-routes (routes ctx) a))}
-                    up (assoc :started (dissoc (:ok up) :out))))))))))
+    ;; validated up front, so a refused wave claim starts nothing; its end is
+    ;; taken again from the clock read after a start (`until` below)
+    (r/let-ok [_valid (sw/wave-until ((:now ctx)) ttl-minutes
+                                     (setting ctx :compose/claim-max-ttl-minutes) note)]
+      (let [sid (:profile/id p)
+            known (synced-active ctx sid)
+            adopted (when-not known (adopt-running! ctx p))
+            taken (when (and adopted (r/ok? adopted)) (:ok adopted))
+            ;; the start goes through the caller's guards (the addon passes the
+            ;; ownership and orphan guards `up` runs), else a plain up
+            up (when-not (or known taken)
+                 (if start! (start!) (ops/up-profile! ctx p)))]
+        (cond
+          (and up (r/err? up)) up
+          (nil? (get-in @(:state ctx) [:active sid]))
+          ;; a reaper pass forgot the section between the check and the write:
+          ;; never resurrect a partial entry
+          (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
+          :else
+          (let [now ((:now ctx))
+                until (:ok (sw/wave-until now ttl-minutes (setting ctx :compose/claim-max-ttl-minutes) note))
+                live (some->> (agents ctx) (into #{} (map :agent/id)))
+                swarm? (when live (contains? live agent))
+                before (get-in @(:state ctx) [:active sid :claims agent])
+                lapsed? (sw/lapsed-wave before now until)
+                [old _] (swap-vals! (:state ctx)
+                                    (fn [st] (if (get-in st [:active sid])
+                                               (update-in st [:active sid]
+                                                          #(-> %
+                                                               (update :claims sw/claim agent now {:note note :swarm? swarm? :until until})
+                                                               (assoc :last-touch now)
+                                                               (dissoc :orphaned-at)))
+                                               st)))
+                a (get-in @(:state ctx) [:active sid])
+                c (get-in a [:claims agent])]
+            (persist! ctx)
+            (if-not (get-in old [:active sid])
+              ;; the reaper forgot it between the check and the write: no claim was written
+              (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
+              (r/ok (cond-> {:profile sid
+                             :agent agent
+                             :claims (vec (sort (keys (:claims a))))
+                             :claim (sw/claim-view c now (claim-ttl-ms ctx))
+                             :claim-ttl-minutes (setting ctx :compose/claim-ttl-minutes)
+                             :renew (if (sw/wave? c)
+                                      "a wave claim: it holds until :until whether or not its owner stays in the swarm; claim again with ttl_minutes to move it, release when done"
+                                      "claim again (or touch) before the claim TTL runs out; release when done")
+                             :nrepl (with-advice (section-routes (routes ctx) a))}
+                      known (assoc :renewed {:profile sid :services (:services a)})
+                      taken (assoc :adopted (cond-> {:profile sid :services (:services a)}
+                                              (seq (:programs taken)) (assoc :programs (:programs taken))
+                                              (seq (:not-started taken)) (assoc :programs-not-started (:not-started taken))))
+                      lapsed? (assoc :wave-ended
+                                     (str "your wave claim had ended (:until " (:until before)
+                                          "); this renewal without ttl_minutes holds it as a plain claim, renewed within the claim TTL"))
+                      up (assoc :started (dissoc (:ok up) :out)))))))))))
 
 (defn release-claim!
   "Result: `agent` gives up its claim on section `p`. When no claim is left the
@@ -385,9 +500,7 @@
                             :let [p (or (get-in settings [:compose/profiles sid]) (:profile a))]]
                         (cond-> {:id sid
                                  :project (:project a)
-                                 :claims (into (sorted-map)
-                                               (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
-                                               (:claims a))
+                                 :claims (sw/claims-view (:claims a) now (claim-ttl-ms ctx))
                                  :in-use? (boolean (get-in a [:usage :in-use?]))
                                  :used-by (get-in a [:usage :by] [])
                                  :in-use-via (get-in a [:usage :sources] [])

@@ -22,6 +22,7 @@
    MemAvailable minus `:compose/host-reserve`. MemAvailable comes from the
    caller (port/IHostMemory), never read here."
   (:require [clojure.string :as str]
+            [hive-compose.promote.swarm :as sw]
             [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
@@ -296,7 +297,7 @@
    smallest run id."
   [settings runs now {:keys [claim-ttl-ms idle-ms]}]
   (let [prio #(get-in settings [:compose/stacks % :stack/priority] 0)
-        live? (fn [e] (some #(< (- now (:seen % 0)) claim-ttl-ms) (vals (:claims e))))
+        live? (fn [e] (some #(sw/claim-live? nil % nil now claim-ttl-ms) (vals (:claims e))))
         frees? (fn [run] (let [{:keys [bytes unknown?]} (freed-mem runs run)] (or unknown? (pos? bytes))))]
     (->> runs
          (remove (fn [[_ e]] (or (live? e)
