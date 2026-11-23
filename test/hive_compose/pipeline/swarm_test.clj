@@ -85,6 +85,23 @@
 
 (defn- ups [c] (filterv #(#{:up :restart :recreate} (first %)) (stub/calls (:engine c))))
 
+(deftest a-renewed-claim-answers-only-the-running-nrepls
+  ;; card 20261123125953-1956fd03: every advice row on every renewal cost ~1k tokens
+  (let [c (-> (ctx)
+              (update-in [:settings :compose/projects "shop" :project/programs] conj
+                         {:program/id "web-repl" :program/dir "/w/shop/web" :program/command ["clojure"]
+                          :program/nrepl-port (inc repl-port) :program/with ["web"]}))
+        _ (stub-runner/listen! (:runner c) repl-port)
+        p (section c "shop/api")
+        first-claim (:ok (swarm/claim! c p "ling-1" {}))
+        renewed (:ok (swarm/claim! c p "ling-1" {}))]
+    (is (= 2 (count (:nrepl first-claim))) "a first claim names every route with its advice")
+    (is (every? :advice (:nrepl first-claim)))
+    (is (:renewed renewed))
+    (is (= [repl-port] (mapv :nrepl-port (get-in renewed [:nrepl :running]))) "a renewal: only what runs")
+    (is (= 1 (get-in renewed [:nrepl :not-running])))
+    (is (re-find #"compose nrepl path=" (get-in renewed [:nrepl :hint])))))
+
 (deftest a-claim-on-an-active-section-never-starts-anything
   ;; staging already skipped up for a section in THIS instance's map: the
   ;; up-count assertions here are regression guards; :renewed and the

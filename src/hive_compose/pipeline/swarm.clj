@@ -122,6 +122,19 @@
 (defn- with-advice [rs]
   (mapv #(assoc % :advice (sw/route-advice %)) rs))
 
+(defn nrepl-answer
+  "The nREPL routes a claim answers with: every route with its advice for a
+   first claim or an adoption; for a renewal (`renewed?`) only the running
+   ones, the others as a count with the hint to ask for one by path (card
+   20261123125953-1956fd03: a renewal repeated ~1k tokens of advice)."
+  [rs renewed?]
+  (if-not renewed?
+    (with-advice rs)
+    (let [{running true others false} (group-by (comp boolean :running?) rs)]
+      (cond-> {:running (with-advice (vec running))}
+        (seq others) (assoc :not-running (count others)
+                            :hint "compose nrepl path=<file> answers the route of a module that does not run")))))
+
 (defn section-routes
   "The routes of active entry `a`'s compose project: the shared nREPLs of the
    app it runs."
@@ -324,8 +337,10 @@
    containers were being recreated, or one brought up outside this
    instance), track it as active WITHOUT calling the engine to start
    anything, and answer the new entry. nil when something it needs is down."
-  [ctx p]
-  (let [engine (:engine ctx)]
+  [ctx p0]
+  (let [engine (:engine ctx)
+        ;; what the running containers were started from, as far as a holder says
+        {p :profile assumed? :assumed?} (ops/adopt-profile ctx p0)]
     (r/let-ok [closure (port/-closure engine p)
                running (port/-running engine p)]
       (let [services (profile/up-services p closure)
@@ -340,7 +355,8 @@
                                           :services (vec services) :profile p
                                           :started-at now :last-touch now}
                                    (seq (remove (set services) closure)) (assoc :needs (vec closure))
-                                   (seq held) (assoc :programs held)))))
+                                   (seq held) (assoc :programs held)
+                                   assumed? (assoc :inputs :assumed)))))
             (r/ok {:entry (get-in @(:state ctx) [:active (:profile/id p)])
                    :programs report
                    :not-started not-started}))
@@ -444,7 +460,7 @@
                              :renew (if (sw/wave? c)
                                       "a wave claim: it holds until :until whether or not its owner stays in the swarm; claim again with ttl_minutes to move it, release when done"
                                       "claim again (or touch) before the claim TTL runs out; release when done")
-                             :nrepl (with-advice (section-routes (routes ctx) a))}
+                             :nrepl (nrepl-answer (section-routes (routes ctx) a) (and known (not taken) (not up)))}
                       known (assoc :renewed {:profile sid :services (:services a)})
                       taken (assoc :adopted (cond-> {:profile sid :services (:services a)}
                                               (seq (:programs taken)) (assoc :programs (:programs taken))

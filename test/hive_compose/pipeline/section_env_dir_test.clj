@@ -315,6 +315,58 @@
                (is (= "../../wt/hotfix" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))
                (is (= before (stub/container-ids e "dc")) "the holder's next up does not recreate back")))))
 
+;; ---------------------------------------------------------------------------
+;; review #62 M3: claim, adopt and up target= of a held service
+
+(deftest m3a-a-claim-that-starts-a-section-uses-the-remembered-env-inside-the-guard
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             (call {"command" "up" "profile" "flow-payment" "env" {"SISF_SYNC_SRC" "../../wt/hotfix-sync"}})
+             ;; its container died: a claim of the service must start it again
+             (stub/halt! e "dc" ["sisf-payment"])
+             (let [{:keys [error? res]} (call {"command" "claim" "target" "dc/sisf-payment" "agent" "ling-1"})
+                   p (last-up e)]
+               (is (not error?) (pr-str res))
+               (is (some? (:started res)) "started, through up's guards")
+               (is (= "/w/pv01" (:profile/dir p)) "from the holder's checkout, not the project dir")
+               (is (= "../../wt/pv01-merge-sisf-payment" (get-in p [:profile/env "SISF_PAYMENT_SRC"])))
+               (is (= "../../wt/hotfix-sync" (get-in p [:profile/env "SISF_SYNC_SRC"])) "with the remembered call env")))))
+
+(deftest m3b-adopt-records-the-holders-inputs-or-marks-them-assumed
+  (session [flow-payment]
+           (fn [{:keys [call e state]}]
+             (testing "nothing says how it was started: the preset, marked assumed"
+               (stub/run-outside! e "dc" ["postgres" "sisf-payment"])
+               (call {"command" "claim" "profile" "flow-payment" "agent" "ling-1"})
+               (is (= :assumed (get-in @(state) [:active "flow-payment" :inputs])))
+               (let [row (first (filter #(= "flow-payment" (:id %)) (:profiles (:res (call {"command" "status"})))))]
+                 (is (= "assumed" (:inputs row)))))
+             (testing "an assumed adoption is never trusted as a holder: restart target= falls to the project and the guard"
+               (let [{:keys [error? res]} (call {"command" "restart" "target" "dc/sisf-payment" "recreate" true})]
+                 (is error? "recreating a service whose inputs are only assumed needs allow_shared")
+                 (is (= "held-by-another-section" (:error res)))
+                 (is (empty? (stub/restarts e))))))))
+
+(deftest m3b-adopt-takes-the-inputs-of-the-active-holder
+  (session [flow-payment (assoc flow-sync :profile/services ["postgres"])]
+           (fn [{:keys [call state]}]
+             (call {"command" "up" "profile" "flow-sync" "env" {"SISF_PAYMENT_SRC" "../../wt/hotfix"}})
+             (call {"command" "claim" "target" "dc/postgres" "agent" "ling-1"})
+             (let [a (get-in @(state) [:active "dc/postgres"])]
+               (is (some? a) (pr-str (keys (:active @(state)))))
+               (is (= "/w/pv01" (get-in a [:profile :profile/dir])) "the holder's checkout, not /w/dc")
+               (is (= "../../wt/hotfix" (get-in a [:profile :profile/env "SISF_PAYMENT_SRC"])))
+               (is (nil? (:inputs a)) "known, not assumed")))))
+
+(deftest m3c-up-target-of-a-held-service-never-rebuilds-from-project-defaults
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             (call {"command" "up" "profile" "flow-payment"})
+             (let [{:keys [error? res]} (call {"command" "up" "target" "dc/sisf-payment"})]
+               (is (not error?) (pr-str res))
+               (is (= "/w/pv01" (:profile/dir (last-up e))) "the holder's checkout")
+               (is (= "../../wt/pv01-merge-sisf-payment" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))))))
+
 (deftest an-inactive-preset-row-carries-no-inputs
   (session [flow-payment]
            (fn [{:keys [call]}]

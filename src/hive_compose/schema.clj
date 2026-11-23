@@ -129,6 +129,9 @@
    [:profile {:optional true} Profile]
    [:claims {:optional true} [:map-of :string Claim]]
    [:orphaned-at {:optional true} :int]
+   ;; :assumed: adopted running with nothing saying how it was started; its
+   ;; :profile is the preset or project default, never trusted as a holder
+   [:inputs {:optional true} [:enum :assumed]]
    [:usage {:optional true} Usage]])
 
 (def ActiveMap [:map-of :string Active])

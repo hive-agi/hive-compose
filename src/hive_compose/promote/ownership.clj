@@ -95,7 +95,8 @@
   [{:keys [active self project p services recreate?]}]
   (let [mine (inputs p)]
     (vec (for [{:keys [agents entry] :as h} (holders active self project services)
-               :let [differs (differences mine (inputs (:profile entry)))]
+               ;; a holder adopted with assumed inputs: what it runs from is unknown
+               :let [differs (differences mine (when-not (= :assumed (:inputs entry)) (inputs (:profile entry))))]
                :when (or recreate? (seq differs))]
            (cond-> (-> h
                        (dissoc :entry)
@@ -114,7 +115,8 @@
   [active project services]
   (let [wanted (set services)]
     (vec (for [[id a] (sort-by key active)
-               :when (and (= project (:project a)) (:profile a))
+               ;; an adoption whose inputs are assumed says nothing about where a recreate comes from
+               :when (and (= project (:project a)) (:profile a) (not= :assumed (:inputs a)))
                :let [held (vec (sort (filter wanted (plan/footprint a))))]
                :when (seq held)]
            {:section id :services held :profile (:profile a)}))))

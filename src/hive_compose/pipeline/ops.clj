@@ -206,6 +206,32 @@
                                          :hint (str id " holds none of " (str/join ", " services))})
           :else (r/ok {:profile (target/effective-profile p {:call-env env})}))))))
 
+(defn claim-call
+  "The `effective-subject` call of a claim on section `p` (as
+   `section-subject` resolved it from target `tgt` / profile `id`): by id when
+   `p` is active or a preset, else by the target, so a claim that starts or
+   adopts it uses the inputs an up would."
+  [ctx p tgt id]
+  (let [sid (:profile/id p)]
+    (if (or (active-entry ctx sid) (configured ctx sid))
+      {:id sid}
+      {:target tgt :id id})))
+
+(defn adopt-profile
+  "{:profile Profile :assumed? bool}: what section `p`, found running but not
+   tracked, is recorded as having been started from. The active section that
+   holds its services says (its dir, files and env, through
+   `promote.target/effective-profile`); with none, or holders that disagree,
+   nothing is known and `p` is recorded as an assumption."
+  [ctx p]
+  (let [services (vec (:profile/services p))
+        pick (when (seq services)
+               (holder-of ctx (:profile/id p) (profile/project p) services nil))]
+    (if-let [h (:holder pick)]
+      {:profile (assoc (target/effective-profile p {:holder h}) :profile/services services)
+       :assumed? false}
+      {:profile p :assumed? true})))
+
 (defn remember-call-env!
   "Active entry `id` remembers call env `env` (a nil value forgets that var),
    as after an up: what a recreate ran with is what the section runs with.
@@ -883,6 +909,8 @@
                   (:profile/description p) (assoc :description (:profile/description p))
                   ;; the checkout, files and env NAMES the section runs with (values of *_SRC only)
                   (:profile a) (merge (target/inputs-summary (:profile a)))
+                  ;; adopted running with nothing to say how it was started
+                  (= :assumed (:inputs a)) (assoc :inputs "assumed")
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)

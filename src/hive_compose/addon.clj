@@ -355,9 +355,13 @@
                         (fn [o]
                           (if-let [run (stacks/claim-run tgt)]
                             (stacks/claim! ctx run (agent-param params) o)
-                            (on-section (fn [p] (swarm/claim! ctx p (agent-param params)
-                                                              ;; a claim that must start the section passes up's guards
-                                                              (assoc o :start! #(guard p :up false (fn [] (ops/up-profile! ctx p))))))))))
+                            (on-section
+                             (fn [p0]
+                               ;; adopt and start use the inputs an up would (remembered
+                               ;; call env, holding section); the start passes up's guards
+                               (r/let-ok [{p :profile} (ops/effective-subject ctx (ops/claim-call ctx p0 tgt id))]
+                                 (swarm/claim! ctx p (agent-param params)
+                                               (assoc o :start! #(guard p :up false (fn [] (ops/up-profile! ctx p)))))))))))
         "release" (if-let [run (stacks/claim-run tgt)]
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
                     (on-section #(swarm/release-claim! ctx % (agent-param params)

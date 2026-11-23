@@ -1580,6 +1580,10 @@ components:
             - seen
         orphaned-at:
           type: integer
+        inputs:
+          type: string
+          enum:
+          - assumed
         usage:
           type: object
           properties:
@@ -1810,6 +1814,10 @@ components:
               - seen
           orphaned-at:
             type: integer
+          inputs:
+            type: string
+            enum:
+            - assumed
           usage:
             type: object
             properties:
@@ -4448,6 +4456,11 @@ components:
           type: array
           items:
             type: string
+        inputs:
+          enum:
+          - assumed
+          description: 'adopted running with nothing saying how it was started: dir, files and env are the preset''s
+            or project''s, never trusted as a holder'
         env-src:
           type: object
           additionalProperties:
@@ -4773,9 +4786,25 @@ components:
               type: integer
           x-source: hand
         nrepl:
-          type: array
-          items:
-            $ref: '#/components/schemas/Route'
+          description: every route with advice on a first claim or an adoption; on a renewal only the running ones,
+            the others counted
+          oneOf:
+          - type: array
+            items:
+              $ref: '#/components/schemas/Route'
+          - type: object
+            properties:
+              running:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Route'
+              not-running:
+                type: integer
+              hint:
+                type: string
+            required:
+            - running
+            x-source: hand
         started:
           $ref: '#/components/schemas/UpResult'
         renewed:

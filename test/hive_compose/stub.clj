@@ -433,6 +433,16 @@
   [e]
   (:restarts @(:world e) []))
 
+(defn run-outside!
+  "Make `services` of `project` run, as started outside the addon."
+  [e project services]
+  (swap! (:world e) update-in [:running project] (fnil into #{}) services))
+
+(defn halt!
+  "Make `services` of `project` stop running (a container that died)."
+  [e project services]
+  (swap! (:world e) update-in [:running project] #(reduce disj (or % #{}) services)))
+
 (defn reads!
   "Make service `s` of `project` read only env vars `vars`: a call whose
    other vars differ leaves its container as it is."
