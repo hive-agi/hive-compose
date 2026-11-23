@@ -270,6 +270,37 @@
      now. A non-zero exit is :compose/command-failed carrying :exit and
      :stderr; no running container is :compose/no-container."))
 
+(defprotocol IIsolatedRuns
+  "Optional engine capability: what an isolated run of sections needs
+   (FUN-D, `hive-compose.promote.isolated`). A Profile here may carry
+   `:profile/override` (a path): the engine appends it as the last `-f`."
+  (-model [e profile]
+    "Result<model>: the merged compose model of `profile`'s files and env
+     under its project name, every native profile enabled (`docker compose
+     --profile * config --format json`), as JSON data with string keys, its
+     `:profile/override` applied when it names one.")
+  (-image-ids [e images]
+    "Result<{image id}>: the local image id (sha256:..) of each of `images`
+     (`<repo>[:tag]`) the daemon holds; an absent one is left out.")
+  (-run-facts [e profile]
+    "Result<{:ports {service {\"<port>[/udp]\" host-port}} :images {service
+     image-id}}>: the host port docker bound to each container port, and the
+     image id, of the running containers of `profile`'s compose project.")
+  (-run-volumes [e compose-project]
+    "Result<[{:name :labels {k v}}]>: every docker volume labelled with
+     compose project `compose-project`.")
+  (-remove-volumes! [e names]
+    "Result<{:removed [name] :kept [{:name :reason}]}>: remove exactly the
+     volumes `names`, one by one, never forced: a volume still in use is
+     kept with :reason :in-use, any other refusal with :reason :failed.
+
+     THE SINGLE EXCEPTION to the rule that hive-compose never removes a
+     volume (decision of Pedro, 2026-11-23, card 20261123112858-3f8b3b8e):
+     only `hive-compose.pipeline.isolated` calls it, and only with the names
+     `hive-compose.promote.isolated/removable` keeps (volumes of an isolated
+     run recorded in the state, under that run's own compose project). No
+     section, stack or data-lifecycle path reaches it."))
+
 (defprotocol ICommandRunner
   "Optional runner capability: run a host command to completion (hc-9 data
    commands declared as `:command`), unlike `IProgramRunner/-start!`, which

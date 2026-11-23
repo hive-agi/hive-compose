@@ -13,6 +13,7 @@
             [hive-compose.adapter.secrets :as secrets]
             [hive-compose.port :as port]
             [hive-compose.promote.env :as env]
+            [hive-compose.promote.isolated :as isolated]
             [hive-compose.promote.profile :as profile]
             [hive-dsl.result :as r]
             [hive-system.shell.core :as shell]))
@@ -29,12 +30,70 @@
 ;; argv
 
 (defn base-argv
-  "`docker compose` addressed at profile `p`: project dir, project name, files
-   and native compose profiles."
+  "`docker compose` addressed at profile `p`: project dir, project name,
+   files, the generated override of an isolated run (`:profile/override`,
+   last) and native compose profiles. A profile with no override gives the
+   argv it always gave."
   [p]
   (-> ["docker" "compose" "--project-directory" (:profile/dir p) "-p" (profile/project p)]
       (into (mapcat (fn [f] ["-f" f])) (:profile/files p))
+      (cond-> (:profile/override p) (into ["-f" (:profile/override p)]))
       (into (mapcat (fn [cp] ["--profile" cp])) (:profile/compose-profiles p))))
+
+(defn model-argv
+  "The merged model of `p`'s project, every native profile enabled, its
+   override applied when it names one (callers computing the override pass
+   `p` without it)."
+  [p]
+  (-> (base-argv (dissoc p :profile/compose-profiles))
+      (into ["--profile" "*" "config" "--format" "json"])))
+
+(declare lines parse-json-rows parse-labels)
+
+(defn image-ls-argv
+  "Every local image as `<repo>:<tag>\\t<full id>\\t<repo>@<digest>`, one a line."
+  []
+  ["docker" "image" "ls" "--no-trunc" "--digests" "--format" "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Repository}}@{{.Digest}}"])
+
+(defn image-ids
+  "{image id} of those of `images` (refs normalised: `docker.io/library/x:t`,
+   a tagless ref as `:latest`, `x@sha256:..` by its repo digest) that
+   `image-ls-argv` output `s` lists."
+  [s images]
+  (let [have (into {} (for [l (lines s)
+                            :let [[ref id dig] (str/split l #"\t" 3)]
+                            :when (seq id)
+                            k [ref dig]
+                            :when (and (seq k) (not (str/includes? k "<none>")))]
+                        [k id]))]
+    (into (sorted-map) (keep (fn [i] (when-let [id (have (isolated/normalize-ref i))] [i id]))) images)))
+
+(defn project-ids-argv
+  "Full ids of the running containers of compose project `cp`, by label."
+  [cp]
+  ["docker" "ps" "-q" "--no-trunc" "--filter" (str "label=com.docker.compose.project=" cp)
+   "--filter" "status=running"])
+
+(defn volume-ls-argv
+  "Every volume labelled with compose project `cp`, one JSON object a line."
+  [cp]
+  ["docker" "volume" "ls" "--filter" (str "label=com.docker.compose.project=" cp) "--format" "{{json .}}"])
+
+(defn volume-rm-argv
+  "`docker volume rm` of exactly one volume, never -f."
+  [name]
+  ["docker" "volume" "rm" name])
+
+(defn volume-rows
+  "[{:name :labels}] of `volume-ls-argv` output."
+  [s]
+  (vec (sort-by :name (for [row (parse-json-rows s)]
+                        {:name (get row "Name") :labels (parse-labels (get row "Labels"))}))))
+
+(defn in-use?
+  "True when docker refused a `volume rm` because a container uses it."
+  [stderr]
+  (boolean (re-find #"(?i)volume is in use" (str stderr))))
 
 (defn closure-argv [p]
   (-> (base-argv p) (into ["config" "--format" "json"]) (into (:profile/services p))))
@@ -763,6 +822,42 @@
   (-networks-labelled [{:keys [exec timeout-ms]} labels]
     (parsed (run-argv exec (labelled-networks-argv labels) timeout-ms)
             :compose/unparseable labelled-networks)))
+
+(extend-type CliEngine
+  port/IIsolatedRuns
+  (-model [{:keys [exec timeout-ms]} p]
+    (parsed (run exec p (model-argv p) timeout-ms) :compose/unparseable json/read-str))
+  (-image-ids [{:keys [exec timeout-ms]} images]
+    (if (empty? images)
+      (r/ok {})
+      (r/map-ok (run-argv exec (image-ls-argv) timeout-ms) #(image-ids % images))))
+  ;; By label: no compose file is loaded; one inspect gives ports and images.
+  (-run-facts [{:keys [exec timeout-ms]} p]
+    (r/let-ok [ids (r/map-ok (run-argv exec (project-ids-argv (profile/project p)) timeout-ms) lines)]
+      ;; m10: one inspect per container, so one that exits between ps and
+      ;; inspect ("No such object") drops out instead of failing the row
+      (let [rows (into [] (mapcat (fn [id]
+                                    (let [x (run-argv exec (inspect-argv [id]) timeout-ms)]
+                                      (if (r/ok? x) (try (parse-json-rows (:ok x)) (catch Exception _ [])) []))))
+                       ids)]
+        (r/ok (isolated/container-facts rows)))))
+  (-run-volumes [{:keys [exec timeout-ms]} cp]
+    (parsed (run-argv exec (volume-ls-argv cp) timeout-ms) :compose/unparseable volume-rows))
+  ;; The single volume-removing call (see the port's docstring): exact names,
+  ;; one `docker volume rm` each, never -f, never a prune or a `down -v`.
+  (-remove-volumes! [{:keys [exec timeout-ms]} names]
+    (r/ok (reduce (fn [acc nm]
+                    (let [res (exec (volume-rm-argv nm) {:timeout-ms timeout-ms})
+                          {:keys [exit stderr]} (:ok res)]
+                      (cond
+                        (and (r/ok? res) (zero? exit)) (update acc :removed conj nm)
+                        ;; m5: already gone (another pass removed it): not an error
+                        (and (r/ok? res) (re-find #"(?i)no such volume" (str stderr))) (update acc :gone (fnil conj []) nm)
+                        (and (r/ok? res) (in-use? stderr)) (update acc :kept conj {:name nm :reason :in-use})
+                        :else (update acc :kept conj {:name nm :reason :failed
+                                                      :stderr (clip (str (or stderr (:message res))))}))))
+                  {:removed [] :kept []}
+                  (distinct names)))))
 
 (defn stack-dir
   "Where stack overrides are written: `stacks/` beside the state file, else

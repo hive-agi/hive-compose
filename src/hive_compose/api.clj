@@ -83,6 +83,8 @@
    :compose/unknown-data-service 400
    :compose/shared-reset-without-tenancy 400
    :compose/volume-removal-refused 400
+   :compose/invalid-override 400
+   :compose/fresh-external-volume 400
    ;; a suite's test report (JUnit / TAP) the runner left: 502 like any
    ;; other backend whose output cannot be read or is not there
    :report/malformed 502
@@ -131,6 +133,7 @@
    :compose/holders-disagree 409
    :compose/not-a-holder 400
    :compose/run-exists 409
+   :compose/run-still-active 409
    :compose/over-budget 409
    :compose/toxiproxy-proxy-conflict 409
    :compose/not-implemented 501
@@ -140,6 +143,9 @@
    :compose/no-container 502
    :compose/instance-unhealthy 502
    :compose/stack-down-incomplete 502
+   ;; an isolated run could not come up (image missing or changed, port in
+   ;; use, unhealthy, config invalid): never a test verdict
+   :compose/could-not-run 502
    :compose/toxiproxy-failed 502
    :compose/runner-failed 502
    :compose/unparseable 502
@@ -156,6 +162,7 @@
    :compose/no-compose-file 503
    :compose/program-needs-command 503
    :compose/stacks-unsupported 503
+   :compose/isolated-unsupported 503
    :compose/data-exec-unsupported 503
    :compose/data-runner-unsupported 503
    :compose/no-trace-query 503

@@ -10,7 +10,7 @@
 
 (def ProfileId
   "A preset name, or a section id `<project>/<target>[+<target>..]`."
-  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$"])
+  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$"])
 
 (def IdleAction
   "What the reaper does to an idle profile. :stop keeps containers, :down removes
@@ -88,7 +88,23 @@
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
    [:profile/activity {:optional true} Activity]
-   [:profile/description {:optional true} :string]])
+   [:profile/description {:optional true} :string]
+   ;; an isolated run of the section (FUN-D): the run id, the shared compose
+   ;; project it copies, and the generated override appended as the last -f
+   [:profile/run {:optional true} [:re #"^[a-z0-9]{3,40}\z"]]
+   [:profile/base-project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+   [:profile/override {:optional true} [:string {:min 1}]]
+   ;; G8: top-level volumes of the shared project an isolated run of this
+   ;; preset BORROWS instead of creating its own (declared external, named
+   ;; <shared-project>_<key>, never removed with the run). BUILD CACHES ONLY
+   ;; (Go build/module cache, Maven repository), NEVER a volume that holds
+   ;; state: hive-compose cannot tell a cache from state, so two runs sharing
+   ;; a state volume would not be isolated. Opt-in; a call may only narrow it.
+   [:profile/run-shared-volumes {:optional true} [:vector [:string {:min 1}]]]
+   ;; FUN-D (B): the declared memory budget, in MiB, of an isolated run of
+   ;; this section's whole closure; when present it is the run's admission
+   ;; figure instead of the per-service sum
+   [:profile/run-mem-mb {:optional true} [:int {:min 1}]]])
 
 (def Claim
   "An agent's declaration that it works on a section (or holds a stack run):
@@ -577,7 +593,11 @@
 (def Settings
   [:map
    [:compose/projects [:map-of :string Project]]
-   [:compose/profiles [:map-of :string Profile]]
+   ;; m3: `@` is reserved for the derived ids of isolated runs (<id>@<run>)
+   [:compose/profiles [:map-of [:re {:error/message "a configured profile id may not contain @ (reserved for <id>@<run>)"}
+                                #"^[^@]+$"]
+                       [:and Profile [:fn {:error/message "a configured profile id may not contain @"}
+                                      #(not (re-find #"@" (str (:profile/id %))))]]]]
    [:compose/tick-seconds [:int {:min 5}]]
    [:compose/default-ttl-minutes [:int {:min 1}]]
    [:compose/default-idle-action IdleAction]
@@ -601,7 +621,18 @@
    [:compose/suites {:optional true} [:map-of :string Suite]]
    [:compose/default-resources {:optional true} Resources]
    [:compose/budget {:optional true} MemSize]
-   [:compose/host-reserve {:optional true} MemSize]])
+   [:compose/host-reserve {:optional true} MemSize]
+   ;; FUN-D M1: how long the reaper keeps an isolated run's volumes after
+   ;; ending the run before it removes them (up run=<id>, a claim or a touch
+   ;; on a section of the run cancels the removal)
+   [:compose/run-volumes-grace-minutes {:optional true} [:int {:min 1}]]
+   ;; FUN-D M2: the memory an isolated run's admission assumes for a
+   ;; service whose compose file sets no mem_limit
+   [:compose/run-default-service-mem-mb {:optional true} [:int {:min 1}]]
+   ;; FUN-D R2-M2: a reaper pass more than this after the previous one (an
+   ;; NTP step, a suspend) is doubtful: it marks and removes no volume.
+   ;; Default max(3 x :compose/tick-seconds, 10 minutes)
+   [:compose/reaper-max-gap-minutes {:optional true} [:int {:min 1}]]])
 
 (def InstanceCaps
   "The caps the stack plan resolved for one instance: `:mem` in bytes and
@@ -643,6 +674,51 @@
    [:reserve {:optional true} [:int {:min 0}]]
    [:instances [:vector [:map [:instance :string] [:mem [:int {:min 0}]]]]]
    [:message :string]])
+
+;; ---------------------------------------------------------------------------
+;; Generated override (FUN-D): what a private copy of a compose project (a
+;; stack's private instance, an isolated section run) changes in the merged
+;; model so it runs beside the shared one. Interpreted only by
+;; hive-compose.promote.override; emitted with compose merge tags.
+
+(def PortPolicy
+  "How a private copy publishes host ports. :keep as the model says; :strip
+   none at all (reached by network alias); :ephemeral every container port
+   on 127.0.0.1 with a host port docker picks; {:offset n} every published
+   host port p as p+n on the same address (unpublished ones stay as they
+   are); {:publish {service {container-port host-port}}} exactly these on
+   127.0.0.1, a host port 0 letting docker pick, every other port stripped."
+  [:or
+   [:enum :keep :strip :ephemeral]
+   [:map {:closed true} [:offset [:int {:min -65535 :max 65535}]]]
+   [:map {:closed true}
+    [:publish [:map-of [:string {:min 1}]
+               [:map-of [:or [:int {:min 1 :max 65535}] [:re #"^[0-9]{1,5}(/(tcp|udp|sctp))?\z"]]
+                [:int {:min 0 :max 65535}]]]]]])
+
+(def OverrideSpec
+  "What the override of one private copy changes. `:override/names` the
+   services whose container_name is reset (default :all, every one setting
+   it; :none keeps them); `:override/ports` a PortPolicy (default :strip);
+   `:override/fresh-volumes` the top-level volume keys (or :all, every
+   non-external one) given the per-run name `<project>_<key>_<run>`, which
+   needs `:override/run`; `:override/images-from` the compose project whose
+   built image a service with `build:` and no `image:` reuses (image pinned
+   to `<images-from>-<service>`, build reset, pull_policy never), so a copy
+   never builds under its own name."
+  [:and
+   [:map {:closed true}
+    [:override/run {:optional true} RunId]
+    [:override/names {:optional true} [:or [:enum :all :none] [:vector [:string {:min 1}]]]]
+    [:override/ports {:optional true} PortPolicy]
+    [:override/fresh-volumes {:optional true} [:or [:= :all] [:vector [:string {:min 1}]]]]
+    [:override/images-from {:optional true} ComposeProjectName]
+    [:override/images {:optional true} [:map-of [:string {:min 1}] [:string {:min 1}]]]
+    [:override/shared-volumes {:optional true} [:vector [:string {:min 1}]]]
+    [:override/volume-labels {:optional true} [:map-of [:string {:min 1}] [:string {:min 1}]]]]
+   [:fn {:error/message "fresh volumes need :override/run"}
+    (fn [s] (let [f (:override/fresh-volumes s)]
+              (or (nil? f) (and (coll? f) (empty? f)) (contains? s :override/run))))]])
 
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."

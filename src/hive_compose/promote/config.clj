@@ -37,6 +37,8 @@
      :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
                                    whose last claim ended, when shorter than its TTL
                                    (default 10)
+     :compose/run-volumes-grace-minutes  how long the reaper keeps an isolated
+                                   run's volumes after ending it (default 60)
      :compose/program-grace-ms     how long a host program is watched after its
                                    start; one that exits within it is reported
                                    :exited with its code and log tail (default 3000)
@@ -72,7 +74,9 @@
    :compose/claim-ttl-minutes 30
    :compose/claim-max-ttl-minutes 480
    :compose/orphan-ttl-minutes 10
-   :compose/program-grace-ms 3000})
+   :compose/program-grace-ms 3000
+   :compose/run-volumes-grace-minutes 60
+   :compose/run-default-service-mem-mb 128})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")
@@ -174,6 +178,9 @@
   (let [p (cond-> p
             (:profile/id p) (update :profile/id name)
             (:profile/dir p) (update :profile/dir #(expand-home home %))
+            ;; an absolute or ~ file may live outside the dir; a relative one
+            ;; keeps resolving against it (compose's --project-directory)
+            (sequential? (:profile/files p)) (update :profile/files #(mapv (partial expand-home home) %))
             (contains? p :profile/activity) (update :profile/activity activity-set))]
     (cond-> p
       (:profile/programs p) (update :profile/programs #(normalize-programs home (:profile/dir p) %)))))
@@ -185,6 +192,7 @@
   (let [p (cond-> p
             (:project/id p) (update :project/id name)
             (:project/dir p) (update :project/dir #(expand-home home %))
+            (sequential? (:project/files p)) (update :project/files #(mapv (partial expand-home home) %))
             (contains? p :project/activity) (update :project/activity activity-set)
             (map? (:project/provides p)) (update :project/provides normalize-provides)
             (map? (:project/needs p)) (update :project/needs normalize-needs))]

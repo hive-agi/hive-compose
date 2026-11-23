@@ -26,6 +26,9 @@
             [hive-compose.boundary.history :as history]
             [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.flaky :as flaky]
+            [hive-compose.pipeline.isolated :as isolated]
+            [hive-compose.promote.isolated :as iso-model]
+            [hive-compose.promote.target :as target]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.pipeline.why :as why]
@@ -122,7 +125,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting :runs]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]
@@ -177,8 +180,23 @@
               adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
                         (ops/adopt! ctx))
               observed (swarm/observe! ctx)
+              ;; R2-M2: a pass far later than the previous one (a clock step,
+              ;; a suspend) judges every claim stale: a doubtful pass
+              observed (cond-> observed
+                         (isolated/clock-jump? (:settings ctx) (get-in @state [:last-pass :at]) ((:now ctx)))
+                         (assoc :clock-jump? true))
               reaped (ops/reap! ctx)
               _ (swarm/announce-reaped! ctx (:reaped reaped))
+              ;; an isolated run whose last section was just reaped ends, and
+              ;; its own volumes go with it (Pedro, 2026-11-23)
+              ;; step 2 first: volumes whose grace ran out on an EARLIER pass
+              runs-swept (isolated/sweep-due! ctx observed)
+              _ (isolated/note-observed! ctx observed)
+              runs-ended (into (isolated/after-reap! ctx (:reaped reaped) observed)
+                               (isolated/end-orphans! ctx observed))
+              reaped (cond-> reaped
+                       (seq runs-ended) (assoc :runs-ended runs-ended)
+                       (seq runs-swept) (assoc :runs-swept runs-swept))
               stack-runs (:reaped (stacks/reap! ctx))
               pass (cond-> (assoc reaped :observed observed)
                      (seq adopted) (assoc :adopted adopted)
@@ -295,6 +313,27 @@
     (param params "run") (assoc :run (str (param params "run")))
     (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
 
+(defn- isolated-opts
+  "Result<{:run :ports :shared-volumes}> when the call asks for an isolated
+   run (isolated=true, or run=<id> on up/switch), else nil."
+  [params]
+  (let [run (some-> (param params "run") str)
+        iso? (flag params "isolated")
+        shared (param params "shared_volumes")]
+    (when (or iso? run)
+      (cond
+        (and shared (not (sequential? shared)))
+        (r/err :compose/invalid-param {:param "shared_volumes" :hint "a list of volume keys"})
+        :else
+        (let [ports (iso-model/port-policy (param params "ports"))]
+          (if (and ports (schema/explain schema/PortPolicy ports))
+            (r/err :compose/invalid-param {:param "ports" :problems (schema/explain schema/PortPolicy ports)
+                                           :hint "\"strip\" | \"ephemeral\" | \"keep\" | {\"offset\": n} | {\"publish\": {svc {port host}}}"})
+            (r/ok (cond-> {}
+                    run (assoc :run run)
+                    ports (assoc :ports ports)
+                    shared (assoc :shared-volumes (mapv str shared))))))))))
+
 (defn- test-opts
   "The options of `test` from the tool params: suites, projects (\"X,Y\" or a
    list), run, keep_up, dry_run, wait."
@@ -344,8 +383,16 @@
    tool (`tool`) and the control API (`hive-compose.api`)."
   [a command params]
   (let [ctx (:ctx @(:state a))
-        id (some-> (param params "profile") str)
-        tgt (some-> (param params "target") str)
+        run-param (some-> (param params "run") str)
+        ;; an isolated run's section: profile=X run=R or target=T run=R
+        ;; address the active entry <id>@R (up/switch resolve it themselves)
+        in-run? (and run-param (not (#{"up" "switch" "stack-up" "stack-down" "stack-status" "plan" "faults" "why" "test"} command)))
+        id (some-> (param params "profile") str (cond-> in-run? (iso-model/section-id run-param)))
+        tgt (when-not (and in-run? (param params "target"))
+              (some-> (param params "target") str))
+        id (or id (when (and in-run? (param params "target"))
+                    (let [{:keys [project names]} (target/parse (str (param params "target")))]
+                      (when project (iso-model/section-id (target/section-id project names) run-param)))))
         opts (call-options params)
         allow-orphans? (flag params orphans/override-param)
         allow-shared? (flag params ownership/override-param)
@@ -378,18 +425,42 @@
                                                   :errors (:errors @(:state a))})
       :else
       (case command
-        "status" (r/ok (cond-> (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+        "status" (r/ok (cond-> (merge (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+                                      (let [s (isolated/status ctx)] (when (seq (:runs s)) s)))
                          (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/up-profile! ctx p)))))
-        "switch" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/switch-profile! ctx p)))))
+        ;; an isolated up starts from the same effective inputs a plain up would
+        ;; (remembered call env, holding section) and only then becomes the
+        ;; run's section <id>@<run>, in its own compose project: it is never a
+        ;; holder of the shared project's services, nor the other way round
+        "up" (if-let [iopts (isolated-opts params)]
+               (r/bind iopts (fn [io] (on-effective (fn [p _ _] (if (flag params "dry_run")
+                                                                   (isolated/plan ctx p io)
+                                                                   (orphans/guarded ctx p allow-orphans?
+                                                                                    #(isolated/up! ctx p io)))))))
+               (if (flag params "dry_run")
+                 ;; M4: a plain up has no plan mode; never run it for real
+                 (r/err :compose/invalid-param {:param "dry_run" :hint "dry_run plans an isolated run: add isolated=true or run=<id>"})
+                 (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/up-profile! ctx p)))))))
+        "switch" (if (isolated-opts params)
+                   (r/err :compose/invalid-param {:param "run" :hint "an isolated run has no current section: use up run=<id>"})
+                   (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/switch-profile! ctx p))))))
         "claim" (r/bind (claim-opts)
                         (fn [o]
-                          (if-let [run (stacks/claim-run tgt)]
-                            (stacks/claim! ctx run (agent-param params) o)
+                          (cond
+                            (stacks/claim-run tgt)
+                            (stacks/claim! ctx (stacks/claim-run tgt) (agent-param params) o)
+                            ;; R2-M1: a run marked for volume removal has no section left
+                            ;; to resolve: the claim keeps its data by run id, first
+                            (and in-run? (isolated/cancel-run-due! ctx run-param))
+                            (r/ok {:run run-param :mark-cancelled true
+                                   :hint "the run's volumes are kept; up run=<id> brings its sections back"})
+                            :else
                             (on-section
                              (fn [p0]
+                               ;; a claim on an isolated run's section cancels a pending volume removal
+                               (isolated/cancel-due! ctx (:profile/id p0))
                                ;; adopt and start use the inputs an up would (remembered
                                ;; call env, holding section); the start passes up's guards
                                (r/let-ok [{p :profile} (ops/effective-subject ctx (ops/claim-call ctx p0 tgt id))]
@@ -412,8 +483,22 @@
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
-        "down" (on-subject #(ops/down-profile! ctx % :down))
-        "stop" (on-subject #(ops/down-profile! ctx % :stop))
+        "down" (cond
+                 (and run-param (nil? id))
+                 (isolated/down-run! ctx run-param (boolean (flag params "volumes"))
+                                     {:agent (agent-param params) :allow-shared? (boolean allow-shared?)})
+                 (flag params "volumes")
+                 (r/err :compose/invalid-param {:param "volumes" :hint "volumes=true needs run=<id> alone (an isolated run)"})
+                 ;; N1: the run's LAST section taken down ends the run, its
+                 ;; volumes kept and unmarked (only volumes=true removes them)
+                 :else (on-subject #(r/map-ok (ops/down-profile! ctx % :down)
+                                              (fn [res] (if-let [row (isolated/end-if-empty! ctx (:profile/id %))]
+                                                          (assoc res :run-ended row)
+                                                          res)))))
+        "stop" (on-subject #(r/map-ok (ops/down-profile! ctx % :stop)
+                                      (fn [res] (if-let [row (isolated/end-if-empty! ctx (:profile/id %))]
+                                                  (assoc res :run-ended row)
+                                                  res))))
         ;; a target is restarted from the live section holding its services (its
         ;; dir, files and env); profile=<id> with a target names that section
         ;; a recreate's env is remembered by the section it ran from (the holder)
@@ -426,9 +511,15 @@
                          ;; recreated from p: an assumed section's inputs are now known
                          (ops/inputs-known! ctx (or section (:profile/id p)) p))
                        res)))
-        "touch" (if (or tgt id)
-                  (on-subject #(ops/touch! ctx (:profile/id %)))
-                  (ops/touch-all! ctx (some-> (param params "project") str)))
+        "touch" (cond
+                  ;; R2-M1: a marked run is kept by run id, before any section lookup
+                  (and in-run? (isolated/cancel-run-due! ctx run-param))
+                  (r/ok {:run run-param :mark-cancelled true
+                         :hint "the run's volumes are kept; up run=<id> brings its sections back"})
+                  (or tgt id)
+                  (on-subject #(do (isolated/cancel-due! ctx (:profile/id %))
+                                   (ops/touch! ctx (:profile/id %))))
+                  :else (ops/touch-all! ctx (some-> (param params "project") str)))
         "ps" (on-subject #(ops/ps-profile ctx %))
         "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
         "reap" (r/ok (tick! a))
@@ -471,6 +562,21 @@
                      "A WAVE claim (claim ttl_minutes=.. note=.., up to 8 h, owner may be a coordinator) holds until it ends or is released, even when its owner parks or leaves the swarm. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
+                     "ISOLATED RUNS: up isolated=true (or run=<id> to join one) starts a section as a private copy "
+                     "of its compose project (-p <project>-<run>, override: no container_name, host ports per ports=, "
+                     "images of the shared project pinned by id, fresh volumes); several sections of one run share one "
+                     "project. Every compose call of a run gets HIVE_RUN, HIVE_RUN_PROJECT, HIVE_PORT_OFFSET and "
+                     "HIVE_PORT_<SERVICE>_<PORT> (none of the latter under ports=ephemeral: unknown before up); a call env "
+                     "naming one is refused. status answers runs with ports, images, config-digest and volumes. "
+                     "down run=<id> ends a run keeping its volumes; volumes=true removes only the volumes that run created "
+                     "(labelled hive.compose.run/hive.compose.base by its override), refused while another agent claims a "
+                     "section of the run unless allow_shared. When the reaper reaps a run's last section it only MARKS the "
+                     "volumes for removal after :compose/run-volumes-grace-minutes (default 60, status :stale-run-volumes "
+                     ":due-at); up run=<id>, a claim or a touch on its sections in that time keeps the data. A run must own "
+                     "its compose project: a project <project>-<run> that already exists is refused. A BIND mount is shared "
+                     "with the host and with the shared project (status :binds); an external volume is refused unless named in "
+                     ":profile/run-shared-volumes. :profile/run-shared-volumes borrows volumes of the shared "
+                     "project: BUILD CACHES ONLY, never a volume holding state. up dry_run=true answers the memory admission. "
                      "SUITES: test suites=X,Y projects=A,B runs the suite x project matrix on one union stack and answers per-cell verdicts from exit code and JUnit/TAP; a failed matrix stays up for inspection. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
@@ -481,7 +587,7 @@
                               "wait" {:type "boolean" :description "[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
-                              "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
+                              "allow_shared" {:type "boolean" :description "[up|switch|restart|down] recreate a service another live section holds (refused by default, naming the holder section and its agents); down run=<id> volumes=true: remove the run's volumes although another agent claims a section of it"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys); a null value (\"VAR\": null) forgets VAR (a no-op when not remembered); a reload that changes VAR's declared value forgets it too"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}
@@ -494,11 +600,15 @@
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
                               "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"}
+                              "isolated" {:type "boolean" :description "[up] start the section in a new isolated run (a private copy of its compose project under -p <project>-<run>: no container_name, host ports per `ports`, fresh volumes of its own, the shared project's images pinned by id, never built); the answer names the run id"}
+                              "ports" {:type ["string" "object"] :description "[up] host ports of an isolated run, fixed at its first up: \"strip\" (default, none), \"ephemeral\" (127.0.0.1, docker picks; no HIVE_PORT_<SVC>_<PORT> vars then), \"keep\", {\"offset\": n} (each published port p as p+n), {\"publish\": {svc {port host}}}. status answers the host port per service and container port"}
+                              "shared_volumes" {:type "array" :description "[up] narrow the preset's :profile/run-shared-volumes: volumes an isolated run borrows from the shared project. BUILD CACHES ONLY (Go build/module cache, Maven repository), never a volume holding state; never removed with the run"}
+                              "volumes" {:type "boolean" :description "[down] with run=<id> alone: also remove the volumes the isolated run created (default false: kept, listed as stale-run-volumes). The only volume removal hive-compose does; the reaper does it too when it reaps an isolated run"}
                               "suites" {:type "string" :description "[test] suite ids under :compose/suites, X,Y (default all)"}
                               "projects" {:type "string" :description "[test] projects under test, A,B (default every project a selected suite applies to)"}
                               "keep_up" {:type "boolean" :description "[test] keep the stack up even when every cell passed (a failed matrix always stays up)"}
-                              "dry_run" {:type "boolean" :description "[test] answer the matrix, the stack plan and every runner spec; start nothing"}
+                              "dry_run" {:type "boolean" :description "[test|up] answer the matrix, the stack plan and every runner spec; start nothing. [up] with isolated/run: plan only, no side effect: the override, ports, pinned images and the memory admission (need-mb, free-mb, verdict, and on refusal which sections would have to stop)"}
                               "variants" {:type "string" :description "[test] only these env variants of the suites that declare :suite/variants, a,b (default every variant); each selected suite with variants must declare every named one, else refused; a suite without variants runs once. The variant env reaches the suite RUNNER only, never the stack's consumers (no restart or re-env per variant)"}
                               "skip_fails" {:type "boolean" :description "[test] a skipped case fails its cell (the case stays skipped in the report); default each suite's :suite/skip-fails?, else false"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}

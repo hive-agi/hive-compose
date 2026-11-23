@@ -58,7 +58,9 @@
                  (when-let [snap (:profile (active-entry ctx id))]
                    (let [[pid section?] (str/split id #"/" 2)
                          proj (get-in ctx [:settings :compose/projects pid])]
-                     (if (and section? proj)
+                     ;; an isolated run's section keeps its run's project and
+                     ;; override: re-basing would point it at the shared project
+                     (if (and section? proj (not (:profile/run snap)))
                        (target/rebase-section nil proj snap)
                        snap))))]
     (r/ok p)
@@ -338,6 +340,7 @@
         rows (for [[id a] (sort-by key (:active @(:state ctx)))
                    :let [pid (first (str/split id #"/" 2))]
                    :when (and (:profile a) (str/includes? id "/") (not (configured ctx id))
+                              (not (get-in a [:profile :profile/run]))
                               (contains? old-projects pid)
                               (not= (get old-projects pid) (get new-projects pid)))]
                (if-let [proj (get new-projects pid)]
@@ -783,9 +786,14 @@
 
 (defn reconcile!
   "Forget active profiles none of whose services still run (taken down outside
-   the addon), stopping the programs they alone hold. Answers the forgotten ids."
+   the addon), stopping the programs they alone hold. Answers the forgotten ids.
+   An isolated run's section (`:profile/run`) is never forgotten here: after a
+   docker or host restart its containers are stopped, not gone, and its
+   claims (wave claims included) must survive; such a section is left to the
+   TTL reaper and its claims (FUN-D R2-B1)."
   [ctx]
   (let [dropped (vec (for [[id a] (:active @(:state ctx))
+                           :when (not (get-in a [:profile :profile/run]))
                            :let [running (r/bind (lookup ctx id) #(port/-running (:engine ctx) %))]
                            :when (and (r/ok? running) (not-any? (:ok running) (:services a)))]
                        id))]
@@ -948,6 +956,8 @@
                          :idle-action (profile/idle-action settings p)
                          :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  ;; an isolated run's section: the run it belongs to
+                  (:profile/run p) (assoc :run (:profile/run p))
                   ;; the checkout, files and env NAMES the section runs with (values of *_SRC only)
                   (:profile a) (merge (target/inputs-summary (:profile a)))
                   ;; adopted running with nothing to say how it was started
