@@ -30,6 +30,7 @@
     (:project/files project) (assoc :profile/files (:project/files project))
     (:project/name project) (assoc :profile/project (:project/name project))
     (seq (:project/programs project)) (assoc :profile/programs (vec (:project/programs project)))
+    (false? (:project/compose? project)) (assoc :profile/compose? false)
     (:project/env project) (assoc :profile/env (:project/env project))
     (some? (:project/wait? project)) (assoc :profile/wait? (:project/wait? project))
     (:project/ttl-minutes project) (assoc :profile/ttl-minutes (:project/ttl-minutes project))

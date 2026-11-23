@@ -63,7 +63,8 @@
    start; `allow?` runs it anyway. The ok answer carries :orphans-overridden
    when it overrode, :orphan-check when the check itself could not run."
   [ctx p allow? f]
-  (if-not (enabled? ctx)
+  ;; a profile with no compose project starts no container: nothing to hold
+  (if (or (not (enabled? ctx)) (false? (:profile/compose? p)))
     (f)
     (let [c (try (check ctx p)
                  (catch Throwable t (r/err :compose/orphan-check-failed {:message (str t)})))
