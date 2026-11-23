@@ -63,22 +63,35 @@
 ;; ---------------------------------------------------------------------------
 ;; claims
 
-(defn claim
-  "`claims` with `agent` claiming at `now`. A renewed claim keeps its :since,
-   and its note unless a new one is given. `until` (absolute ms) makes it a
-   WAVE claim, live until then whatever the swarm says; a renewal with an
-   `until` moves it, one without leaves it as it was."
-  [claims agent now {:keys [note swarm? until]}]
-  (update claims agent
-          (fn [c] (cond-> (assoc (or c {:since now}) :seen now)
-                    (some? note) (assoc :note note)
-                    (some? swarm?) (assoc :swarm? (boolean swarm?))
-                    (some? until) (assoc :until until)))))
-
 (defn wave?
   "True when `claim` is a wave claim: it carries an absolute :until."
   [claim]
   (int? (:until claim)))
+
+(defn lapsed-wave
+  "True when renewing `claim` at `now` without a new `until` finds a wave
+   claim whose :until has already passed: the renewal then makes it a plain
+   claim from `now`, which is what a caller who leaves out ttl_minutes means.
+   Without this the renewal would keep the stale :until, answer ok and be
+   dropped as :expired on the next pass."
+  [claim now until]
+  (boolean (and (nil? until) (wave? claim) (<= (:until claim) now))))
+
+(defn claim
+  "`claims` with `agent` claiming at `now`. A renewed claim keeps its :since,
+   and its note unless a new one is given. `until` (absolute ms) makes it a
+   WAVE claim, live until then whatever the swarm says; a renewal with an
+   `until` moves it. One without leaves a live wave claim as it was, and
+   turns a wave claim whose :until has passed into a plain claim
+   (`lapsed-wave`)."
+  [claims agent now {:keys [note swarm? until]}]
+  (update claims agent
+          (fn [c] (cond-> (assoc (or c {:since now}) :seen now)
+                    ;; a renewal without ttl after the wave ended: a plain claim from now
+                    (lapsed-wave c now until) (dissoc :until)
+                    (some? note) (assoc :note note)
+                    (some? swarm?) (assoc :swarm? (boolean swarm?))
+                    (some? until) (assoc :until until)))))
 
 (defn claim-end
   "Why `claim` of `agent` no longer holds at `now`, nil while it holds. THE

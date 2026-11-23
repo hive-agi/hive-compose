@@ -85,6 +85,11 @@
 (defn- ups [c] (filterv #(#{:up :restart :recreate} (first %)) (stub/calls (:engine c))))
 
 (deftest a-claim-on-an-active-section-never-starts-anything
+  ;; staging already skipped up for a section in THIS instance's map: the
+  ;; up-count assertions here are regression guards; :renewed and the
+  ;; target= lookups are red on staging. The D1 red tests proper are
+  ;; a-claim-on-a-running-untracked-section-takes-it-without-an-up and
+  ;; a-claim-sees-a-section-another-instance-brought-up.
   (let [c (ctx)
         p (section c "shop/api")]
     (is (contains? (:ok (swarm/claim! c p "ling-1" {})) :started) "the first claim brings it up")
@@ -122,6 +127,62 @@
           res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
       (is (contains? res :started))
       (is (= [[:up "shop" ["api" "postgres"]]] (ups c))))))
+
+(deftest an-adopted-section-starts-its-host-programs
+  (let [c (ctx)
+        _ (ops/up-profile! c (section c "shop/api"))
+        _ (swap! (:state c) update :active dissoc "shop/api")
+        starts (count (stub-runner/starts (:runner c)))
+        before (ups c)
+        res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+    (is (= before (ups c)) "still no engine start")
+    (is (= (inc starts) (count (stub-runner/starts (:runner c)))) "the paired nREPL program is started")
+    (is (= ["api-repl"] (keys (get-in @(:state c) [:active "shop/api" :programs]))) "and recorded, so release stops it")
+    (is (= [true] (mapv :started? (get-in res [:adopted :programs])))))
+  (testing "a program that cannot start: the claim still holds and says why"
+    (let [c (ctx)
+          _ (ops/up-profile! c (section c "shop/api"))
+          _ (swap! (:state c) update :active dissoc "shop/api")
+          _ (stub-runner/fail! (:runner c) :start)
+          res (swarm/claim! c (section c "shop/api") "ling-1" {})]
+      (is (r/ok? res))
+      (is (= ["ling-1"] (:claims (:ok res))))
+      (is (= "api-repl" (get-in res [:ok :adopted :programs-not-started 0 :program/id])))
+      (is (some? (get-in res [:ok :adopted :programs-not-started 0 :error]))))))
+
+(deftest a-plain-renewal-after-the-owners-wave-ended-keeps-the-section
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 60})
+    (advance! c (* 61 minute))
+    (let [res (:ok (swarm/claim! c p "coordinator:f07f8867" {}))]
+      (is (string? (:wave-ended res)) "the answer says the wave claim had ended")
+      (is (false? (get-in res [:claim :wave?]))))
+    (let [pass (pass! c)]
+      (is (empty? (get-in pass [:observed :expired])) "the renewal holds: not dropped as :expired")
+      (is (empty? (:reaped pass))))
+    (is (active? c "shop/api"))))
+
+(deftest a-claim-never-resurrects-a-section-forgotten-meanwhile
+  ;; the section is not tracked and its start answers ok, but a reaper pass
+  ;; forgot it meanwhile (here: the start leaves no entry): the claim fails
+  ;; instead of writing an entry with only :claims and :last-touch
+  (let [c (ctx)
+        p (section c "shop/api")
+        res (swarm/claim! c p "ling-3" {:start! #(r/ok {:profile "shop/api"})})]
+    (is (= :compose/not-active (:error res)))
+    (is (nil? (get-in @(:state c) [:active "shop/api"])))))
+
+(deftest a-claim-sees-a-section-another-instance-brought-up
+  ;; two addon instances share one state file; :sync! merges it in. The second
+  ;; instance's claim must see the first's section and renew, not start it.
+  (let [c1 (ctx)
+        _ (ops/up-profile! c1 (section c1 "shop/api"))
+        c2 (ctx)
+        c2 (assoc c2 :sync! (fn [] (swap! (:state c2) assoc :active (:active @(:state c1)))))
+        res (:ok (swarm/claim! c2 (section c2 "shop/api") "ling-2" {}))]
+    (is (:renewed res) "a renewal, not a start")
+    (is (= [] (ups c2)) "no up on the second instance's engine")))
 
 (deftest claim-and-release-accept-a-section-or-preset-id-as-target
   (let [c (assoc-in (ctx) [:settings :compose/profiles "flow"]

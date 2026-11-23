@@ -331,13 +331,19 @@
       (let [services (profile/up-services p closure)
             now ((:now ctx))]
         (if (and (seq services) (every? (set running) services))
-          (do (swap! (:state ctx) update-in [:active (:profile/id p)]
-                     (fn [a] (or a (cond-> {:profile/id (:profile/id p) :project (profile/project p)
-                                            :services (vec services) :profile p
-                                            :started-at now :last-touch now}
-                                     (seq (remove (set services) closure)) (assoc :needs (vec closure))))))
-              (swap! (:state ctx) update :current #(or % (:profile/id p)))
-              (r/ok (get-in @(:state ctx) [:active (:profile/id p)])))
+          ;; the containers run: start only the host programs they pair with
+          ;; (no engine call), as `up` would have, so the claimer gets its nREPL
+          (let [{:keys [held report]} (ops/start-section-programs! ctx p services)
+                not-started (filterv #(or (:error %) (:exited? %)) report)]
+            (swap! (:state ctx) update-in [:active (:profile/id p)]
+                   (fn [a] (or a (cond-> {:profile/id (:profile/id p) :project (profile/project p)
+                                          :services (vec services) :profile p
+                                          :started-at now :last-touch now}
+                                   (seq (remove (set services) closure)) (assoc :needs (vec closure))
+                                   (seq held) (assoc :programs held)))))
+            (r/ok {:entry (get-in @(:state ctx) [:active (:profile/id p)])
+                   :programs report
+                   :not-started not-started}))
           (r/ok nil))))))
 
 (defn- claim-ttl-ms [ctx] (* 60000 (setting ctx :compose/claim-ttl-minutes)))
@@ -350,15 +356,19 @@
    A claim on an ACTIVE section never calls the engine to start, recreate or
    restart anything: it writes the claim, touches the section and answers
    :renewed (the services as they run). A section the addon does not track
-   whose services all run is taken in the same way (:adopted). Only a
-   section that is not running is brought up (:started), through the same
-   `ops/up-profile!` an `up` runs, with the Profile `ops/subject` resolved.
+   whose services all run is taken in the same way (:adopted), its host
+   programs started as `up` would (host only; one that cannot start is
+   named under :programs-not-started and the claim still holds). A section
+   not (fully) running is brought up (:started) by `start!`, a thunk the
+   caller passes so the start goes through the same ownership and orphan
+   guards as `up` (the addon does; a refusal is the claim's error), else by
+   a plain `ops/up-profile!`.
 
    `ttl-minutes` makes it a WAVE claim (see `promote.swarm/claim-end`): live
    until now + ttl-minutes whether or not `agent` (an agent or a
    coordinator) stays in the swarm; it needs a `note` and is bounded by
    :compose/claim-max-ttl-minutes. Claiming again moves its end."
-  [ctx p agent {:keys [note ttl-minutes]}]
+  [ctx p agent {:keys [note ttl-minutes start!]}]
   (if (str/blank? agent)
     (r/err :compose/missing-param {:param "agent" :hint "the claiming agent's id"})
     (r/let-ok [until (sw/wave-until ((:now ctx)) ttl-minutes
@@ -366,19 +376,31 @@
       (let [sid (:profile/id p)
             known (synced-active ctx sid)
             adopted (when-not known (adopt-running! ctx p))
-            up (when-not (or known (and adopted (r/ok? adopted) (:ok adopted)))
-                 (ops/up-profile! ctx p))]
+            taken (when (and adopted (r/ok? adopted)) (:ok adopted))
+            ;; the start goes through the caller's guards (the addon passes the
+            ;; ownership and orphan guards `up` runs), else a plain up
+            up (when-not (or known taken)
+                 (if start! (start!) (ops/up-profile! ctx p)))]
         (cond
           (and up (r/err? up)) up
+          (nil? (get-in @(:state ctx) [:active sid]))
+          ;; a reaper pass forgot the section between the check and the write:
+          ;; never resurrect a partial entry
+          (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
           :else
           (let [now ((:now ctx))
                 live (some->> (agents ctx) (into #{} (map :agent/id)))
-                swarm? (when live (contains? live agent))]
-            (swap! (:state ctx) update-in [:active sid]
-                   (fn [a] (-> a
-                               (update :claims sw/claim agent now {:note note :swarm? swarm? :until until})
-                               (assoc :last-touch now)
-                               (dissoc :orphaned-at))))
+                swarm? (when live (contains? live agent))
+                before (get-in @(:state ctx) [:active sid :claims agent])
+                lapsed? (sw/lapsed-wave before now until)]
+            (swap! (:state ctx)
+                   (fn [st] (if (get-in st [:active sid])
+                              (update-in st [:active sid]
+                                         #(-> %
+                                              (update :claims sw/claim agent now {:note note :swarm? swarm? :until until})
+                                              (assoc :last-touch now)
+                                              (dissoc :orphaned-at)))
+                              st)))
             (persist! ctx)
             (let [a (get-in @(:state ctx) [:active sid])
                   c (get-in a [:claims agent])]
@@ -392,7 +414,12 @@
                                       "claim again (or touch) before the claim TTL runs out; release when done")
                              :nrepl (with-advice (section-routes (routes ctx) a))}
                       known (assoc :renewed {:profile sid :services (:services a)})
-                      (and (nil? known) (nil? up)) (assoc :adopted {:profile sid :services (:services a)})
+                      taken (assoc :adopted (cond-> {:profile sid :services (:services a)}
+                                              (seq (:programs taken)) (assoc :programs (:programs taken))
+                                              (seq (:not-started taken)) (assoc :programs-not-started (:not-started taken))))
+                      lapsed? (assoc :wave-ended
+                                     (str "your wave claim had ended (:until " (:until before)
+                                          "); this renewal without ttl_minutes holds it as a plain claim, renewed within the claim TTL"))
                       up (assoc :started (dissoc (:ok up) :out)))))))))))
 
 (defn release-claim!

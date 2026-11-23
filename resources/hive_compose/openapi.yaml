@@ -593,13 +593,14 @@ paths:
   /v1/claim:
     post:
       operationId: claim
-      summary: an agent declares it works on a section; on an active section it only renews (never starts or recreates
-        anythi
-      description: an agent declares it works on a section; on an active section it only renews (never starts or
-        recreates anything), else it brings it up; the answer names the shared nREPL per module to drive. target
-        (an active section id, a preset id, or services) | profile | target=stack:<run>; agent (default agent_id);
-        note; ttl_minutes (a wave claim, held whether or not the owner stays in the swarm; needs note). Renew before
-        claim TTL
+      summary: an agent declares it works on a section; on an active or fully running section it only renews or
+        takes it (nev
+      description: an agent declares it works on a section; on an active or fully running section it only renews
+        or takes it (never starts or recreates a container), else it brings it up through the same guards as up
+        (refused, naming the holder section and its agents, when that would recreate a service another live section
+        holds); the answer names the shared nREPL per module to drive. target (an active section id, a preset id,
+        or services) | profile | target=stack:<run>; agent (default agent_id); note; ttl_minutes (a wave claim,
+        held whether or not the owner stays in the swarm; needs note). Renew before claim TTL
       tags:
       - swarm
       x-hive-call-op: claim
@@ -646,11 +647,12 @@ paths:
   /v1/release:
     post:
       operationId: release
-      summary: an agent gives up its claim (a wave claim too); with no claim left the section is reaped after the
-        orphan TTL,
-      description: an agent gives up its claim (a wave claim too); with no claim left the section is reaped after
-        the orphan TTL, or now with stop=true. target (an active section id, a preset id, or services) | profile
-        | target=stack:<run>; agent; stop
+      summary: 'an agent gives up its claim (a wave claim too; agent= names whose claim, and any caller may name
+        any agent: th'
+      description: 'an agent gives up its claim (a wave claim too; agent= names whose claim, and any caller may
+        name any agent: there is no auth); with no claim left the section is reaped after the orphan TTL, or now
+        with stop=true. target (an active section id, a preset id, or services) | profile | target=stack:<run>;
+        agent; stop'
       tags:
       - swarm
       x-hive-call-op: release
@@ -1558,6 +1560,8 @@ components:
                 type: string
               swarm?:
                 type: boolean
+              until:
+                type: integer
             required:
             - since
             - seen
@@ -1773,6 +1777,8 @@ components:
                   type: string
                 swarm?:
                   type: boolean
+                until:
+                  type: integer
               required:
               - since
               - seen
@@ -3068,6 +3074,7 @@ components:
         claim-max-ttl-minutes:
           type: integer
           minimum: 1
+          maximum: 10080
         orphan-ttl-minutes:
           type: integer
           minimum: 1
@@ -3714,6 +3721,11 @@ components:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
+        ttl_minutes:
+          type: integer
+          description: '[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes,
+            default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the
+            swarm; claim again to move its end, release to end it now'
         op:
           type: string
           enum:
@@ -3739,11 +3751,6 @@ components:
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
-        ttl_minutes:
-          type: integer
-          description: '[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes,
-            default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the
-            swarm; claim again to move its end, release to end it now'
         agent_id:
           type: string
           description: stamped by the MCP host on every call; claim/release fall back to it when agent is absent
@@ -4692,8 +4699,21 @@ components:
               type: array
               items:
                 type: string
-          description: 'the section was not tracked but all its services ran: taken without an up'
+            programs:
+              type: array
+              items:
+                $ref: '#/components/schemas/ProgramReport'
+            programs-not-started:
+              type: array
+              items:
+                $ref: '#/components/schemas/ProgramReport'
+          description: 'the section was not tracked but all its services ran: taken without an up; its host programs
+            started (host only), those that could not named under programs-not-started'
           x-source: hand
+        wave-ended:
+          type: string
+          description: 'the caller''s wave claim had passed its until: this renewal without ttl_minutes holds it
+            as a plain claim'
       required:
       - profile
       - agent

@@ -207,8 +207,8 @@
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
-   "claim" "an agent declares it works on a section; on an active section it only renews (never starts or recreates anything), else it brings it up; the answer names the shared nREPL per module to drive. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent (default agent_id); note; ttl_minutes (a wave claim, held whether or not the owner stays in the swarm; needs note). Renew before claim TTL"
-   "release" "an agent gives up its claim (a wave claim too); with no claim left the section is reaped after the orphan TTL, or now with stop=true. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent; stop"
+   "claim" "an agent declares it works on a section; on an active or fully running section it only renews or takes it (never starts or recreates a container), else it brings it up through the same guards as up (refused, naming the holder section and its agents, when that would recreate a service another live section holds); the answer names the shared nREPL per module to drive. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent (default agent_id); note; ttl_minutes (a wave claim, held whether or not the owner stays in the swarm; needs note). Renew before claim TTL"
+   "release" "an agent gives up its claim (a wave claim too; agent= names whose claim, and any caller may name any agent: there is no auth); with no claim left the section is reaped after the orphan TTL, or now with stop=true. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent; stop"
    "who" "per active section: claims (owner, note, wave?, expires-in-seconds), what the last pass saw using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent the sections it works in"
    "nrepl" "which shared nREPL drives a module: path (a file or dir) for the closest one, project to filter, none for all; each with advice"
    "reap" "run the idle reaper now (usage pass, then reap)"
@@ -346,7 +346,9 @@
                         (fn [o]
                           (if-let [run (stacks/claim-run tgt)]
                             (stacks/claim! ctx run (agent-param params) o)
-                            (on-section #(swarm/claim! ctx % (agent-param params) o)))))
+                            (on-section (fn [p] (swarm/claim! ctx p (agent-param params)
+                                                              ;; a claim that must start the section passes up's guards
+                                                              (assoc o :start! #(guard p :up false (fn [] (ops/up-profile! ctx p))))))))))
         "release" (if-let [run (stacks/claim-run tgt)]
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
                     (on-section #(swarm/release-claim! ctx % (agent-param params)

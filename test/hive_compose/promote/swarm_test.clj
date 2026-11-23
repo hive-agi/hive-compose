@@ -89,6 +89,29 @@
   (prop/for-all [agent gen-agent c gen-plain live gen-live now gen/nat ttl gen/s-pos-int]
     (= (legacy-end agent c live now ttl) (sw/claim-end agent c live now ttl))))
 
+(defspec a-renewal-is-live-when-it-is-made 300
+  ;; over (stored until or none, now, ttl given or not): whatever was stored,
+  ;; the claim right after a renewal at `now` holds at `now`
+  (prop/for-all [stored (gen/one-of [(gen/return nil) gen/nat])
+                 now gen/nat
+                 ttl (gen/one-of [(gen/return nil) gen/s-pos-int])
+                 claim-ttl gen/s-pos-int]
+    (let [old (cond-> {:since 0 :seen 0} stored (assoc :until stored))
+          until (when ttl (+ now ttl))
+          c (get (sw/claim {"a" old} "a" now {:until until}) "a")]
+      (and (sw/claim-live? "a" c nil now claim-ttl)
+           ;; a live wave claim renewed without ttl keeps its end; a lapsed one is plain
+           (= (:until c) (cond until until
+                               (and stored (> stored now)) stored
+                               :else nil))))))
+
+(deftest a-plain-renewal-after-the-wave-ended-is-a-plain-claim
+  (let [c (sw/claim {"co" {:since 0 :seen 0 :until 1000 :note "gate"}} "co" 1500 {})]
+    (is (= {:since 0 :seen 1500 :note "gate"} (get c "co")))
+    (is (sw/lapsed-wave {:until 1000} 1500 nil))
+    (is (not (sw/lapsed-wave {:until 1000} 999 nil)) "a live wave claim keeps its end")
+    (is (not (sw/lapsed-wave {:until 1000} 1500 9000)) "a new ttl moves it instead")))
+
 (deftest a-wave-claim-outlives-its-agent-and-ends-at-until
   (let [claims (sw/claim {} "coordinator:f07f8867" 0 {:note "pv01 gate" :swarm? true :until 1000})]
     (is (= {} (sw/expired-claims claims #{} 999 10)) "gone from the swarm and long unrenewed: still held")

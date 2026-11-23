@@ -285,6 +285,14 @@
             {:held {} :report []}
             (program/wanted (:profile/programs p) services))))
 
+(defn start-section-programs!
+  "{:held {program-id Running} :report [..]}: start the host programs `p`
+   pairs with `services`, reusing the live ones its project's sections hold.
+   Host only: nothing is asked of the engine. For a section taken as it runs
+   (a claim's adopt), which never goes through `bring-up!`."
+  [ctx p services]
+  (start-programs! ctx p services (live-programs ctx (profile/project p))))
+
 (defn- stop-programs!
   "Stop the programs only active entry `id` holds, those in `keep` spared.
    Answers one report row per program."

@@ -563,7 +563,7 @@
    [:compose/activity Activity]
    [:compose/cpu-busy-percent {:optional true} [:and number? [:>= 0]]]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
-   [:compose/claim-max-ttl-minutes {:optional true} [:int {:min 1}]]
+   [:compose/claim-max-ttl-minutes {:optional true} [:int {:min 1 :max 10080}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
    [:compose/program-grace-ms {:optional true} [:int {:min 0}]]
    [:compose/history-file {:optional true} [:string {:min 1}]]

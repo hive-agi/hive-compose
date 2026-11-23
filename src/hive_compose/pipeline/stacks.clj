@@ -35,6 +35,7 @@
   (:require [clojure.string :as str]
             [hive-compose.port :as port]
             [hive-compose.promote.capability :as capability]
+            [hive-compose.promote.config :as config]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.resources :as resources]
             [hive-compose.promote.stack :as stack]
@@ -590,7 +591,8 @@
   (serialized ctx
     (let [t (now ctx)
           until (sw/wave-until t ttl-minutes
-                               (or (:compose/claim-max-ttl-minutes (:settings ctx)) 480) note)]
+                               (or (:compose/claim-max-ttl-minutes (:settings ctx))
+                                   (:compose/claim-max-ttl-minutes config/defaults)) note)]
       (cond
         (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
         (r/err? until) until
@@ -621,7 +623,7 @@
 (defn- ttls [settings]
   {:ttl-ms (* 60000 (or (:compose/default-ttl-minutes settings) 60))
    :orphan-ttl-ms (* 60000 (or (:compose/orphan-ttl-minutes settings) (:compose/default-ttl-minutes settings) 60))
-   :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) 30))})
+   :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) (:compose/claim-ttl-minutes config/defaults)))})
 
 (defn- down-row [ctx rid extra]
   (let [x (try (stack-down! ctx {:run rid})

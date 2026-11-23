@@ -154,7 +154,10 @@ components["ClaimResult"] = obj({"profile": S, "agent": S, "claims": arr(S), "cl
     "claim": obj({"note": S, "since": I, "seen": I, "wave?": B, "until": I, "expires-in-seconds": I}),
     "nrepl": arr(ref("Route")), "started": ref("UpResult"),
     "renewed": obj({"profile": S, "services": arr(S)}, desc="the section was active: nothing was started, recreated or restarted"),
-    "adopted": obj({"profile": S, "services": arr(S)}, desc="the section was not tracked but all its services ran: taken without an up")}, ["profile", "agent", "claims", "claim-ttl-minutes", "renew", "nrepl"])
+    "adopted": obj({"profile": S, "services": arr(S), "programs": arr(ref("ProgramReport")),
+                    "programs-not-started": arr(ref("ProgramReport"))},
+                   desc="the section was not tracked but all its services ran: taken without an up; its host programs started (host only), those that could not named under programs-not-started"),
+    "wave-ended": {"type": "string", "description": "the caller's wave claim had passed its until: this renewal without ttl_minutes holds it as a plain claim"}}, ["profile", "agent", "claims", "claim-ttl-minutes", "renew", "nrepl"])
 components["ReleaseResult"] = obj({"profile": S, "agent": S, "claims": arr(S), "orphaned?": B, "reap-in-seconds": I,
     "note": S, "stopped": ref("DownResult")}, ["profile", "agent", "claims"])
 components["WhoResult"] = obj({"sections": arr(obj({"id": S, "project": S,

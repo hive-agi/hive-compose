@@ -52,6 +52,13 @@
         (is (= #{} (apply disj in-src enum)) "missing from ErrorCategory")
         (is (= #{} (apply disj enum in-src)) "in ErrorCategory but answered by no source")))))
 
+(deftest a-persisted-claim-carries-its-wave-end
+  (doseq [path [["Claim" "properties" "until"]
+                ["Active" "properties" "claims" "additionalProperties" "properties" "until"]
+                ["ActiveMap" "additionalProperties" "properties" "claims" "additionalProperties" "properties" "until"]]]
+    (is (= "integer" (get-in @spec (into ["components" "schemas"] (conj path "type")))) (pr-str path)))
+  (is (some? (get-in @spec ["components" "schemas" "Settings" "properties" "claim-max-ttl-minutes"]))))
+
 (deftest request-params-are-the-tools-params
   (let [tool-params (set (keys (get-in (addon/tool (addon/make-addon)) [:inputSchema :properties])))]
     (doseq [c addon/commands
