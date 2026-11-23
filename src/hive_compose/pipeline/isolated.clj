@@ -182,6 +182,7 @@
                    running (r/ok (if entry (let [x (port/-running e ip)] (if (r/ok? x) (:ok x) #{})) #{}))]
           (let [{:keys [budget verdict limits]} (admission ctx model cp (remove (set running) closure))]
             (r/ok {:run rid :new? (nil? entry) :compose-project cp :profile ip :doc doc
+                   :config-digest (config-digest {"config" model "override" doc} base rid)
                    :text (override/emit doc) :path path :images pinned :shared-volumes shared
                    :ports policy :planned-ports planned :env run-env :model model
                    :admission (cond-> {:verdict (if (r/ok? verdict) :ok :refused)
@@ -220,6 +221,7 @@
                                                 :shared-volumes (:shared-volumes pl)
                                                 :dir (get-in pl [:profile :profile/dir])
                                                 :files (get-in pl [:profile :profile/files])
+                                                :override (:path pl)
                                                 :env (env/rendered (get-in pl [:profile :profile/env]))))))
       (record-run! ctx rid #(-> %
                                 (assoc :images (merge (:images %) (:images pl)))
@@ -240,7 +242,7 @@
   [ctx p opts]
   (r/map-ok (plan-join ctx p opts)
             (fn [pl] (-> (select-keys pl [:run :new? :compose-project :path :images :shared-volumes
-                                          :ports :planned-ports :env :admission])
+                                          :ports :planned-ports :env :admission :config-digest])
                          (assoc :section (get-in pl [:profile :profile/id])
                                 :override (override/describe (:doc pl))
                                 :override-text (:text pl))))))
@@ -299,8 +301,15 @@
    volumes removed only with `volumes?` (default kept: a failed run's data is
    evidence)."
   [ctx rid volumes?]
-  (if-not (get (runs ctx) rid)
+  (cond
+    (not (get (runs ctx) rid))
     (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (runs ctx))))})
+    ;; an ended run keeps its volumes until asked: down run=<id> volumes=true
+    (get-in (runs ctx) [rid :ended-at])
+    (if volumes?
+      (r/map-ok (remove-volumes! ctx rid) (fn [v] {:run rid :ended? true :volumes v}))
+      (r/ok {:run rid :ended? true :volumes-kept (let [x (removable-volumes ctx rid)] (if (r/ok? x) (mapv :name (:ok x)) []))}))
+    :else
     (let [ids (iso/run-sections (:active @(:state ctx)) rid)
           downs (mapv (fn [id] (let [x (r/bind (ops/lookup ctx id) #(ops/down-profile! ctx % :down))]
                                  (cond-> {:section id :ok? (r/ok? x)} (r/err? x) (assoc :error x))))

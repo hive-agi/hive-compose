@@ -5,6 +5,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [hive-compose.promote.isolated]
             [hive-compose.promote.override :as ov]
             [hive-dsl.result :as r]))
 
@@ -178,3 +179,33 @@
       (or (r/err? doc)
           (and (= (ov/emit (:ok doc)) (ov/emit (:ok doc)))
                (= (ov/emit (:ok doc)) (ov/emit (:ok doc2))))))))
+
+;; The consumer's real port shapes, as `docker compose config --format json`
+;; (5.7.1) answers them: a loopback bind, an ephemeral bind already in the
+;; file (published "0"), an interpolated one (resolved before we see it,
+;; POSTGRES_HOST_PORT=7777 in the call env), and a service with several.
+(def shapes
+  {"name" "dc"
+   "services" {"gw" {"image" "x"
+                     "ports" [{"mode" "ingress" "host_ip" "127.0.0.1" "target" 8090 "published" "18090" "protocol" "tcp"}
+                              {"mode" "ingress" "host_ip" "127.0.0.1" "target" 9000 "published" "0" "protocol" "tcp"}
+                              {"mode" "ingress" "target" 5432 "published" "7777" "protocol" "tcp"}]}
+               "envoy" {"image" "x"
+                        "ports" [{"target" 10000 "published" "10000" "protocol" "tcp"}
+                                 {"target" 10001 "published" "10001" "protocol" "tcp"}
+                                 {"target" 9901 "published" "9901" "protocol" "tcp"}]}}})
+
+(deftest real-port-shapes-under-offset
+  (let [doc (ok (ov/override-doc shapes {:override/ports {:offset 1000}}))]
+    (is (= (ov/tagged "!override"
+                      [{"target" 8090 "protocol" "tcp" "host_ip" "127.0.0.1" "published" "19090"}
+                       {"target" 9000 "protocol" "tcp" "host_ip" "127.0.0.1" "published" "0"}
+                       {"target" 5432 "protocol" "tcp" "published" "8777"}])
+           (get-in doc ["services" "gw" "ports"]))
+        "loopback keeps its host ip; an ephemeral bind stays ephemeral (0, never 0+N); the resolved value moves")
+    (is (= {"gw" {"8090" 19090 "5432" 8777} "envoy" {"10000" 11000 "10001" 11001 "9901" 10901}}
+           (ov/planned-ports shapes {:offset 1000}))
+        "an ephemeral bind has no host port known before up")
+    (is (= #{"HIVE_PORT_GW_8090" "HIVE_PORT_GW_5432" "HIVE_PORT_ENVOY_10000" "HIVE_PORT_ENVOY_10001" "HIVE_PORT_ENVOY_9901"}
+           (set (filter #(and (clojure.string/starts-with? % "HIVE_PORT_") (not= % "HIVE_PORT_OFFSET")) (keys (hive-compose.promote.isolated/run-env "dc" "r01" {:offset 1000} (ov/planned-ports shapes {:offset 1000}))))))
+        "one variable per published port; none for the ephemeral one")))

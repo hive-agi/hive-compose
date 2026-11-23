@@ -147,6 +147,11 @@
       (is (= ["dc-dcabc123_pgdata"] (get-in d [:ok :volumes-kept])))
       (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))
       (is (= [{:run rid :name "dc-dcabc123_pgdata"}] (:stale-run-volumes (isolated/status ctx)))))
+    (testing "a later down run=<id> volumes=true of the ended run removes them (the real-docker gate order)"
+      (let [d (isolated/down-run! ctx rid true)]
+        (is (= ["dc-dcabc123_pgdata"] (get-in d [:ok :volumes :removed])) (pr-str d))
+        (is (not (contains? (stub/volumes e) "dc-dcabc123_pgdata")))
+        (is (contains? (stub/volumes e) "dc_pgdata"))))
     (testing "explicit removal takes only the run's own volumes"
       (let [{:keys [ctx e]} (world)
             rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
