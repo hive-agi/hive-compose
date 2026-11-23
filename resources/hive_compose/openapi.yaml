@@ -593,10 +593,13 @@ paths:
   /v1/claim:
     post:
       operationId: claim
-      summary: an agent declares it works on a section, bringing it up when not active; the answer names the shared
-        nREPL per
-      description: an agent declares it works on a section, bringing it up when not active; the answer names the
-        shared nREPL per module to drive. target|profile; agent (default agent_id); note. Renew before claim TTL
+      summary: an agent declares it works on a section; on an active section it only renews (never starts or recreates
+        anythi
+      description: an agent declares it works on a section; on an active section it only renews (never starts or
+        recreates anything), else it brings it up; the answer names the shared nREPL per module to drive. target
+        (an active section id, a preset id, or services) | profile | target=stack:<run>; agent (default agent_id);
+        note; ttl_minutes (a wave claim, held whether or not the owner stays in the swarm; needs note). Renew before
+        claim TTL
       tags:
       - swarm
       x-hive-call-op: claim
@@ -643,10 +646,11 @@ paths:
   /v1/release:
     post:
       operationId: release
-      summary: an agent gives up its claim; with no claim left the section is reaped after the orphan TTL, or now
-        with stop=t
-      description: an agent gives up its claim; with no claim left the section is reaped after the orphan TTL, or
-        now with stop=true. target|profile; agent; stop
+      summary: an agent gives up its claim (a wave claim too); with no claim left the section is reaped after the
+        orphan TTL,
+      description: an agent gives up its claim (a wave claim too); with no claim left the section is reaped after
+        the orphan TTL, or now with stop=true. target (an active section id, a preset id, or services) | profile
+        | target=stack:<run>; agent; stop
       tags:
       - swarm
       x-hive-call-op: release
@@ -693,10 +697,11 @@ paths:
   /v1/who:
     post:
       operationId: who
-      summary: 'per active section: claims, what the last pass saw using it (claims, agents working in its project,
-        new nREPL '
-      description: 'per active section: claims, what the last pass saw using it (claims, agents working in its project,
-        new nREPL connections), when it is reaped; per live agent the sections it works in'
+      summary: 'per active section: claims (owner, note, wave?, expires-in-seconds), what the last pass saw using
+        it (claims, '
+      description: 'per active section: claims (owner, note, wave?, expires-in-seconds), what the last pass saw
+        using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent
+        the sections it works in'
       tags:
       - swarm
       x-hive-call-op: who
@@ -1828,6 +1833,8 @@ components:
           type: string
         swarm?:
           type: boolean
+        until:
+          type: integer
       required:
       - since
       - seen
@@ -3058,6 +3065,9 @@ components:
         claim-ttl-minutes:
           type: integer
           minimum: 1
+        claim-max-ttl-minutes:
+          type: integer
+          minimum: 1
         orphan-ttl-minutes:
           type: integer
           minimum: 1
@@ -3684,7 +3694,7 @@ components:
             default <stack><6 hex>); claim/release a run with target=stack:<run>'
         note:
           type: string
-          description: '[claim] what the agent works on'
+          description: '[claim] what the agent works on (required with ttl_minutes)'
         limit:
           type: integer
           description: '[flaky] how many ranked cases (default 20)'
@@ -3729,6 +3739,11 @@ components:
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
+        ttl_minutes:
+          type: integer
+          description: '[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes,
+            default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the
+            swarm; claim again to move its end, release to end it now'
         agent_id:
           type: string
           description: stamped by the MCP host on every call; claim/release fall back to it when agent is absent
@@ -3792,6 +3807,7 @@ components:
       - compose/alias-shadows-service
       - compose/api-bind-failed
       - compose/bundle-unwritable
+      - compose/claim-ttl-over-max
       - compose/command-failed
       - compose/consumer-name-collision
       - compose/data-exec-unsupported
@@ -4284,6 +4300,10 @@ components:
       properties:
         claim:
           type: string
+        wave?:
+          type: boolean
+        until:
+          type: integer
         agent:
           type: string
         port:
@@ -4346,6 +4366,12 @@ components:
               since:
                 type: integer
               seen:
+                type: integer
+              wave?:
+                type: boolean
+              until:
+                type: integer
+              expires-in-seconds:
                 type: integer
             x-source: hand
         orphaned?:
@@ -4439,6 +4465,7 @@ components:
                 enum:
                 - gone
                 - stale
+                - expired
             x-source: hand
         orphaned:
           type: array
@@ -4623,12 +4650,50 @@ components:
           type: integer
         renew:
           type: string
+        claim:
+          type: object
+          properties:
+            note:
+              type: string
+            since:
+              type: integer
+            seen:
+              type: integer
+            wave?:
+              type: boolean
+            until:
+              type: integer
+            expires-in-seconds:
+              type: integer
+          x-source: hand
         nrepl:
           type: array
           items:
             $ref: '#/components/schemas/Route'
         started:
           $ref: '#/components/schemas/UpResult'
+        renewed:
+          type: object
+          properties:
+            profile:
+              type: string
+            services:
+              type: array
+              items:
+                type: string
+          description: 'the section was active: nothing was started, recreated or restarted'
+          x-source: hand
+        adopted:
+          type: object
+          properties:
+            profile:
+              type: string
+            services:
+              type: array
+              items:
+                type: string
+          description: 'the section was not tracked but all its services ran: taken without an up'
+          x-source: hand
       required:
       - profile
       - agent
@@ -4683,6 +4748,12 @@ components:
                     since:
                       type: integer
                     seen:
+                      type: integer
+                    wave?:
+                      type: boolean
+                    until:
+                      type: integer
+                    expires-in-seconds:
                       type: integer
                   x-source: hand
               in-use?:
@@ -5189,7 +5260,7 @@ components:
             (addon/agent-param)
         note:
           type: string
-          description: '[claim] what the agent works on'
+          description: '[claim] what the agent works on (required with ttl_minutes)'
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5197,6 +5268,11 @@ components:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
+        ttl_minutes:
+          type: integer
+          description: '[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes,
+            default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the
+            swarm; claim again to move its end, release to end it now'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)

@@ -82,7 +82,7 @@
                       "down" {"profile" "api"} "stop" {"target" "dc/web"}
                       "touch" {"project" "dc"} "ps" {"target" "dc/web"}
                       "logs" {"target" "dc/web" "tail" 50}
-                      "claim" {"target" "dc/web" "note" "hc-14" "agent" "ling-1"}
+                      "claim" {"target" "dc/web" "note" "hc-14" "agent" "coordinator:f07f8867" "ttl_minutes" 240}
                       "release" {"target" "dc/web" "stop" true "agent_id" "ling-1"}
                       "nrepl" {"path" "/w/dc/src/a.clj" "project" "dc"}
                       "status" {} "targets" {} "help" {} "who" {} "reap" {}}]

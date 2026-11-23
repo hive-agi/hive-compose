@@ -207,9 +207,9 @@
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
-   "claim" "an agent declares it works on a section, bringing it up when not active; the answer names the shared nREPL per module to drive. target|profile; agent (default agent_id); note. Renew before claim TTL"
-   "release" "an agent gives up its claim; with no claim left the section is reaped after the orphan TTL, or now with stop=true. target|profile; agent; stop"
-   "who" "per active section: claims, what the last pass saw using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent the sections it works in"
+   "claim" "an agent declares it works on a section; on an active section it only renews (never starts or recreates anything), else it brings it up; the answer names the shared nREPL per module to drive. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent (default agent_id); note; ttl_minutes (a wave claim, held whether or not the owner stays in the swarm; needs note). Renew before claim TTL"
+   "release" "an agent gives up its claim (a wave claim too); with no claim left the section is reaped after the orphan TTL, or now with stop=true. target (an active section id, a preset id, or services) | profile | target=stack:<run>; agent; stop"
+   "who" "per active section: claims (owner, note, wave?, expires-in-seconds), what the last pass saw using it (claims, agents working in its project, new nREPL connections), when it is reaped; per live agent the sections it works in"
    "nrepl" "which shared nREPL drives a module: path (a file or dir) for the closest one, project to filter, none for all; each with advice"
    "reap" "run the idle reaper now (usage pass, then reap)"
    "adopt" "take charge of running containers no section owns"
@@ -259,6 +259,18 @@
   "The claiming agent: `agent`, else the `agent_id` the host stamps on a call."
   [params]
   (some-> (or (param params "agent") (param params "agent_id")) str))
+
+(defn- ttl-minutes-param
+  "Result<minutes-or-nil>: the `ttl_minutes` of a claim (a JSON integer, or
+   digits as text), nil when absent; anything else is an invalid-param."
+  [params]
+  (let [v (param params "ttl_minutes")]
+    (cond
+      (nil? v) (r/ok nil)
+      (int? v) (r/ok (long v))
+      (and (string? v) (re-matches #"\d{1,9}" v)) (r/ok (Long/parseLong v))
+      :else (r/err :compose/invalid-param {:param "ttl_minutes" :value v
+                                           :hint "a whole number of minutes, at least 1"}))))
 
 (defn- stack-opts
   "The options of `stack-up`/`stack-down`/`stack-status`/`plan` from the tool
@@ -313,6 +325,10 @@
                                 (r/bind (ops/subject ctx {:target tgt :id id :env (:env o)})
                                         #(f (adjust % o))))))
         on-subject (fn [f] (on-subject* f (fn [p o] (profile/with-call-options p (select-keys o [:env])))))
+        ;; claim/release: target is first an active section id or a preset id
+        on-section (fn [f] (r/bind (ops/section-subject ctx {:target tgt :id id}) f))
+        claim-opts (fn [] (r/map-ok (ttl-minutes-param params)
+                                    (fn [t] {:note (some-> (param params "note") str) :ttl-minutes t})))
         with-opts (fn [f] (on-subject* f profile/with-call-options))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
@@ -326,13 +342,14 @@
         "programs" (ops/programs ctx)
         "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
         "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
-        "claim" (if-let [run (stacks/claim-run tgt)]
-                  (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
-                  (on-subject #(swarm/claim! ctx % (agent-param params)
-                                              {:note (some-> (param params "note") str)})))
+        "claim" (r/bind (claim-opts)
+                        (fn [o]
+                          (if-let [run (stacks/claim-run tgt)]
+                            (stacks/claim! ctx run (agent-param params) o)
+                            (on-section #(swarm/claim! ctx % (agent-param params) o)))))
         "release" (if-let [run (stacks/claim-run tgt)]
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
-                    (on-subject #(swarm/release-claim! ctx % (agent-param params)
+                    (on-section #(swarm/release-claim! ctx % (agent-param params)
                                                        {:stop? (flag params "stop")})))
         ;; stack-up/stack-down/claim/release and the reaper's stacks/reap! take
         ;; the one stack lock of ctx's state (stacks/serialized): never concurrent
@@ -387,11 +404,13 @@
                      "the refusal names that section and the agents owning it. "
                      "up/switch take no_deps (start only the named services, e.g. past a failing migration), "
                      "wait (until healthy) and env. touch with no target resets every active section. "
-                     "SWARM: an agent working on an app claims its section (claim target=.. note=..; renew within "
-                     "the claim TTL, release when done) and gets the shared nREPL per module to drive instead of "
+                     "SWARM: an agent working on an app claims its section (claim target=<section, preset or services> note=..; "
+                     "renew within the claim TTL, release when done; claiming an active section never restarts it) "
+                     "and gets the shared nREPL per module to drive instead of "
                      "starting its own JVM; nrepl path=<file> answers which port drives that file. The reaper keeps "
                      "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
+                     "A WAVE claim (claim ttl_minutes=.. note=.., up to 8 h, owner may be a coordinator) holds until it ends or is released, even when its owner parks or leaves the swarm. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
                      "command=help lists every command with its params.")
@@ -409,7 +428,8 @@
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}
                               "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
                               "agent" {:type "string" :description "[claim|release] the agent claiming; defaults to the caller's agent_id"}
-                              "note" {:type "string" :description "[claim] what the agent works on"}
+                              "note" {:type "string" :description "[claim] what the agent works on (required with ttl_minutes)"}
+                              "ttl_minutes" {:type "integer" :description "[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes, default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the swarm; claim again to move its end, release to end it now"}
                               "stop" {:type "boolean" :description "[release] stop the section now when no claim is left (what other sections need stays up)"}
                               "path" {:type "string" :description "[nrepl] a file or directory: answers the shared nREPL that drives it"}
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}

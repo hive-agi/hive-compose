@@ -82,6 +82,102 @@
     (testing "a claim without an agent is refused"
       (is (r/err? (swarm/claim! c (section c "shop/api") "" {}))))))
 
+(defn- ups [c] (filterv #(#{:up :restart :recreate} (first %)) (stub/calls (:engine c))))
+
+(deftest a-claim-on-an-active-section-never-starts-anything
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (is (contains? (:ok (swarm/claim! c p "ling-1" {})) :started) "the first claim brings it up")
+    (let [before (ups c)
+          res (:ok (swarm/claim! c p "ling-2" {:note "renew"}))]
+      (is (= before (ups c)) "no up, restart or recreate on a renewal")
+      (is (not (contains? res :started)))
+      (is (= {:profile "shop/api" :services ["api" "postgres"]} (:renewed res))))
+    (testing "the same by preset id: profile= and target= both find the active section"
+      (let [c (ctx)
+            c (assoc-in c [:settings :compose/profiles "flow"]
+                        {:profile/id "flow" :profile/dir "/w/shop" :profile/project "shop" :profile/services ["api"]})
+            p (:ok (ops/section-subject c {:id "flow"}))]
+        (swarm/claim! c p "ling-1" {})
+        (let [before (ups c)]
+          (doseq [call [{:id "flow"} {:target "flow"} {:target "shop/flow"}]]
+            (let [res (r/bind (ops/section-subject c call) #(swarm/claim! c % "ling-2" {}))]
+              (is (r/ok? res) (str call))
+              (is (:renewed (:ok res)) (str call))))
+          (is (= before (ups c))))))))
+
+(deftest a-claim-on-a-running-untracked-section-takes-it-without-an-up
+  (testing "its services run (another section or instance started them): claim tracks it, starts nothing"
+    (let [c (ctx)
+          _ (ops/up-profile! c (section c "shop/api"))
+          _ (swap! (:state c) update :active dissoc "shop/api")
+          before (ups c)
+          res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+      (is (= before (ups c)))
+      (is (not (contains? res :started)))
+      (is (= ["api" "postgres"] (get-in res [:adopted :services])))
+      (is (= ["ling-1"] (:claims res)))))
+  (testing "when something it needs is down, it is brought up as before"
+    (let [c (ctx)
+          res (:ok (swarm/claim! c (section c "shop/api") "ling-1" {}))]
+      (is (contains? res :started))
+      (is (= [[:up "shop" ["api" "postgres"]]] (ups c))))))
+
+(deftest claim-and-release-accept-a-section-or-preset-id-as-target
+  (let [c (assoc-in (ctx) [:settings :compose/profiles "flow"]
+                    {:profile/id "flow" :profile/dir "/w/shop" :profile/project "shop" :profile/services ["api"]})]
+    (is (= "flow" (:profile/id (:ok (ops/section-subject c {:target "flow"})))) "a preset id")
+    (is (= "flow" (:profile/id (:ok (ops/section-subject c {:target "shop/flow"})))) "behind its compose project")
+    (is (= "shop/api" (:profile/id (:ok (ops/section-subject c {:target "shop/api"})))) "a target still resolves")
+    (ops/up-profile! c (section c "blog/ghost"))
+    (is (= "blog/ghost" (:profile/id (:ok (ops/section-subject c {:target "blog/ghost"})))) "an active section id")
+    (is (= :compose/unknown-target (:error (ops/section-subject c {:target "nope"}))))))
+
+(deftest a-wave-claim-outlives-its-coordinator-and-lanes-claim-on-top
+  (let [c (ctx [{:agent/id "coordinator:f07f8867"} {:agent/id "ling-1" :agent/cwd "/elsewhere"}])
+        p (section c "shop/api")]
+    (testing "bounded, and it needs a note"
+      (is (= :compose/claim-ttl-over-max (:error (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 481}))))
+      (is (= :compose/missing-param (:error (swarm/claim! c p "coordinator:f07f8867" {:ttl-minutes 240}))))
+      (is (not (active? c "shop/api")) "a refused wave claim starts nothing"))
+    (let [res (:ok (swarm/claim! c p "coordinator:f07f8867" {:note "pv01 gate" :ttl-minutes 240}))]
+      (is (= {:note "pv01 gate" :since 0 :seen 0 :wave? true :until (* 240 minute) :expires-in-seconds (* 240 60)}
+             (:claim res))))
+    (swarm/claim! c p "ling-1" {:note "scored run"})
+    (swarm/release-claim! c p "ling-1" {})
+    (is (contains? (get-in @(:state c) [:active "shop/api" :claims]) "coordinator:f07f8867")
+        "releasing an ordinary claim leaves the wave claim")
+    (stub-swarm/agents! (:swarm c) [])
+    (dotimes [_ 7]
+      (advance! c (* 30 minute))
+      (let [pass (pass! c)]
+        (is (empty? (get-in pass [:observed :expired])) "parked or gone, unrenewed: the wave claim holds")
+        (is (empty? (:reaped pass)))))
+    (is (active? c "shop/api") "3.5 h on, past the section TTL and the claim TTL: kept")
+    (let [[s] (:sections (:ok (swarm/who c)))
+          w (get-in s [:claims "coordinator:f07f8867"])]
+      (is (:wave? w))
+      (is (= (* 30 60) (:expires-in-seconds w)))
+      (is (= "pv01 gate" (:note w))))
+    (testing "renewing moves its end"
+      (swarm/claim! c p "coordinator:f07f8867" {:note "pv01 gate" :ttl-minutes 60})
+      (is (= (* 270 minute) (get-in @(:state c) [:active "shop/api" :claims "coordinator:f07f8867" :until]))))
+    (advance! c (* 61 minute))
+    (let [pass (pass! c)]
+      (is (= [{:section "shop/api" :agent "coordinator:f07f8867" :reason :expired}] (get-in pass [:observed :expired])))
+      (is (= ["shop/api"] (get-in pass [:observed :orphaned])) "an ended wave claim orphans like any other"))
+    (advance! c (* 11 minute))
+    (pass! c)
+    (is (not (active? c "shop/api")) "then the reaper takes it like any orphan")))
+
+(deftest release-ends-a-wave-claim-at-once
+  (let [c (ctx)
+        p (section c "shop/api")]
+    (swarm/claim! c p "coordinator:f07f8867" {:note "gate" :ttl-minutes 480})
+    (let [res (:ok (swarm/release-claim! c p "coordinator:f07f8867" {}))]
+      (is (= [] (:claims res)))
+      (is (:orphaned? res)))))
+
 (deftest a-renewed-claim-keeps-the-section-past-its-ttl
   (let [c (ctx)
         p (section c "shop/api")]
@@ -227,7 +323,7 @@
     (let [{:keys [sections agents]} (:ok (swarm/who c))
           [s] sections]
       (is (= "shop/api" (:id s)))
-      (is (= {"ling-1" {:note "fix login" :since 0 :seen 0}} (:claims s)))
+      (is (= {"ling-1" {:note "fix login" :since 0 :seen 0 :wave? false :expires-in-seconds (* 30 60)}} (:claims s)))
       (is (:in-use? s))
       (is (= [{:claim "ling-1"} {:agent "ling-2"}] (:used-by s)))
       (is (= {"ling-2" ["shop/api"] "ling-3" []}

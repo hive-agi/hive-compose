@@ -44,6 +44,40 @@
       (is (.isShutdown ^java.util.concurrent.ExecutorService sched))
       (is (= :down (:status (addon/health a)))))))
 
+(deftest claim-through-the-tool-renews-by-preset-id-and-takes-a-wave-ttl
+  (let [dir (temp-dir)
+        engine (stub/engine {"api" ["api" "db"]})
+        a (sut/make-addon (assoc (config dir engine) :compose/swarm? false))
+        ups #(count (filter (comp #{:up :restart :recreate} first) (stub/calls engine)))]
+    (addon/initialize! a {})
+    (try
+      (let [first-claim (call a {"command" "claim" "profile" "api" "agent" "ling-1"})]
+        (is (not (:error? first-claim)) (pr-str first-claim))
+        (is (contains? (:body first-claim) :started)))
+      (let [n (ups)]
+        (doseq [params [{"command" "claim" "profile" "api" "agent" "ling-2"}
+                        {"command" "claim" "target" "api" "agent" "ling-3"}
+                        {"command" "claim" "target" "api" "agent" "coordinator:f07f8867"
+                         "note" "pv01 gate" "ttl_minutes" 240}]]
+          (let [res (call a params)]
+            (is (not (:error? res)) (pr-str params res))
+            (is (:renewed (:body res)) (pr-str params))
+            (is (not (contains? (:body res) :started)))))
+        (is (= n (ups)) "a renewal, by profile= or target=, never calls up"))
+      (let [w (get-in (call a {"command" "who"}) [:body :sections 0 :claims :coordinator:f07f8867])]
+        (is (true? (:wave? w)))
+        (is (= "pv01 gate" (:note w))))
+      (testing "over the bound: refused, naming it"
+        (let [res (call a {"command" "claim" "target" "api" "agent" "coordinator:f07f8867"
+                           "note" "x" "ttl_minutes" 481})]
+          (is (:error? res))
+          (is (= "claim-ttl-over-max" (get-in res [:body :error])))
+          (is (= 480 (get-in res [:body :max])))))
+      (testing "release by target= id"
+        (let [res (call a {"command" "release" "target" "api" "agent" "ling-3"})]
+          (is (not (:error? res)) (pr-str res))))
+      (finally (addon/shutdown! a)))))
+
 (deftest stack-commands-drive-runs-and-persist-them
   (let [dir (temp-dir)
         engine (stub/engine {} {} {"kafka" {"kafka" {}} "shop" {"api" {}}})

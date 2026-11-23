@@ -44,6 +44,7 @@
    not ready or not configured, 500 a fault of the addon itself."
   {:compose/missing-param 400
    :compose/invalid-param 400
+   :compose/claim-ttl-over-max 400
    :compose/invalid-run 400
    :compose/invalid-stack 400
    :compose/invalid-version 400

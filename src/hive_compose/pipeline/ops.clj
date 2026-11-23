@@ -23,6 +23,7 @@
             [hive-compose.promote.program :as program]
             [hive-compose.promote.stack :as stack]
             [hive-compose.promote.stack-run :as stack-run]
+            [hive-compose.promote.swarm :as swarm]
             [hive-compose.promote.target :as target]
             [hive-dsl.result :as r]
             [clojure.string :as str]))
@@ -137,6 +138,30 @@
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
+
+(defn section-subject
+  "Result<Profile> for claim and release, which name a section that usually
+   runs already: `target` is first an ACTIVE section id (flow-payment,
+   dc/api), then a preset id, and only then a target resolved as `subject`
+   does (services or native profiles). `id` (profile=) works as in
+   `subject`. So `claim target=flow-payment` finds the preset section the
+   way `claim profile=flow-payment` does, instead of asking compose for a
+   service of that name."
+  [ctx {:keys [target] :as call}]
+  (let [known? #(or (active-entry ctx %) (configured ctx %))
+        {:keys [project names]} (when (seq target) (target/parse target))
+        ;; dc/flow-payment: a preset or active id behind its compose project
+        named (when (and project (= 1 (count names)) (known? (first names)))
+                (let [id (first names)
+                      p (:ok (lookup ctx id))
+                      proj (get-in ctx [:settings :compose/projects project])]
+                  (when (and p (contains? (set (remove nil? [project (some-> proj target/project-profile profile/project)]))
+                                          (profile/project p)))
+                    id)))]
+    (cond
+      (and (seq target) (known? target)) (lookup ctx target)
+      named (lookup ctx named)
+      :else (subject ctx call))))
 
 (defn rebase-sections!
   "After the configured projects changed from `old-projects` to the ones in
@@ -751,9 +776,9 @@
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
                   (and a bad) (assoc :reap-blocked? true)
-                  (seq (:claims a)) (assoc :claims (into (sorted-map)
-                                                         (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
-                                                         (:claims a)))
+                  (seq (:claims a)) (assoc :claims (swarm/claims-view (:claims a) now
+                                                                      (* 60000 (or (:compose/claim-ttl-minutes settings)
+                                                                                   (:compose/claim-ttl-minutes config/defaults)))))
                   (:orphaned-at a) (assoc :orphaned? true)
                   (:usage a) (assoc :usage (:usage a)
                                     :in-use-via (get-in a [:usage :sources] []))
