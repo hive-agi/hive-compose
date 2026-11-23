@@ -610,6 +610,47 @@
    [:instances [:vector [:map [:instance :string] [:mem [:int {:min 0}]]]]]
    [:message :string]])
 
+;; ---------------------------------------------------------------------------
+;; Generated override (FUN-D): what a private copy of a compose project (a
+;; stack's private instance, an isolated section run) changes in the merged
+;; model so it runs beside the shared one. Interpreted only by
+;; hive-compose.promote.override; emitted with compose merge tags.
+
+(def PortPolicy
+  "How a private copy publishes host ports. :keep as the model says; :strip
+   none at all (reached by network alias); :ephemeral every container port
+   on 127.0.0.1 with a host port docker picks; {:offset n} every published
+   host port p as p+n on the same address (unpublished ones stay as they
+   are); {:publish {service {container-port host-port}}} exactly these on
+   127.0.0.1, a host port 0 letting docker pick, every other port stripped."
+  [:or
+   [:enum :keep :strip :ephemeral]
+   [:map {:closed true} [:offset [:int {:min -65535 :max 65535}]]]
+   [:map {:closed true}
+    [:publish [:map-of [:string {:min 1}]
+               [:map-of [:int {:min 1 :max 65535}] [:int {:min 0 :max 65535}]]]]]])
+
+(def OverrideSpec
+  "What the override of one private copy changes. `:override/names` the
+   services whose container_name is reset (default :all, every one setting
+   it; :none keeps them); `:override/ports` a PortPolicy (default :strip);
+   `:override/fresh-volumes` the top-level volume keys (or :all, every
+   non-external one) given the per-run name `<project>_<key>_<run>`, which
+   needs `:override/run`; `:override/images-from` the compose project whose
+   built image a service with `build:` and no `image:` reuses (image pinned
+   to `<images-from>-<service>`, build reset, pull_policy never), so a copy
+   never builds under its own name."
+  [:and
+   [:map {:closed true}
+    [:override/run {:optional true} RunId]
+    [:override/names {:optional true} [:or [:enum :all :none] [:vector [:string {:min 1}]]]]
+    [:override/ports {:optional true} PortPolicy]
+    [:override/fresh-volumes {:optional true} [:or [:= :all] [:vector [:string {:min 1}]]]]
+    [:override/images-from {:optional true} ComposeProjectName]]
+   [:fn {:error/message "fresh volumes need :override/run"}
+    (fn [s] (let [f (:override/fresh-volumes s)]
+              (or (nil? f) (and (coll? f) (empty? f)) (contains? s :override/run))))]])
+
 (def Release
   "One step of a plan: act on `services` of `project` on behalf of a profile."
   [:map

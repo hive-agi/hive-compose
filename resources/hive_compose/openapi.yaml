@@ -3809,6 +3809,7 @@ components:
       - compose/faults-unknown-proxy
       - compose/faults-unknown-toxic
       - compose/forbidden-origin
+      - compose/fresh-external-volume
       - compose/held-by-another-section
       - compose/history-unreadable
       - compose/history-unwritable
@@ -3822,6 +3823,7 @@ components:
       - compose/invalid-data-state
       - compose/invalid-data-step
       - compose/invalid-extra-envs
+      - compose/invalid-override
       - compose/invalid-param
       - compose/invalid-phase
       - compose/invalid-range
