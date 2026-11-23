@@ -458,6 +458,11 @@
   "How a suite reports test cases: JUnit XML, TAP, or :auto (by extension)."
   [:enum :junit :tap :auto])
 
+(def VariantName
+  "The name of a suite's env variant (`:suite/variants`): one plain id, as it
+   becomes part of the cell key `<suite>@<variant>`."
+  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*\z"])
+
 (def Suite
   "A test runner in any language: a container `:suite/image` (optional
    `:suite/command` as its args) or a host `:suite/command`. It needs
@@ -477,7 +482,22 @@
     [:suite/reports-dir {:optional true} [:string {:min 1}]]
     [:suite/report-format {:optional true} ReportFormat]
     [:suite/timeout-ms {:optional true} [:int {:min 1000}]]
+    ;; how long a container suite's missing image may take to pull (default 10 min)
+    [:suite/pull-timeout-ms {:optional true} [:int {:min 1000}]]
     [:suite/resources {:optional true} Resources]
+    ;; default TRUE for a container suite (:suite/image, it always has its
+    ;; /reports mount) and for one that declares :suite/reports-dir or
+    ;; :suite/report-format: it must leave a report that parses, with at
+    ;; least one case, else its cell is :error (could not run, exit 2). Only
+    ;; an explicit false opts out (the exit code is then the verdict)
+    [:suite/report-required? {:optional true} :boolean]
+    ;; a skipped case fails the cell (the case stays :skipped in the report)
+    [:suite/skip-fails? {:optional true} :boolean]
+    ;; named env variants: each is a cell of its own (<suite>@<variant>), run
+    ;; one after the other on the same stack. The variant env is set on the
+    ;; suite RUNNER only (over :suite/env); the stack and its consumers are
+    ;; NOT restarted or re-env'd per variant (follow-up card 20261123122851-6e29b6f7)
+    [:suite/variants {:optional true} [:map-of VariantName Env]]
     [:suite/description {:optional true} :string]]
    [:fn {:error/message "a suite needs :suite/image or :suite/command"}
     (fn [s] (or (contains? s :suite/image) (contains? s :suite/command)))]])

@@ -187,7 +187,7 @@ RESULT = {"help": "HelpResult", "status": "StatusResult", "targets": "TargetsRes
           "projects": "ProjectsResult", "reload": "ReloadResult",
           "faults": "FaultsResult", "stack-up": "StackUpResult", "stack-down": "StackDownResult",
           "stack-status": "StackStatusResult", "plan": "PlanResult", "why": "WhyResult",
-          "flaky": "FlakyResult"}
+          "flaky": "FlakyResult", "test": "TestResult"}
 # Commands staging added after phase 1 (hc-4/6/10/12). Their result maps are built in
 # pipeline/stacks.clj, pipeline/why.clj and pipeline/faults.clj with no malli schema yet, so
 # they are typed open here rather than hand-copied (NOTES: response shapes drift).
@@ -199,9 +199,10 @@ components["StackStatusResult"] = open_result("pipeline.stacks/stack-status: sta
 components["PlanResult"] = open_result("pipeline.stacks/plan: what stack-up would start, share or find running")
 components["FlakyResult"] = open_result("pipeline.flaky/flaky: test cases ranked by intermittent failure, each flaky, regression, fixed or stable")
 components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
-STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why", "flaky"}
+components["TestResult"] = open_result("pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env'd per variant; a suite without variants under a variants filter ran once and carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file")
+STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why", "flaky", "test"}
 MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload",
-           "faults", "stack-up", "stack-down", "why"}
+           "faults", "stack-up", "stack-down", "why", "test"}
 assert set(RESULT) == set(tool["commands"]), set(tool["commands"]) ^ set(RESULT)
 
 def ok_of(schema_ref):
@@ -244,18 +245,14 @@ for cmd in tool["commands"]:
     paths["/v1/" + cmd] = {"post": op}
 
 # ---------------------------------------------------------------- planned stack ops (placeholders)
-PLANNED = [
-  ("test", "test", "hc-8-suites", "Expand suites x projects to the minimal union stack, run each runner (container or command) with TRACEPARENT and baggage test.id, collect exit code plus JUnit XML or TAP.",
-   {"suites": arr(S), "projects": arr(S), "run": ref("RunId")},
-   obj({"run": ref("RunId"), "cells": arr(obj({"suite": S, "project": S, "exit": I, "report": ref("Report")}))})),
-]
+PLANNED = []  # hc-8 `test` is live since feat/hc8-pipeline
 
 components["Report"] = dict(obj({"format": {"enum": ["junit", "tap"]},
     "cases": arr(obj({"case/id": S, "name": S, "classname": S, "status": {"enum": ["passed", "failed", "error", "skipped"]},
                       "time-s": N, "message": S, "output": S}, ["case/id", "name", "status"])),
     "totals": obj({"passed": I, "failed": I, "error": I, "skipped": I})}, ["format", "cases", "totals"],
-    desc="hc-8 Report as relayed by hc-lane-core (branch feat/hc8-report, promote/report.clj, uncommitted); hand-copied, regenerate once merged"),
-    **{"x-status": "planned"})
+    desc="hc-8 Report (promote/report.clj); hand-copied"),
+    **{"x-source": "hand"})
 REQ_REQUIRED = {}
 for path, op, card, desc, reqp, res in PLANNED:
     rn = "Req_" + op.replace(".", "_"); vn = "Res_" + op.replace(".", "_")
@@ -290,7 +287,6 @@ doc = {
   "servers": [{"url": "http://127.0.0.1:{port}", "variables": {"port": {"default": "0", "description": ":compose/api :port (0 binds an ephemeral port; the compose status command answers api.port)"}}}],
   "tags": [{"name": "sections", "description": "existing section commands"}, {"name": "swarm", "description": "existing claim / nREPL routing commands"},
            {"name": "stacks", "description": "stack runs, fault injection, failure explanation and flaky ranking (hc-4/6/10/12/13)"},
-           {"name": "stacks (planned)", "description": "hc-8 placeholder (test)"},
            {"name": "meta", "description": "health and this document"}],
   "security": [],
   "x-trust-model": "No authentication. The server binds a loopback address only and refuses browser traffic (Host must be a loopback name, "

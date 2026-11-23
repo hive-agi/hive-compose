@@ -109,8 +109,7 @@
   (let [d (deps (fn [_ _] (throw (ex-info "must not run" {}))))]
     (is (= 404 (:status (api/route d (req "POST" "/v1/bogus" "{}")))))
     (is (= "compose/unknown-command" (get (body (api/route d (req "POST" "/v1/bogus" "{}"))) "error")))
-    (is (= 501 (:status (api/route d (req "POST" "/v1/test" "{}")))))
-    (is (= "test" (get (body (api/route d (req "POST" "/v1/test" "{}"))) "op")))
+    (is (empty? api/planned) "hc-8 test is live: no path answers 501 now")
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "[1,2]")))))
     (is (= 400 (:status (api/route d (req "POST" "/v1/up" "{not json")))))
     (is (= 405 (:status (api/route d (req "GET" "/v1/up" "")))))

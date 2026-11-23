@@ -90,10 +90,10 @@
           (is (= "dc/envoy" (get-in body ["holders" 0 "section"])))))
       (testing "the same input shares and runs"
         (is (= 200 (:status (post port "up" {"target" "dc/inventory"})))))
-      (testing "a missing param is 400, an unknown target 404, a planned op 501"
+      (testing "a missing param is 400, an unknown target 404, an unknown test param 400"
         (is (= 400 (:status (post port "ps" {}))))
         (is (= 404 (:status (post port "ps" {"target" "nope/x"}))))
-        (is (= 501 (:status (post port "test" {})))))
+        (is (= 400 (:status (post port "test" {"suitez" "x"})))))
       (testing "an unknown param is 400"
         (is (= 400 (:status (post port "ps" {"target" "dc/envoy" "tial" 5})))))
       (testing "a param of the wrong type is 400, not a throw"

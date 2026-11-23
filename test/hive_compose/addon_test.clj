@@ -5,7 +5,8 @@
             [clojure.test :refer [deftest is testing]]
             [hive-addon.protocol :as addon]
             [hive-compose.addon :as sut]
-            [hive-compose.stub :as stub]))
+            [hive-compose.stub :as stub]
+            [hive-compose.stub-runner :as stub-runner]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -31,6 +32,16 @@
     (is (= "hive.compose" (addon/addon-id a)))
     (is (= :new (:lifecycle @(:state a))))
     (is (nil? (:scheduler @(:state a))))))
+
+(deftest test-params-are-exactly-what-test-reads
+  (testing "PR #60 review M2: command-params \"test\" (what the API and Req_test accept) equals what test-opts reads"
+    (is (= sut/test-params (get sut/command-params "test")))
+    ;; every declared param, each with a value: a param test-opts reads shows
+    ;; up in the opts, one it ignores does not
+    (let [props (keys (get-in (sut/tool nil) [:inputSchema :properties]))
+          read-by (fn [p] (seq (#'sut/test-opts {p (if (#{"keep_up" "dry_run" "wait" "skip_fails"} p) true "x")})))]
+      (is (= sut/test-params (set (filter read-by props))))))
+  (is (contains? (get sut/command-params "test") "wait") "wait=false is no longer refused"))
 
 (deftest lifecycle-is-idempotent-and-stops-the-reaper
   (let [dir (temp-dir)
@@ -108,6 +119,32 @@
       (is (= #{} (stub/running engine "kafka")))
       (is (empty? (:stacks (edn/read-string (slurp (io/file dir "state.edn"))))))
       (is (:error? (call a {"command" "stack-up" "stack" "nope"})))
+      (finally (addon/shutdown! a)))))
+
+(deftest test-command-runs-the-suite-matrix
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"pg" {"db" {}} "shop" {"api" {}}})
+        runner (stub-runner/suite-runner {"smoke/shop" {:exit 1 :passed 1 :failed 1}})
+        cfg (assoc (config dir engine)
+                   :compose/suite-runner runner
+                   :compose/projects {"pg" {:project/id "pg" :project/dir "/w/pg"
+                                            :project/provides {"postgres" {:service "db"}}}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"
+                                              :project/needs {"postgres" {}}}}
+                   :compose/suites [{:suite/id "smoke" :suite/command "make e2e" :suite/projects ["shop"]}])
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (is (contains? (:commands (:body (call a {"command" "help"}))) :test))
+      (let [dry (call a {"command" "test" "suites" "smoke" "projects" "shop" "run" "dry001" "dry_run" true})]
+        (is (not (:error? dry)) (pr-str dry))
+        (is (= ["make e2e"] (map :command (:runners (:body dry)))))
+        (is (empty? (stub-runner/suite-runs runner)) "dry_run starts nothing"))
+      (let [res (call a {"command" "test" "suites" "smoke" "run" "ci001"})]
+        (is (not (:error? res)) (pr-str res))
+        (is (= ["failed" 1 true] ((juxt :status :exit :stack-kept?) (:body res))))
+        (is (contains? (:stacks (edn/read-string (slurp (io/file dir "state.edn")))) "ci001")
+            "a failed matrix stays up, recorded"))
       (finally (addon/shutdown! a)))))
 
 (deftest tool-drives-profiles-and-persists-state
