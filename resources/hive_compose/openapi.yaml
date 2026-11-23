@@ -1407,7 +1407,7 @@ components:
       properties:
         id:
           type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
         project:
           type: string
         services:
@@ -1452,7 +1452,7 @@ components:
           properties:
             id:
               type: string
-              pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+              pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
             dir:
               type: string
               minLength: 1
@@ -1468,7 +1468,7 @@ components:
               type: array
               items:
                 type: string
-                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
             services:
               type: array
               items:
@@ -1566,6 +1566,23 @@ components:
               uniqueItems: true
             description:
               type: string
+            run:
+              type: string
+              pattern: ^[a-z0-9]{3,40}\z
+            base-project:
+              type: string
+              pattern: ^[a-z0-9][a-z0-9_-]*$
+            override:
+              type: string
+              minLength: 1
+            run-shared-volumes:
+              type: array
+              items:
+                type: string
+                minLength: 1
+            run-mem-mb:
+              type: integer
+              minimum: 1
           required:
           - id
           - dir
@@ -1624,7 +1641,7 @@ components:
         properties:
           id:
             type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
           project:
             type: string
           services:
@@ -1669,7 +1686,7 @@ components:
             properties:
               id:
                 type: string
-                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
               dir:
                 type: string
                 minLength: 1
@@ -1685,7 +1702,7 @@ components:
                 type: array
                 items:
                   type: string
-                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
               services:
                 type: array
                 items:
@@ -1783,6 +1800,23 @@ components:
                 uniqueItems: true
               description:
                 type: string
+              run:
+                type: string
+                pattern: ^[a-z0-9]{3,40}\z
+              base-project:
+                type: string
+                pattern: ^[a-z0-9][a-z0-9_-]*$
+              override:
+                type: string
+                minLength: 1
+              run-shared-volumes:
+                type: array
+                items:
+                  type: string
+                  minLength: 1
+              run-mem-mb:
+                type: integer
+                minimum: 1
             required:
             - id
             - dir
@@ -2044,7 +2078,7 @@ components:
       properties:
         id:
           type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
         dir:
           type: string
           minLength: 1
@@ -2060,7 +2094,7 @@ components:
           type: array
           items:
             type: string
-            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+            pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
         services:
           type: array
           items:
@@ -2158,6 +2192,23 @@ components:
           uniqueItems: true
         description:
           type: string
+        run:
+          type: string
+          pattern: ^[a-z0-9]{3,40}\z
+        base-project:
+          type: string
+          pattern: ^[a-z0-9][a-z0-9_-]*$
+        override:
+          type: string
+          minLength: 1
+        run-shared-volumes:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        run-mem-mb:
+          type: integer
+          minimum: 1
       required:
       - id
       - dir
@@ -2165,7 +2216,7 @@ components:
       x-malli: 'malli: hive-compose.schema/Profile @ origin/staging'
     ProfileId:
       type: string
-      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
       x-source: generated
       x-malli: 'malli: hive-compose.schema/ProfileId @ origin/staging'
     Program:
@@ -2557,7 +2608,7 @@ components:
       properties:
         id:
           type: string
-          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
         project:
           type: string
         action:
@@ -2923,127 +2974,146 @@ components:
         profiles:
           type: object
           additionalProperties:
-            type: object
-            properties:
-              id:
-                type: string
-                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
-              dir:
-                type: string
-                minLength: 1
-              files:
-                type: array
-                items:
+            allOf:
+            - type: object
+              properties:
+                id:
+                  type: string
+                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
+                dir:
                   type: string
                   minLength: 1
-              project:
-                type: string
-                pattern: ^[a-z0-9][a-z0-9_-]*$
-              compose-profiles:
-                type: array
-                items:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                project:
                   type: string
-                  pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
-              services:
-                type: array
-                items:
-                  type: string
-                  minLength: 1
-              programs:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    id:
-                      type: string
-                      pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
-                    dir:
-                      type: string
-                      minLength: 1
-                    command:
-                      anyOf:
-                      - type: string
+                  pattern: ^[a-z0-9][a-z0-9_-]*$
+                compose-profiles:
+                  type: array
+                  items:
+                    type: string
+                    pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$
+                services:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                programs:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
+                      dir:
+                        type: string
                         minLength: 1
-                      - type: array
+                      command:
+                        anyOf:
+                        - type: string
+                          minLength: 1
+                        - type: array
+                          items:
+                            type: string
+                            minLength: 1
+                          minItems: 1
+                      kind:
+                        type: string
+                        enum:
+                        - shadow
+                        - deps
+                        - lein
+                        - bb
+                        - plain
+                      nrepl-port:
+                        type: integer
+                        minimum: 1
+                        maximum: 65535
+                      with:
+                        type: array
                         items:
                           type: string
                           minLength: 1
-                        minItems: 1
-                    kind:
-                      type: string
-                      enum:
-                      - shadow
-                      - deps
-                      - lein
-                      - bb
-                      - plain
-                    nrepl-port:
-                      type: integer
-                      minimum: 1
-                      maximum: 65535
-                    with:
-                      type: array
-                      items:
+                      env:
+                        type: object
+                        additionalProperties:
+                          anyOf:
+                          - type: string
+                          - type: object
+                            properties:
+                              pass:
+                                type: string
+                                minLength: 1
+                            required:
+                            - pass
+                            additionalProperties: false
+                      description:
                         type: string
-                        minLength: 1
-                    env:
-                      type: object
-                      additionalProperties:
-                        anyOf:
-                        - type: string
-                        - type: object
-                          properties:
-                            pass:
-                              type: string
-                              minLength: 1
-                          required:
-                          - pass
-                          additionalProperties: false
-                    description:
-                      type: string
-                  required:
-                  - id
-                  - dir
-              env:
-                type: object
-                additionalProperties:
-                  anyOf:
-                  - type: string
-                  - type: object
-                    properties:
-                      pass:
-                        type: string
-                        minLength: 1
                     required:
-                    - pass
-                    additionalProperties: false
-              wait?:
-                type: boolean
-              no-deps?:
-                type: boolean
-              ttl-minutes:
-                type: integer
-                minimum: 1
-              idle-action:
-                type: string
-                enum:
-                - stop
-                - down
-                - none
-              activity:
-                type: array
-                items:
+                    - id
+                    - dir
+                env:
+                  type: object
+                  additionalProperties:
+                    anyOf:
+                    - type: string
+                    - type: object
+                      properties:
+                        pass:
+                          type: string
+                          minLength: 1
+                      required:
+                      - pass
+                      additionalProperties: false
+                wait?:
+                  type: boolean
+                no-deps?:
+                  type: boolean
+                ttl-minutes:
+                  type: integer
+                  minimum: 1
+                idle-action:
                   type: string
                   enum:
-                  - nrepl
-                  - published
-                  - cpu
-                uniqueItems: true
-              description:
-                type: string
-            required:
-            - id
-            - dir
+                  - stop
+                  - down
+                  - none
+                activity:
+                  type: array
+                  items:
+                    type: string
+                    enum:
+                    - nrepl
+                    - published
+                    - cpu
+                  uniqueItems: true
+                description:
+                  type: string
+                run:
+                  type: string
+                  pattern: ^[a-z0-9]{3,40}\z
+                base-project:
+                  type: string
+                  pattern: ^[a-z0-9][a-z0-9_-]*$
+                override:
+                  type: string
+                  minLength: 1
+                run-shared-volumes:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                run-mem-mb:
+                  type: integer
+                  minimum: 1
+              required:
+              - id
+              - dir
+            - {}
         tick-seconds:
           type: integer
           minimum: 5
@@ -3385,6 +3455,12 @@ components:
             minimum: 1
           - type: string
             pattern: ^[0-9]+(?:[kKmMgGtT][bB]?|[bB])?\z
+        run-volumes-grace-minutes:
+          type: integer
+          minimum: 1
+        run-default-service-mem-mb:
+          type: integer
+          minimum: 1
       required:
       - projects
       - profiles
@@ -3768,13 +3844,26 @@ components:
         path:
           type: string
           description: '[nrepl] a file or directory: answers the shared nREPL that drives it'
+        isolated:
+          type: boolean
+          description: '[up] start the section in a new isolated run (a private copy of its compose project under
+            -p <project>-<run>: no container_name, host ports per `ports`, fresh volumes of its own, the shared
+            project''s images pinned by id, never built); the answer names the run id'
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        volumes:
+          type: boolean
+          description: '[down] with run=<id> alone: also remove the volumes the isolated run created (default false:
+            kept, listed as stale-run-volumes). The only volume removal hive-compose does; the reaper does it too
+            when it reaps an isolated run'
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         note:
           type: string
           description: '[claim] what the agent works on (required with ttl_minutes)'
@@ -3790,7 +3879,9 @@ components:
           description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
         dry_run:
           type: boolean
-          description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
+          description: '[test|up] answer the matrix, the stack plan and every runner spec; start nothing. [up] with
+            isolated/run: plan only, no side effect: the override, ports, pinned images and the memory admission
+            (need-mb, free-mb, verdict, and on refusal which sections would have to stop)'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
@@ -3825,8 +3916,9 @@ components:
           description: '[faults] what to do (default list)'
         allow_shared:
           type: boolean
-          description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
-            the holder section and its agents)'
+          description: '[up|switch|restart|down] recreate a service another live section holds (refused by default,
+            naming the holder section and its agents); down run=<id> volumes=true: remove the run''s volumes although
+            another agent claims a section of it'
         proxy:
           type: string
           description: '[faults] proxy name <consumer>.<capability>'
@@ -3834,6 +3926,19 @@ components:
           type: boolean
           description: '[up|switch|restart] go ahead although processes a dead docker daemon left running still
             hold the section''s volumes or ports (refused by default, naming them)'
+        shared_volumes:
+          type: array
+          description: '[up] narrow the preset''s :profile/run-shared-volumes: volumes an isolated run borrows from
+            the shared project. BUILD CACHES ONLY (Go build/module cache, Maven repository), never a volume holding
+            state; never removed with the run'
+        ports:
+          type:
+          - string
+          - object
+          description: '[up] host ports of an isolated run, fixed at its first up: "strip" (default, none), "ephemeral"
+            (127.0.0.1, docker picks; no HIVE_PORT_<SVC>_<PORT> vars then), "keep", {"offset": n} (each published
+            port p as p+n), {"publish": {svc {port host}}}. status answers the host port per service and container
+            port'
         test:
           type: string
           description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
@@ -3908,6 +4013,7 @@ components:
       - compose/claim-ttl-over-max
       - compose/command-failed
       - compose/consumer-name-collision
+      - compose/could-not-run
       - compose/data-exec-unsupported
       - compose/data-phase-threw
       - compose/data-runner-unsupported
@@ -3924,6 +4030,7 @@ components:
       - compose/faults-unknown-proxy
       - compose/faults-unknown-toxic
       - compose/forbidden-origin
+      - compose/fresh-external-volume
       - compose/held-by-another-section
       - compose/history-unreadable
       - compose/history-unwritable
@@ -3938,6 +4045,7 @@ components:
       - compose/invalid-data-state
       - compose/invalid-data-step
       - compose/invalid-extra-envs
+      - compose/invalid-override
       - compose/invalid-param
       - compose/invalid-phase
       - compose/invalid-range
@@ -3949,6 +4057,7 @@ components:
       - compose/invalid-trace-id
       - compose/invalid-version
       - compose/invalid-wiring
+      - compose/isolated-unsupported
       - compose/lock-unreadable
       - compose/lock-unwritable
       - compose/log-unwritable
@@ -3995,6 +4104,7 @@ components:
       - compose/run-busy
       - compose/run-exists
       - compose/run-not-up
+      - compose/run-still-active
       - compose/runner-failed
       - compose/runner-threw
       - compose/secret-unresolved
@@ -5190,20 +5300,51 @@ components:
             hold the section''s volumes or ports (refused by default, naming them)'
         allow_shared:
           type: boolean
-          description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
-            the holder section and its agents)'
+          description: '[up|switch|restart|down] recreate a service another live section holds (refused by default,
+            naming the holder section and its agents); down run=<id> volumes=true: remove the run''s volumes although
+            another agent claims a section of it'
+        dry_run:
+          type: boolean
+          description: '[test|up] answer the matrix, the stack plan and every runner spec; start nothing. [up] with
+            isolated/run: plan only, no side effect: the override, ports, pinned images and the memory admission
+            (need-mb, free-mb, verdict, and on refusal which sections would have to stop)'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>'
           allOf:
           - $ref: '#/components/schemas/Env'
+        isolated:
+          type: boolean
+          description: '[up] start the section in a new isolated run (a private copy of its compose project under
+            -p <project>-<run>: no container_name, host ports per `ports`, fresh volumes of its own, the shared
+            project''s images pinned by id, never built); the answer names the run id'
         no_deps:
           type: boolean
           description: '[up|switch] start only the named services, not their depends_on (which must already run)'
+        ports:
+          type:
+          - string
+          - object
+          description: '[up] host ports of an isolated run, fixed at its first up: "strip" (default, none), "ephemeral"
+            (127.0.0.1, docker picks; no HIVE_PORT_<SVC>_<PORT> vars then), "keep", {"offset": n} (each published
+            port p as p+n), {"publish": {svc {port host}}}. status answers the host port per service and container
+            port'
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
+        shared_volumes:
+          type: array
+          description: '[up] narrow the preset''s :profile/run-shared-volumes: volumes an isolated run borrows from
+            the shared project. BUILD CACHES ONLY (Go build/module cache, Maven repository), never a volume holding
+            state; never removed with the run'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5229,8 +5370,9 @@ components:
             hold the section''s volumes or ports (refused by default, naming them)'
         allow_shared:
           type: boolean
-          description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
-            the holder section and its agents)'
+          description: '[up|switch|restart|down] recreate a service another live section holds (refused by default,
+            naming the holder section and its agents); down run=<id> volumes=true: remove the run''s volumes although
+            another agent claims a section of it'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
@@ -5262,13 +5404,30 @@ components:
     Req_down:
       type: object
       properties:
+        allow_shared:
+          type: boolean
+          description: '[up|switch|restart|down] recreate a service another live section holds (refused by default,
+            naming the holder section and its agents); down run=<id> volumes=true: remove the run''s volumes although
+            another agent claims a section of it'
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
             or a,b'
+        volumes:
+          type: boolean
+          description: '[down] with run=<id> alone: also remove the volumes the isolated run created (default false:
+            kept, listed as stale-run-volumes). The only volume removal hive-compose does; the reaper does it too
+            when it reaps an isolated run'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
@@ -5283,6 +5442,13 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5304,8 +5470,9 @@ components:
             hold the section''s volumes or ports (refused by default, naming them)'
         allow_shared:
           type: boolean
-          description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
-            the holder section and its agents)'
+          description: '[up|switch|restart|down] recreate a service another live section holds (refused by default,
+            naming the holder section and its agents); down run=<id> volumes=true: remove the run''s volumes although
+            another agent claims a section of it'
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
@@ -5319,6 +5486,13 @@ components:
           type: boolean
           description: '[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting
             them in place'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5341,6 +5515,13 @@ components:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
             routes; [flaky] only runs against this project'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5354,6 +5535,13 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5372,6 +5560,13 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         tail:
           type: integer
           description: '[logs] lines per service (default 100)'
@@ -5403,6 +5598,13 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5433,6 +5635,13 @@ components:
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        run:
+          type: string
+          description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         stop:
           type: boolean
           description: '[release] stop the section now when no claim is left (what other sections need stays up)'
@@ -5514,7 +5723,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         toxic:
           type: object
           description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
@@ -5532,7 +5744,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5549,7 +5764,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5562,7 +5780,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5575,7 +5796,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         stack:
           type: string
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
@@ -5588,7 +5812,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         test:
           type: string
           description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
@@ -5600,7 +5827,9 @@ components:
       properties:
         dry_run:
           type: boolean
-          description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
+          description: '[test|up] answer the matrix, the stack plan and every runner spec; start nothing. [up] with
+            isolated/run: plan only, no side effect: the override, ports, pinned images and the memory admission
+            (need-mb, free-mb, verdict, and on refusal which sections would have to stop)'
         keep_up:
           type: boolean
           description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
@@ -5610,7 +5839,10 @@ components:
         run:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
-            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+            (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>.
+            [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as
+            compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes
+            the whole run down'
         skip_fails:
           type: boolean
           description: '[test] a skipped case fails its cell (the case stays skipped in the report); default each
