@@ -104,6 +104,48 @@
              (:orphaned-at entry) (assoc :orphaned? true)
              (empty? agents) (assoc :agents []))))))
 
+(defn section-holders
+  "[{:section id :services [s] :profile Profile}] of the live active entries
+   of compose project `project` (`self` included) whose footprint holds any of
+   `services` and that kept the Profile they ran with, by section id. Pure."
+  [active project services]
+  (let [wanted (set services)]
+    (vec (for [[id a] (sort-by key active)
+               :when (and (= project (:project a)) (live? a) (:profile a))
+               :let [held (vec (sort (filter wanted (plan/footprint a))))]
+               :when (seq held)]
+           {:section id :services held :profile (:profile a)}))))
+
+(defn pick-holder
+  "Which live section's compose inputs a call on `services` of `project` runs
+   with (card 20261123112129-701a7d69): {:holder Profile :section id} when the
+   sections holding them agree on dir, files and env (one section, or several
+   with equal inputs; the first by id answers), {:none true} when none does,
+   {:disagree [{:section :services :differs}]} when they differ, each row
+   saying what differs from the first. `only` (a section id or nil) narrows
+   the holders to that one section. Pure."
+  [active project services only]
+  (let [hs (cond->> (section-holders active project services)
+             only (filterv #(= only (:section %))))
+        [h & more] hs]
+    (cond
+      (nil? h) {:none true}
+      (every? #(= (inputs (:profile h)) (inputs (:profile %))) more)
+      {:holder (:profile h) :section (:section h)}
+      :else {:disagree (vec (for [x hs]
+                              (cond-> (select-keys x [:section :services])
+                                (not= x h) (assoc :differs (differences (inputs (:profile x))
+                                                                        (inputs (:profile h)))))))})))
+
+(defn outcomes
+  "{service \"recreated\"|\"kept\"} of `services` from the container ids before
+   and after a call ({service id}): kept when the same container still runs it,
+   recreated otherwise. What the engine did, not what was allowed. Pure."
+  [services before after]
+  (into (sorted-map)
+        (for [s services]
+          [s (if (and (some? (get before s)) (= (get before s) (get after s))) "kept" "recreated")])))
+
 (defn describe
   "One line naming each holder of `found`, its agents and what differs."
   [found]

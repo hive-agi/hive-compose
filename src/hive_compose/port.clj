@@ -68,6 +68,14 @@
     "Result<{service percent}>: the CPU use, in percent of one core, of each
      running service of the profile's project (the busiest of its containers)."))
 
+(defprotocol IContainerIds
+  "Optional engine capability: which container runs each service now, so a
+   call can say whether it recreated a service or left it alone."
+  (-container-ids [e profile services]
+    "Result<{service id}>: the id of the container of each of `services` in the
+     profile's compose project, by label (no compose file is loaded). A service
+     with no container is absent."))
+
 (defprotocol ISwarm
   "The agents working beside the addon and the channel that reaches them."
   (-agents [s]

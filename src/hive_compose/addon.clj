@@ -348,9 +348,16 @@
                                   :project (some-> (param params "project") str)})
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
-        "restart" (with-opts (fn [p] (let [recreate? (flag params "recreate")]
-                                       (guard p :restart recreate?
-                                              #(restart/restart-profile! ctx p recreate?)))))
+        ;; a target is restarted from the live section holding its services (its
+        ;; dir, files and env); profile=<id> with a target names that section
+        "restart" (r/bind (checked-options opts)
+                          (fn [o]
+                            (r/let-ok [p0 (ops/subject ctx {:target tgt :id id :env (:env o)})
+                                       p1 (if (seq tgt) (restart/with-holder ctx p0 id) (r/ok p0))]
+                              (let [p (profile/with-call-options p1 o)
+                                    recreate? (flag params "recreate")]
+                                (guard p :restart recreate?
+                                       #(restart/restart-profile! ctx p recreate?))))))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))

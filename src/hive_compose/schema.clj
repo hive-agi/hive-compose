@@ -77,6 +77,9 @@
    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
    [:profile/programs {:optional true} [:vector Program]]
    [:profile/env {:optional true} Env]
+   ;; the env a call gave (up/switch/restart env=), kept so a later call on the
+   ;; same section never falls back to weaker env; references stay references
+   [:profile/call-env {:optional true} Env]
    [:profile/wait? {:optional true} :boolean]
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]

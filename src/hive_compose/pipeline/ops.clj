@@ -46,9 +46,13 @@
    entry (a preset or a section) ran with. The snapshot of a section whose
    project is still configured is re-based on the project as configured now, so
    a release that follows a restart interpolates the files it names with the
-   variables they need. What the snapshot's env says wins over the project's."
+   variables they need. What the snapshot's env says wins over the project's.
+   A configured preset that is active keeps the env a call gave it
+   (:profile/call-env of its snapshot), so a later up, restart or reaper pass
+   never falls back to weaker env."
   [ctx id]
-  (if-let [p (or (configured ctx id)
+  (if-let [p (or (when-let [c (configured ctx id)]
+                   (target/with-call-env c (get-in (active-entry ctx id) [:profile :profile/call-env])))
                  (when-let [snap (:profile (active-entry ctx id))]
                    (let [[pid section?] (str/split id #"/" 2)
                          proj (get-in ctx [:settings :compose/projects pid])]
@@ -746,6 +750,8 @@
                          :idle-action (profile/idle-action settings p)
                          :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  ;; the checkout, files and env NAMES the section runs with (values of *_SRC only)
+                  (:profile a) (merge (target/inputs-summary (:profile a)))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)

@@ -3811,6 +3811,7 @@ components:
       - compose/forbidden-origin
       - compose/held-by-another-section
       - compose/history-unreadable
+      - compose/holders-disagree
       - compose/history-unwritable
       - compose/inconsistent-resolution
       - compose/instance-not-ready
@@ -4121,6 +4122,15 @@ components:
                 enum:
                 - recreate
                 - config-differs
+              outcome:
+                type: object
+                description: per shared service what the engine did, from container ids before and after the call
+                additionalProperties:
+                  enum:
+                  - recreated
+                  - kept
+              outcome-unknown:
+                type: boolean
             x-source: hand
         ownership-check:
           type: object
@@ -4208,6 +4218,15 @@ components:
                 enum:
                 - recreate
                 - config-differs
+              outcome:
+                type: object
+                description: per shared service what the engine did, from container ids before and after the call
+                additionalProperties:
+                  enum:
+                  - recreated
+                  - kept
+              outcome-unknown:
+                type: boolean
             x-source: hand
         ownership-check:
           type: object
@@ -4326,6 +4345,24 @@ components:
           type: boolean
         config-project:
           type: string
+        dir:
+          type: string
+          description: the project directory (checkout) the active section runs from
+        files:
+          type: array
+          items:
+            type: string
+          description: the compose files it runs with; empty = compose's defaults
+        env-keys:
+          type: array
+          items:
+            type: string
+          description: names of the env vars it runs with, never their values
+        env-src:
+          type: object
+          additionalProperties:
+            type: string
+          description: value of each *_SRC var (the path of the code under test); a secret reference as pass:<path>
         services:
           type: array
           items:

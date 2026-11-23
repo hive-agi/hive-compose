@@ -109,7 +109,9 @@ components["StepReport"] = obj({"id": ref("ProfileId"), "project": S, "action": 
     ["id", "project", "action", "services"], desc="plan Release step + ops/step-report")
 guard = {"orphans-overridden": arr(obj({"pid": I, "name": S, "holds": {"type": "object"}})),
          "orphan-check": obj({"error": S, "message": S, "category": S}),
-         "shared-overridden": arr(obj({"section": S, "agents": arr(S), "services": arr(S), "reason": {"enum": ["recreate", "config-differs"]}})),
+         "shared-overridden": arr(obj({"section": S, "agents": arr(S), "services": arr(S), "reason": {"enum": ["recreate", "config-differs"]},
+                                       "outcome": {"type": "object", "description": "per shared service what the engine did, from container ids before and after the call", "additionalProperties": {"enum": ["recreated", "kept"]}},
+                                       "outcome-unknown": B})),
          "ownership-check": obj({"error": S, "message": S, "category": S})}
 components["UpResult"] = obj(dict({"profile": S, "project": S, "services": arr(S), "out": S, "needs": arr(S),
     "programs": arr(ref("ProgramReport")), "announced": B,
@@ -126,6 +128,7 @@ components["UsageReason"] = obj({"claim": S, "agent": S, "port": I, "peers": I, 
     "source": {"enum": ["nrepl", "published", "cpu"]}}, desc="promote.swarm/usage reason: {claim} | {agent} | {port peers source} | {service cpu source}")
 components["StatusRow"] = obj({"id": S, "project": S, "active?": B, "section?": B, "ttl-minutes": I,
     "idle-action": ref("IdleAction"), "activity": arr(S), "description": S, "config-ok?": B, "config-project": S,
+    "dir": S, "files": arr(S), "env-keys": arr(S), "env-src": {"type": "object", "additionalProperties": S},
     "services": arr(S), "idle-seconds": I, "reap-in-seconds": I, "reap-blocked?": B,
     "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I})},
     "orphaned?": B, "usage": ref("Usage"), "in-use-via": arr(S), "programs": arr(ref("ProgramRow"))},
