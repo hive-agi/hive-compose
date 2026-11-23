@@ -418,6 +418,16 @@
               (r/ok {:exit 0 :out ""})))))))
 
 (extend-type StubEngine
+  port/IDirProbe
+  ;; every dir exists unless `remove-dir!` named it
+  (-dir-exists? [{:keys [world]} dir] (not (contains? (:missing-dirs @world #{}) dir))))
+
+(defn remove-dir!
+  "Make `dir` count as removed (a checkout deleted under a running section)."
+  [e dir]
+  (swap! (:world e) update :missing-dirs (fnil conj #{}) dir))
+
+(extend-type StubEngine
   port/IContainerIds
   (-container-ids [{:keys [world]} p services]
     (or (fault world :container-ids)

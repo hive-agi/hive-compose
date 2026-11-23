@@ -98,9 +98,10 @@
     (is (= 2 (count (:nrepl first-claim))) "a first claim names every route with its advice")
     (is (every? :advice (:nrepl first-claim)))
     (is (:renewed renewed))
-    (is (= [repl-port] (mapv :nrepl-port (get-in renewed [:nrepl :running]))) "a renewal: only what runs")
-    (is (= 1 (get-in renewed [:nrepl :not-running])))
-    (is (re-find #"compose nrepl path=" (get-in renewed [:nrepl :hint])))))
+    (is (= [repl-port] (mapv :nrepl-port (:nrepl renewed))) "a renewal: still a list, only what runs")
+    (is (= 1 (:nrepl-not-running renewed)))
+    (is (re-find #"compose nrepl path=" (:nrepl-hint renewed)))
+    (is (not (contains? first-claim :nrepl-not-running)))))
 
 (deftest a-claim-on-an-active-section-never-starts-anything
   ;; staging already skipped up for a section in THIS instance's map: the

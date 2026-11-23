@@ -11,6 +11,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [hive-compose.addon :as addon]
+            [hive-compose.api :as api]
             [hive-compose.promote.ownership :as own]
             [hive-compose.promote.target :as target]
             [hive-compose.stub :as stub]))
@@ -64,6 +65,10 @@
        (.initialize! ^hive_addon.protocol.IAddon a {})
        (f {:e e
            :state (fn [] (:state (:ctx @(:state a))))
+           ;; the control API's path into the same dispatch (JSON params)
+           :api (fn [command json-params]
+                  (api/call {:dispatch (fn [c p] (addon/dispatch a c p)) :commands addon/commands}
+                            command (json/read-str json-params)))
            :call (fn [params]
                    (let [res ((:handler (addon/tool a)) params)]
                      {:res (json/read-str (get-in res [:content 0 :text]) :key-fn keyword)
@@ -365,6 +370,77 @@
              (let [{:keys [error? res]} (call {"command" "up" "target" "dc/sisf-payment"})]
                (is (not error?) (pr-str res))
                (is (= "/w/pv01" (:profile/dir (last-up e))) "the holder's checkout")
+               (is (= "../../wt/pv01-merge-sisf-payment" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))))))
+
+;; ---------------------------------------------------------------------------
+;; review #62 round 2: N1, N3, r2-m1, r2-m2
+
+(deftest n1a-an-active-target-section-runs-from-its-own-snapshot
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             (call {"command" "up" "profile" "flow-payment"})
+             (is (not (:error? (call {"command" "up" "target" "dc/sisf-payment"}))))
+             (is (not (:error? (call {"command" "down" "profile" "flow-payment"}))))
+             (testing "up: no recreate, from the checkout it was created from"
+               (let [before (stub/container-ids e "dc")
+                     {:keys [error? res]} (call {"command" "up" "target" "dc/sisf-payment"})]
+                 (is (not error?) (pr-str res))
+                 (is (= "/w/pv01" (:profile/dir (last-up e))))
+                 (is (= "../../wt/pv01-merge-sisf-payment" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))
+                 (is (= before (stub/container-ids e "dc")) "nothing recreated")))
+             (testing "restart recreate=true: from the same checkout"
+               (let [{:keys [error? res]} (call {"command" "restart" "target" "dc/sisf-payment" "recreate" true})]
+                 (is (not error?) (pr-str res))
+                 (is (= "/w/pv01" (:profile/dir (last-restart e))))
+                 (is (= "../../wt/pv01-merge-sisf-payment"
+                        (get-in (last-restart e) [:profile/env "SISF_PAYMENT_SRC"]))))))))
+
+(deftest n1b-a-project-reload-keeps-the-checkout-of-a-holder-derived-section
+  (let [declared (atom {:compose/profiles [flow-payment] :compose/projects [project]})]
+    (session []
+             (fn [{:keys [call e state]}]
+               (call {"command" "up" "profile" "flow-payment"})
+               (call {"command" "up" "target" "dc/sisf-payment"})
+               (is (= "flow-payment" (get-in @(state) [:active "dc/sisf-payment" :profile :profile/inputs-from])))
+               (swap! declared update-in [:compose/projects 0 :project/env] assoc "GW" "10.0.0.1")
+               (is (not (:error? (call {"command" "reload"}))))
+               (is (= "/w/pv01" (get-in @(state) [:active "dc/sisf-payment" :profile :profile/dir])) "the reload kept it")
+               (call {"command" "up" "target" "dc/sisf-payment"})
+               (is (= "/w/pv01" (:profile/dir (last-up e))))
+               (is (nil? (get-in (last-up e) [:profile/env "GW"])) "no project value it did not run with"))
+             {:compose/profiles nil :compose/projects nil :compose/config-source (fn [] @declared)})))
+
+(deftest n3-adopted-strays-are-assumed-never-a-trusted-holder
+  (session []
+           (fn [{:keys [call e state]}]
+             (stub/run-outside! e "dc" ["postgres" "sisf-payment"])
+             (is (= ["dc/adopted"] (:adopted (:res (call {"command" "adopt"})))))
+             (is (= :assumed (get-in @(state) [:active "dc/adopted" :inputs])))
+             (let [{:keys [error? res]} (call {"command" "restart" "target" "dc/sisf-payment" "recreate" true})]
+               (is error? "recreating what came from an unknown checkout needs allow_shared")
+               (is (= "held-by-another-section" (:error res)))
+               (is (empty? (stub/restarts e)) "nothing recreated from a guess"))
+             (testing "a recreate of the adopted section itself makes its inputs known"
+               (is (not (:error? (call {"command" "restart" "profile" "dc/adopted" "recreate" true}))))
+               (is (nil? (get-in @(state) [:active "dc/adopted" :inputs])))))))
+
+(deftest r2m1-a-holder-whose-checkout-is-gone-is-skipped-and-said
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             (call {"command" "up" "profile" "flow-payment"})
+             (stub/remove-dir! e "/w/pv01")
+             (let [{:keys [error? res]} (call {"command" "restart" "target" "dc/sisf-payment"})]
+               (is (not error?) (pr-str res))
+               (is (= "/w/dc" (:profile/dir (last-restart e))))
+               (is (= "flow-payment" (get-in res [:holder-skipped :section])))))))
+
+(deftest r2m2-a-null-forgets-through-the-control-api
+  (session [flow-payment]
+           (fn [{:keys [api e]}]
+             (api "up" "{\"profile\":\"flow-payment\",\"env\":{\"SISF_PAYMENT_SRC\":\"../../wt/hotfix\"}}")
+             (is (= "../../wt/hotfix" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))
+             (let [res (api "up" "{\"profile\":\"flow-payment\",\"env\":{\"SISF_PAYMENT_SRC\":null}}")]
+               (is (:ok res) (pr-str res))
                (is (= "../../wt/pv01-merge-sisf-payment" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))))))
 
 (deftest an-inactive-preset-row-carries-no-inputs
