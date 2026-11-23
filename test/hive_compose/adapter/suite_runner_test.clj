@@ -99,25 +99,32 @@
    :network "hive-r1-orders" :labels {"hive.run" "r1"} :test-id "e2e/orders"
    :resources {:mem "512m" :cpus 2}})
 
+(defn- docker-step
+  "The docker subcommand an argv runs (\"start\" through its sh wrapper)."
+  [argv]
+  (if (= "sh" (first argv)) (nth argv 5 nil) (second argv)))
+
 (deftest container-runs-capped-and-is-inspected
   (let [inspect [{"State" {"OOMKilled" true "ExitCode" 137} "HostConfig" {"Memory" 536870912}}]
         {:keys [exec calls]} (recording-exec
                               (fn [argv]
-                                (case (second argv)
-                                  "run" (r/ok {:exit 137 :stdout "" :stderr ""})
+                                (case (docker-step argv)
+                                  "start" (r/ok {:exit 137 :stdout "" :stderr ""})
                                   "inspect" (r/ok {:exit 0 :stdout (json/write-str inspect) :stderr ""})
                                   (r/ok {:exit 0 :stdout "" :stderr ""}))))
         res (:ok (port/-run! (runner exec true) container-spec))
-        [run-argv run-opts] (first @calls)]
-    (is (= ["sh" "-c" "exec \"$@\" >/dev/null 2>&1 </dev/null" "sh"] (take 4 run-argv))
+        [create-argv create-opts] (first (filter #(= "create" (docker-step (first %))) @calls))
+        [start-argv] (first (filter #(= "start" (docker-step (first %))) @calls))]
+    (is (= ["sh" "-c" "exec \"$@\" >/dev/null 2>&1 </dev/null" "sh" "docker" "start" "-a" "hive-r1-e2e-orders"] start-argv)
         "the container's output is never drained into this heap")
-    (is (= ["docker" "run" "--name" "hive-r1-e2e-orders"] (take 4 (drop 4 run-argv))))
+    (is (= ["docker" "create" "--name" "hive-r1-e2e-orders" "--network" "hive-r1-orders"] (take 6 create-argv)))
+    (is (some #{"type=bind,source=/state/r,target=/reports"} create-argv) "--mount, so a : in a path is safe")
     (is (some #(= ["docker" "logs" "--tail" "50" "hive-r1-e2e-orders"] (first %)) @calls))
     (is (= ["--memory" "536870912" "--memory-swap" "536870912" "--cpus" "2" "node:22" "npm" "test"]
-           (take-last 9 run-argv)))
-    (is (some #{"SECRET"} run-argv))
-    (is (not-any? #(str/includes? % "s3cr3t") run-argv) "env values never reach the argv")
-    (is (= "s3cr3t" (get-in run-opts [:env "SECRET"])))
+           (take-last 9 create-argv)))
+    (is (some #{"SECRET"} create-argv))
+    (is (not-any? #(str/includes? % "s3cr3t") create-argv) "env values never reach the argv")
+    (is (= "s3cr3t" (get-in create-opts [:env "SECRET"])))
     (is (= ["docker" "rm" "-f" "hive-r1-e2e-orders"] (first (last @calls))))
     (is (= "e2e/orders OOM-killed at 512m" (get-in res [:oom :oom/line])))
     (is (= :docker (get-in res [:cap :mode])))))
@@ -126,9 +133,10 @@
   (let [inspect [{"State" {"OOMKilled" false "ExitCode" 137} "HostConfig" {"Memory" 536870912}}]
         {:keys [exec]} (recording-exec
                         (fn [argv]
-                          (if (= "inspect" (second argv))
-                            (r/ok {:exit 0 :stdout (json/write-str inspect) :stderr ""})
-                            (r/ok {:exit 137 :stdout "" :stderr ""}))))
+                          (case (docker-step argv)
+                            "inspect" (r/ok {:exit 0 :stdout (json/write-str inspect) :stderr ""})
+                            "start" (r/ok {:exit 137 :stdout "" :stderr ""})
+                            (r/ok {:exit 0 :stdout "" :stderr ""}))))
         res (:ok (port/-run! (runner exec true) container-spec))]
     (is (= 137 (:exit res)))
     (is (nil? (:oom res)))))

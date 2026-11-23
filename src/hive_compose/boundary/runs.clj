@@ -59,6 +59,12 @@
   "A suite or project directory name: one path segment, never . or .."
   [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.-]*\z"] [:fn #(not (re-matches #"\.+" %))]])
 
+(def CellKey
+  "A cell's suite dir: a PathPart suite id, or `<suite>@<variant>` for a
+   variant cell (hc-8 promote.suite/cell-key)."
+  [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.-]*(@[A-Za-z0-9][A-Za-z0-9_.-]*)?\z"]
+   [:fn #(not (re-matches #"\.+" %))]])
+
 (def OomFinding
   "An OOM kill of the cell's runner (hc-16b `hive-compose.promote.oom`):
    which service, at which cap, and the line `why` prints."
@@ -77,7 +83,7 @@
    OOM-killed."
   [:map
    [:run/id RunDir]
-   [:suite/id PathPart]
+   [:suite/id CellKey]
    [:project PathPart]
    [:status [:enum :passed :failed :error]]
    [:exit {:optional true} [:maybe :int]]
@@ -145,6 +151,24 @@
                 :else (update acc :results conj (assoc (:ok res) :result/path path)))))
           {:results [] :skipped []}
           (result-files state-dir run)))
+
+(def summary-file
+  "The name of a test run's matrix summary inside its run dir (hc-8)."
+  "summary.edn")
+
+(defn summary-path
+  "`<state-dir>/runs/<run>/summary.edn`."
+  [state-dir run]
+  (str (runs-dir state-dir) "/" run "/" summary-file))
+
+(defn write-summary!
+  "Result<path>: the matrix summary `summary` of run `run` written atomically
+   to its `summary-path`, so a caller that lost the answer still finds it."
+  [state-dir run summary]
+  (if-not (re-matches #"^[a-z0-9]{3,40}\z" (str run))
+    (r/err :compose/invalid-run {:run run})
+    (r/try-effect* :compose/summary-unwritable
+      (write-edn! (summary-path state-dir run) summary))))
 
 (defn file-slug
   "`s` as a file name: every char outside [A-Za-z0-9._-] made `_`, at most

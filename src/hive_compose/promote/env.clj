@@ -49,13 +49,15 @@
 (defn scrub
   "`s` with every value a reference of `env` resolved to (`resolved` is the
    spawned environment) replaced by the reference's rendering, so a process
-   echoing its environment does not carry a secret into a result."
+   echoing its environment does not carry a secret into a result. The
+   longest value goes first, so a secret holding another one as a substring
+   is replaced whole."
   [env resolved s]
-  (reduce (fn [s [k ref]]
-            (let [v (get resolved k)]
-              (if (str/blank? v) s (str/replace s v (render ref)))))
+  (reduce (fn [s [v ref]] (str/replace s v (render ref)))
           (or s "")
-          (refs env)))
+          (->> (refs env)
+               (keep (fn [[k ref]] (let [v (get resolved k)] (when-not (str/blank? v) [v ref]))))
+               (sort-by (comp - count first)))))
 
 (defn from-param
   "An env value as sent over MCP: an object {\"pass\" path} is a reference,

@@ -33,7 +33,7 @@
 (def planned
   "Path segment -> hive_call op of the paths the spec marks x-status planned
    (plan 20261122140443-09c5c225). Answered 501 until they are implemented."
-  {"test" "test"})
+  {})
 
 (def status-by-category
   "HTTP status of a Result error category. Every category the source answers
@@ -90,6 +90,24 @@
    :report/malformed 502
    :report/unreadable 502
    :report/none 502
+   :report/unclearable 502
+   :report/uncollectable 502
+   ;; compose test (hc-8)
+   :compose/unsafe-reports-dir 400
+   :compose/project-not-in-run 400
+   :compose/suite-needs-not-in-run 400
+   :compose/run-busy 409
+   :compose/run-not-up 409
+   :compose/interrupted 503
+   :compose/no-suite-runner 503
+   :compose/runner-threw 500
+   :compose/cell-threw 500
+   :compose/record-threw 500
+   :compose/data-phase-threw 500
+   :compose/attach-threw 500
+   :compose/test-threw 500
+   :compose/reports-unwritable 500
+   :compose/summary-unwritable 500
    :compose/unknown-command 404
    :compose/unknown-stack 404
    :compose/unknown-run 404

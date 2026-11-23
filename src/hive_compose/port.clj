@@ -182,16 +182,26 @@
   "Runs one suite runner to its end under its resource caps (hc-16b): a host
    command inside a memory-capped systemd user scope (ulimit -v when no user
    manager answers), a container with docker's memory and cpu flags. See
-   `hive-compose.promote.oom` for the data."
+   `hive-compose.promote.oom` for the data.
+
+   A value of `:env` may be a secret reference, read only here, at spawn.
+   Every answer, ok or error, carries `:scrub` (fn [text]) -> text: the text
+   with every value the runner resolved from a reference replaced by that
+   reference's rendering. The caller passes every text it reads afterwards
+   (the reports) through it; a runner that resolved references and answers
+   no :scrub has its reports' free text redacted."
   (-run! [r spec]
     "Result<{:exit n-or-nil :started-at ms :finished-at ms :output [line]
      :timed-out? bool :cap {:mode :systemd|:ulimit|:docker|:none :mem bytes?
-     :cpus n? :note s?} :oom Finding?}>: run `spec` (a runner spec, see
-     `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
-     :command, :dir, :env, :timeout-ms, :test-id, :image, :name, :mounts,
-     :network, :labels, plus :resources {:mem bytes :cpus n}) and wait for its
-     end. A runner that exits non-zero, is OOM-killed or times out is an ok
-     answer; an error only when it could not be started at all."))
+     :cpus n? :note s?} :oom Finding? :scrub fn}>: run `spec` (a runner spec,
+     see `hive-compose.promote.suite/runner-spec`: :runner :command|:container,
+     :command, :dir, :env, :timeout-ms, :pull-timeout-ms, :test-id,
+     :reports-dir (created before the runner starts), :image, :name, :mounts,
+     :network, :extra-networks, :labels, plus :resources {:mem bytes :cpus n})
+     and wait for its end. A runner that exits non-zero, is OOM-killed or
+     times out is an ok answer; an error (carrying :exit nil and :scrub) only
+     when it could not be started at all: a secret that cannot be read, no
+     docker, a pull that fails or times out."))
 
 (defprotocol IStackEngine
   "Optional engine capability: what a stack run needs beyond sections. View
