@@ -764,6 +764,51 @@
     (parsed (run-argv exec (labelled-networks-argv labels) timeout-ms)
             :compose/unparseable labelled-networks)))
 
+;; ---------------------------------------------------------------------------
+;; builds (IImageBuilder): the same base argv as up/restart, so a build runs
+;; with the section's dir, files, project name and native profiles
+
+(defn build-argv
+  "`compose build` of `services` addressed at profile `p` (`base-argv`):
+   --no-cache and --pull as `opts` asks."
+  [p services {:keys [no-cache? pull?]}]
+  (-> (base-argv p)
+      (conj "build")
+      (cond-> no-cache? (conj "--no-cache"))
+      (cond-> pull? (conj "--pull"))
+      (into services)))
+
+(defn image-ids-argv
+  "The id of each image reference of `refs`, one line each, in order."
+  [refs]
+  (into ["docker" "image" "inspect" "--format" "{{.Id}}"] refs))
+
+(defn build-facts
+  "{service {:build? bool :image ref}} of a `config --format json` document
+   of compose project `project`: whether each service declares `build:` and
+   the reference compose tags its build with (`image:`, else
+   `<project>-<service>`). Pure."
+  [s project]
+  (into (sorted-map)
+        (for [[svc m] (get (json/read-str s) "services")]
+          [svc {:build? (some? (get m "build"))
+                :image (let [i (get m "image")]
+                         (if (str/blank? i) (str project "-" svc) i))}])))
+
+(extend-type CliEngine
+  port/IImageBuilder
+  (-build-facts [{:keys [exec timeout-ms]} p]
+    (parsed (run exec p (closure-argv p) timeout-ms) :compose/unparseable
+            #(build-facts % (profile/project p))))
+  (-build! [{:keys [exec resolver build-timeout-ms timeout-ms]} p services opts]
+    ;; build args interpolate the env: its references are read now, as for an up
+    (spawn exec resolver p (build-argv p services opts) (or build-timeout-ms timeout-ms) services))
+  (-image-ids [{:keys [exec timeout-ms]} refs]
+    (if (empty? refs)
+      (r/ok {})
+      (r/map-ok (run-argv exec (image-ids-argv refs) timeout-ms)
+                #(zipmap refs (lines %))))))
+
 (defn stack-dir
   "Where stack overrides are written: `stacks/` beside the state file, else
    under the temp dir."
@@ -776,6 +821,7 @@
   "CliEngine. `opts`: :exec (default hive-system `shell.core/exec!`),
    :compose/resolver ({scheme ISecretBackend}, default the `pass` one over
    that exec), :compose/timeout-ms, :compose/up-timeout-ms,
+   :compose/build-timeout-ms,
    :compose/stack-dir (where stack overrides go, default `stack-dir`)."
   [opts]
   (let [exec (or (:exec opts) shell/exec!)]
@@ -783,4 +829,6 @@
                      :resolver (or (:compose/resolver opts) (secrets/make-resolver {:exec exec}))
                      :timeout-ms (or (:compose/timeout-ms opts) 60000)
                      :up-timeout-ms (or (:compose/up-timeout-ms opts) 600000)
+                     ;; a build may take many minutes (default 30)
+                     :build-timeout-ms (or (:compose/build-timeout-ms opts) 1800000)
                      :override-dir (or (:compose/stack-dir opts) (stack-dir opts))})))

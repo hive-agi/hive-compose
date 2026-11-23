@@ -585,6 +585,7 @@
    [:compose/log-dir [:string {:min 1}]]
    [:compose/timeout-ms [:int {:min 1000}]]
    [:compose/up-timeout-ms [:int {:min 1000}]]
+   [:compose/build-timeout-ms {:optional true} [:int {:min 1000}]]
    [:compose/adopt? :boolean]
    [:compose/programs? :boolean]
    [:compose/swarm? :boolean]

@@ -135,6 +135,11 @@
    :compose/toxiproxy-proxy-conflict 409
    :compose/not-implemented 501
    :compose/command-failed 502
+   ;; compose build: the build failed (or ran past :compose/build-timeout-ms),
+   ;; another build of the project runs, the engine cannot build
+   :compose/build-failed 502
+   :compose/build-busy 409
+   :compose/build-unsupported 503
    :compose/secret-unresolved 502
    :secrets/unknown-backend 502
    :compose/no-container 502
