@@ -161,7 +161,7 @@
       (let [{:keys [ctx e]} (world)
             rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
             d (isolated/down-run! ctx rid true)]
-        (is (= {:removed ["dc-dcabc123_pgdata"] :kept []} (get-in d [:ok :volumes])))
+        (is (= {:removed ["dc-dcabc123_pgdata"] :kept [] :not-removable []} (get-in d [:ok :volumes])))
         (is (contains? (stub/volumes e) "dc_pgdata") "the shared project's volume stays")
         (is (contains? (stub/volumes e) "ext"))
         (is (every? (fn [[_ names]] (every? #(str/includes? % rid) names))
@@ -484,7 +484,7 @@
     (let [ctx2 (assoc ctx :rand-hex (constantly "def456"))
           x (isolated/up! ctx2 (preset ctx2 "flow-sync") {:ports {:offset 1000}})]
       (is (= :compose/invalid-param (:error x)))
-      (is (= [6434] (map :host (:clashes x)))))))
+      (is (= [6434 19090] (map :host (:clashes x))) "every planned port of the live run clashes"))))
 
 (deftest m8-default-files-come-in-compose-pairs
   (let [{:keys [ctx dir]} (world)]
@@ -514,3 +514,12 @@
     (is (contains? (:active @(:state ctx)) sid) "the section is never reaped under a live wave claim")
     (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "nor marked for volume removal")
     (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))))
+
+(deftest the-up-answer-carries-the-pinned-images-and-a-declared-budget-wins
+  (let [{:keys [ctx]} (world)
+        x (isolated/up! ctx (preset ctx "flow-payment") {})]
+    (is (= {"web" "sha256:aaa" "postgres" "sha256:pg"} (get-in x [:ok :images])) "(A) the same map status answers"))
+  (let [{:keys [ctx]} (world)
+        x (isolated/plan ctx (assoc (preset ctx "flow-payment") :profile/run-mem-mb 3072) {})]
+    (is (= 3072 (get-in x [:ok :admission :need-mb])) (pr-str x))
+    (is (= 0 (get-in x [:ok :admission :assumed-services])) "(B) a declared figure assumes nothing")))

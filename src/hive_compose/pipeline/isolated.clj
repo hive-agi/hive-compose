@@ -177,13 +177,18 @@
    running) of `model`, judged by the stack admission (hc-16a) against every
    live run's memory and the host's MemAvailable minus :compose/host-reserve.
    A service with no mem_limit counts at :compose/default-resources :mem."
-  [ctx model cp services]
+  [ctx model cp services declared-mb]
   (let [settings (:settings ctx)
-        ;; M2: a service with no memory figure counts at
-        ;; :compose/run-default-service-mem-mb (default 128), never at 0
+        ;; M2: a service with no memory figure (no mem_limit in its compose
+        ;; file) counts at :compose/run-default-service-mem-mb (default 128)
         dflt (* 1024 1024 (or (:compose/run-default-service-mem-mb settings) 128))
-        assumed (vec (sort (remove (set (keys (iso/demand model services nil resources/parse-mem))) services)))
-        budget (iso/budget cp (iso/demand model services dflt resources/parse-mem) 1)
+        assumed (if declared-mb
+                  []
+                  (vec (sort (remove (set (keys (iso/demand model services nil resources/parse-mem))) services))))
+        ;; (B) a section's declared budget for its whole closure wins
+        budget (if declared-mb
+                 (iso/budget cp {} (* 1024 1024 declared-mb))
+                 (iso/budget cp (iso/demand model services dflt resources/parse-mem) 1))
         lims (resources/limits settings nil (stacks/mem-available ctx))
         ;; every OTHER live isolated run counts, beside the stack runs
         runs-mem (reduce + 0 (for [[_ e] (runs ctx)
@@ -271,7 +276,8 @@
                                                                           :shared-volumes shared}))]
       (let [ip ip0]
         (r/let-ok [running (r/ok (if entry (let [x (port/-running e ip)] (if (r/ok? x) (:ok x) #{})) #{}))]
-          (let [{:keys [budget verdict limits assumed]} (admission ctx model cp (remove (set running) closure))]
+          (let [{:keys [budget verdict limits assumed]} (admission ctx model cp (remove (set running) closure)
+                                                                          (:profile/run-mem-mb p))]
             (r/ok {:run rid :new? (nil? entry) :compose-project cp :profile ip :doc doc
                    :config-digest (config-digest {"config" model "override" doc} base rid)
                    :text (override/emit doc) :path path :images pinned :shared-volumes shared
@@ -285,10 +291,7 @@
                                :external (:external m)})
                    :binds (:binds (iso/mounts model))
                    :budget budget
-                   :budget budget
                    :admission (cond-> {:verdict (if (r/ok? verdict) :ok :refused)
-                                       :assumed-services (count assumed)
-                                       :assumed-mb-each (or (get-in ctx [:settings :compose/run-default-service-mem-mb]) 128)
                                        :assumed-services (count assumed)
                                        :assumed-mb-each (or (get-in ctx [:settings :compose/run-default-service-mem-mb]) 128)
                                        :need-mb (mb (:budget/total-mem budget))
@@ -356,7 +359,9 @@
               err))
           (let [facts (port/-run-facts e (:profile pl))]
             (r/ok (cond-> (assoc (:ok res) :run rid :compose-project (:compose-project pl)
-                                 :override (override/describe (:doc pl)) :env-run (:env pl))
+                                 :override (override/describe (:doc pl)) :env-run (:env pl)
+                                 ;; (A) the pinned ids, the same map status answers
+                                 :images (get-in (runs ctx) [rid :images] {}))
                     (r/ok? facts) (assoc :ports (:ports (:ok facts)))))))))))
 
 (defn plan

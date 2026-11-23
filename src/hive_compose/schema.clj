@@ -94,7 +94,11 @@
    ;; (Go build/module cache, Maven repository), NEVER a volume that holds
    ;; state: hive-compose cannot tell a cache from state, so two runs sharing
    ;; a state volume would not be isolated. Opt-in; a call may only narrow it.
-   [:profile/run-shared-volumes {:optional true} [:vector [:string {:min 1}]]]])
+   [:profile/run-shared-volumes {:optional true} [:vector [:string {:min 1}]]]
+   ;; FUN-D (B): the declared memory budget, in MiB, of an isolated run of
+   ;; this section's whole closure; when present it is the run's admission
+   ;; figure instead of the per-service sum
+   [:profile/run-mem-mb {:optional true} [:int {:min 1}]]])
 
 (def Claim
   "An agent's declaration that it works on a section (or holds a stack run):
