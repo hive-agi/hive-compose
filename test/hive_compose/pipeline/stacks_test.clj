@@ -298,6 +298,29 @@
     (is (= [{:run run :ok? true}] (:reaped (stacks/reap! c))) "orphan TTL")
     (is (empty? (:stacks @(:state c))))))
 
+(deftest a-wave-claim-holds-a-stack-run-for-hours-and-release-ends-it
+  (let [c (ctx)
+        run (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]
+    (is (= :compose/claim-ttl-over-max
+           (:error (stacks/claim! c run "coordinator:f07f8867" {:note "gate" :ttl-minutes 481}))))
+    (is (= :compose/missing-param (:error (stacks/claim! c run "coordinator:f07f8867" {:ttl-minutes 240}))))
+    (let [res (stacks/claim! c run "coordinator:f07f8867" {:note "pv01 gate" :ttl-minutes 240})]
+      (is (true? (get-in res [:ok :claim :wave?])))
+      (is (= (* 240 60) (get-in res [:ok :claim :expires-in-seconds]))))
+    (stacks/claim! c run "ling-1" {:note "lane"})
+    (stacks/release-claim! c run "ling-1" {})
+    (swap! (:clock c) + (* 239 minute))
+    (is (= [] (:reaped (stacks/reap! c))) "unrenewed for 4 h: the wave claim holds the run")
+    (is (true? (get-in (stacks/stack-status c {:run run}) [:ok :stacks 0 :claims "coordinator:f07f8867" :wave?])))
+    (is (r/ok? (stacks/release-claim! c run "coordinator:f07f8867" {})))
+    (is (get-in @(:state c) [:stacks run :orphaned-at]) "released: an orphan like any other")
+    (testing "a plain renewal after the wave ended says so, as a section's does"
+      (stacks/claim! c run "coordinator:f07f8867" {:note "gate" :ttl-minutes 1})
+      (swap! (:clock c) + (* 2 minute))
+      (let [res (stacks/claim! c run "coordinator:f07f8867" {})]
+        (is (string? (get-in res [:ok :wave-ended])))
+        (is (false? (get-in res [:ok :claim :wave?])))))))
+
 (deftest release-with-stop-takes-it-down
   (let [c (ctx)
         run (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]

@@ -35,10 +35,12 @@
   (:require [clojure.string :as str]
             [hive-compose.port :as port]
             [hive-compose.promote.capability :as capability]
+            [hive-compose.promote.config :as config]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.resources :as resources]
             [hive-compose.promote.stack :as stack]
             [hive-compose.promote.stack-run :as run]
+            [hive-compose.promote.swarm :as sw]
             [hive-compose.promote.target :as target]
             [hive-compose.promote.wiring :as wiring]
             [hive-compose.schema :as schema]
@@ -512,6 +514,8 @@
 ;; ---------------------------------------------------------------------------
 ;; reads
 
+(declare ttls)
+
 (defn stack-status
   "Result<{:stacks [row]}>: every run (narrowed by `opts` {:stack :run}), its
    instances' and consumers' containers as they are now."
@@ -535,7 +539,7 @@
                             :consumers (into (sorted-map)
                                              (for [[c {:keys [compose-project]}] (:consumers e)]
                                                [c {:compose-project compose-project :services (health compose-project)}]))}
-                     (seq (:claims e)) (assoc :claims (:claims e))
+                     (seq (:claims e)) (assoc :claims (sw/claims-view (:claims e) t (:claim-ttl-ms (ttls (:settings ctx)))))
                      (:orphaned-at e) (assoc :orphaned? true))))]
       (r/ok {:stacks (vec rows)}))))
 
@@ -579,19 +583,29 @@
     (subs target (count claim-prefix))))
 
 (defn claim!
-  "Result<{:run :claims}>: `agent` holds run `rid`; renews an existing claim."
-  [ctx rid agent {:keys [note]}]
+  "Result<{:run :claims :claim}>: `agent` holds run `rid`; renews an existing
+   claim. `ttl-minutes` makes it a wave claim, the same law as a section's
+   (`promote.swarm/claim-end`, bounded by :compose/claim-max-ttl-minutes,
+   needs a `note`)."
+  [ctx rid agent {:keys [note ttl-minutes]}]
   (serialized ctx
-    (cond
-      (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
-      (not (contains? (stacks ctx) rid)) (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (stacks ctx))))})
-      :else (let [t (now ctx)]
-              (record! ctx rid (fn [e] (-> e
-                                           (update-in [:claims agent] #(cond-> (assoc (or % {:since t}) :seen t)
-                                                                          note (assoc :note note)))
-                                           (assoc :last-touch t)
-                                           (dissoc :orphaned-at))))
-              (r/ok {:run rid :claims (get-in (stacks ctx) [rid :claims])})))))
+    (let [t (now ctx)
+          until (sw/wave-until t ttl-minutes
+                               (or (:compose/claim-max-ttl-minutes (:settings ctx))
+                                   (:compose/claim-max-ttl-minutes config/defaults)) note)]
+      (cond
+        (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
+        (r/err? until) until
+        (not (contains? (stacks ctx) rid)) (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (stacks ctx))))})
+        :else (let [lapsed? (sw/lapsed-wave (get-in (stacks ctx) [rid :claims agent]) t (:ok until))]
+                (record! ctx rid (fn [e] (-> e
+                                             (update :claims sw/claim agent t {:note note :until (:ok until)})
+                                             (assoc :last-touch t)
+                                             (dissoc :orphaned-at))))
+                (let [claims (get-in (stacks ctx) [rid :claims])]
+                  (r/ok (cond-> {:run rid :claims claims
+                                 :claim (sw/claim-view (get claims agent) t (:claim-ttl-ms (ttls (:settings ctx))))}
+                          lapsed? (assoc :wave-ended "your wave claim had ended; this renewal without ttl_minutes holds the run as a plain claim, renewed within the claim TTL")))))))))
 
 (defn release-claim!
   "Result<{:run :claims ..}>: `agent` gives up run `rid`. With no claim left the
@@ -610,7 +624,7 @@
 (defn- ttls [settings]
   {:ttl-ms (* 60000 (or (:compose/default-ttl-minutes settings) 60))
    :orphan-ttl-ms (* 60000 (or (:compose/orphan-ttl-minutes settings) (:compose/default-ttl-minutes settings) 60))
-   :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) 30))})
+   :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) (:compose/claim-ttl-minutes config/defaults)))})
 
 (defn- down-row [ctx rid extra]
   (let [x (try (stack-down! ctx {:run rid})
