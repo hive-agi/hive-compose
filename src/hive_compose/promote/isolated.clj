@@ -81,6 +81,8 @@
                  :else kv))
     :else v))
 
+(declare ownership-labels)
+
 (defn spec
   "OverrideSpec of run `run` of shared project `base` over its merged model
    `model`, ports per `policy`: every container_name reset, the build-only
@@ -91,7 +93,27 @@
   [model base run {:keys [ports images shared-volumes]}]
   (override/spec-of {:run run :names :all :ports (or ports :strip)
                      :fresh-volumes (vec (remove (set shared-volumes) (override/explicit-volumes model)))
-                     :images-from base :images images :shared-volumes shared-volumes}))
+                     :images-from base :images images :shared-volumes shared-volumes
+                     :volume-labels (ownership-labels base run)}))
+
+(defn mounts
+  "What the services of `model` mount that a run SHARES by nature (M4):
+   {:external [key] (external top-level volumes some service mounts)
+    :binds [{:service :source :target :rw?}] (host paths: shared with the
+   host and with the shared project)}."
+  [model]
+  (let [ext? #(true? (get-in model ["volumes" % "external"]))
+        rows (for [[svc sm] (sort-by key (get model "services"))
+                   v (get sm "volumes")]
+               [svc v])]
+    {:external (vec (sort (distinct (for [[_ v] rows
+                                          :when (= "volume" (get v "type"))
+                                          :when (ext? (get v "source"))]
+                                      (get v "source")))))
+     :binds (vec (for [[svc v] rows
+                       :when (= "bind" (get v "type"))]
+                   {:service svc :source (get v "source") :target (get v "target")
+                    :rw? (not (true? (get v "read_only")))}))}))
 
 (defn build-images
   "{service tag} the build-only services of `model` reuse: the tag the shared
@@ -323,33 +345,51 @@
 
 (def project-label "com.docker.compose.project")
 (def volume-label "com.docker.compose.volume")
+(def run-label "hive.compose.run")
+(def base-label "hive.compose.base")
 
 (defn removable
   "The volumes of `vols` ([{:name :labels {k v}}], what docker lists) that the
    removal of run `run` may take: ONLY when `runs` (the state's :runs)
-   records `run` as an isolated run hive-compose created, and then only the
-   volumes compose created for that run's own compose project (label
-   com.docker.compose.project equal to it, a compose volume label present)
-   whose name carries the run id. Never a volume of the shared project nor
-   of any other project, never an external volume (compose puts no label on
-   one), never a fixed `name:` without the run. Pure; empty when anything
+   records `run` as an isolated run hive-compose created (:isolated? true,
+   its :run, :base-project and :compose-project = <base>-<run> consistent,
+   no merge :conflict), and then only the volumes carrying ALL of: the
+   compose project label equal to <base>-<run>, a compose volume label, and
+   the ownership labels hive.compose.run = run and hive.compose.base = base
+   that only this run's override puts on a volume at its creation. A volume
+   that existed before the run (another project that happens to share the
+   name, a stack's private project, a hand-edited record) never carries them,
+   so it is never removable; neither is an external volume, a volume of the
+   shared project, nor a borrowed cache volume. Pure; empty when anything
    does not hold."
   [runs run vols]
   (let [e (get runs run)
+        base (:base-project e)
         cp (:compose-project e)
-        shared (set (for [k (:shared-volumes e)] (str (:base-project e) "_" k)))]
-    (if-not (and e (true? (:isolated? e)) (valid-run? run)
-                 (= cp (compose-project (:base-project e) run))
-                 (not= cp (:base-project e)))
+        shared (set (for [k (:shared-volumes e)] (str base "_" k)))]
+    (if-not (and e (true? (:isolated? e)) (valid-run? run) (= run (:run e))
+                 (string? base) (seq base)
+                 (= cp (compose-project base run))
+                 (not= cp base)
+                 (not (:conflict e)))
       []
       (vec (sort-by :name
                     (for [v vols
                           :let [ls (:labels v)]
                           :when (= cp (get ls project-label))
                           :when (seq (get ls volume-label))
-                          :when (not (shared (:name v)))
-                          :when (str/includes? (str (:name v)) run)]
+                          ;; the proof of ownership: only the override of THIS run
+                          ;; puts these labels on a volume, at its creation
+                          :when (= run (get ls run-label))
+                          :when (= base (get ls base-label))
+                          :when (not (shared (:name v)))]
                       v))))))
+
+(defn ownership-labels
+  "The labels the override of run `run` of `base` puts on every volume the
+   run creates: the only proof `removable` accepts that a volume is the run's."
+  [base run]
+  {run-label run base-label base})
 
 (defn stale-volumes
   "[{:run :name}] of every ended run's volumes still present: `listed`

@@ -811,6 +811,8 @@
                           {:keys [exit stderr]} (:ok res)]
                       (cond
                         (and (r/ok? res) (zero? exit)) (update acc :removed conj nm)
+                        ;; m5: already gone (another pass removed it): not an error
+                        (and (r/ok? res) (re-find #"(?i)no such volume" (str stderr))) (update acc :gone (fnil conj []) nm)
                         (and (r/ok? res) (in-use? stderr)) (update acc :kept conj {:name nm :reason :in-use})
                         :else (update acc :kept conj {:name nm :reason :failed
                                                       :stderr (clip (str (or stderr (:message res))))}))))

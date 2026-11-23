@@ -579,7 +579,11 @@
    [:compose/suites {:optional true} [:map-of :string Suite]]
    [:compose/default-resources {:optional true} Resources]
    [:compose/budget {:optional true} MemSize]
-   [:compose/host-reserve {:optional true} MemSize]])
+   [:compose/host-reserve {:optional true} MemSize]
+   ;; FUN-D M1: how long the reaper keeps an isolated run's volumes after
+   ;; ending the run before it removes them (up run=<id>, a claim or a touch
+   ;; on a section of the run cancels the removal)
+   [:compose/run-volumes-grace-minutes {:optional true} [:int {:min 1}]]])
 
 (def InstanceCaps
   "The caps the stack plan resolved for one instance: `:mem` in bytes and
@@ -660,7 +664,8 @@
     [:override/fresh-volumes {:optional true} [:or [:= :all] [:vector [:string {:min 1}]]]]
     [:override/images-from {:optional true} ComposeProjectName]
     [:override/images {:optional true} [:map-of [:string {:min 1}] [:string {:min 1}]]]
-    [:override/shared-volumes {:optional true} [:vector [:string {:min 1}]]]]
+    [:override/shared-volumes {:optional true} [:vector [:string {:min 1}]]]
+    [:override/volume-labels {:optional true} [:map-of [:string {:min 1}] [:string {:min 1}]]]]
    [:fn {:error/message "fresh volumes need :override/run"}
     (fn [s] (let [f (:override/fresh-volumes s)]
               (or (nil? f) (and (coll? f) (empty? f)) (contains? s :override/run))))]])

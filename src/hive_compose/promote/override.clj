@@ -247,7 +247,10 @@
     :else
     (if-let [unknown (seq (remove #(contains? (get model "volumes" {}) %) ks))]
       (invalid {:volumes (vec (sort unknown)) :hint "run shared volumes names volumes the model does not declare"})
-      (r/ok (into (sorted-map) (for [k (distinct ks)] [k {"external" true "name" (str base "_" k)}]))))))
+      ;; an already external volume is shared as the file declares it
+      (r/ok (into (sorted-map) (for [k (distinct ks)
+                                     :when (not (true? (get-in model ["volumes" k "external"])))]
+                                 [k {"external" true "name" (str base "_" k)}]))))))
 
 (defn override-doc
   "Result<doc>: the override document of OverrideSpec `spec` over compose
@@ -270,7 +273,13 @@
                              (into (sorted-map) (map (fn [[s v]] [s {"ports" v}])) ports)
                              images)]
         (r/let-ok [shared (shared-volumes model (:override/shared-volumes spec) (:override/images-from spec))]
-          (let [vols (merge vols shared)]
+          (let [labels (:override/volume-labels spec)
+                labelled (when (seq labels)
+                           (into {} (for [[k v] (get model "volumes" {})
+                                          :when (not (true? (get v "external")))
+                                          :when (not (contains? shared k))]
+                                      [k {"labels" (into (sorted-map) labels)}])))
+                vols (merge-with merge labelled vols shared)]
             (r/ok (cond-> {}
                     (seq svcs) (assoc "services" (into (sorted-map) svcs))
                     (seq vols) (assoc "volumes" (into (sorted-map) vols))))))))))
@@ -298,8 +307,9 @@
 (defn spec-of
   "OverrideSpec of options as a call or a preset gives them (:run :names
    :ports :fresh-volumes :images-from), absent ones left out."
-  [{:keys [run names ports fresh-volumes images-from images shared-volumes]}]
+  [{:keys [run names ports fresh-volumes images-from images shared-volumes volume-labels]}]
   (cond-> {}
+    (seq volume-labels) (assoc :override/volume-labels (into (sorted-map) volume-labels))
     (seq images) (assoc :override/images (into (sorted-map) images))
     (seq shared-volumes) (assoc :override/shared-volumes (vec shared-volumes))
     run (assoc :override/run run)

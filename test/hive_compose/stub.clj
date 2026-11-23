@@ -467,5 +467,9 @@
             :when (not (some-> (:profile/override p) slurp
                                (clojure.string/includes? (str "\"" k "\":\n    \"external\": true"))))
             :when (or (nil? (get v "name")) (= (get v "name") (str base "_" k)))]
+      ;; as compose: the override's `labels:` of the volume land on it at creation
       (swap! (:world e) assoc-in [:volumes (str cp "_" k)]
-             {:labels {"com.docker.compose.project" cp "com.docker.compose.volume" k}}))))
+             {:labels (merge {"com.docker.compose.project" cp "com.docker.compose.volume" k}
+                             (when (some-> (:profile/override p) slurp
+                                           (clojure.string/includes? "\"hive.compose.run\""))
+                               {"hive.compose.run" (:profile/run p) "hive.compose.base" base}))}))))

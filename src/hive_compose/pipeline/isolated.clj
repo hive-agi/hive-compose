@@ -81,7 +81,10 @@
       (nil? e) (r/ok {:run rid :entry nil})
       (not= base (:base-project e)) (r/err :compose/invalid-param {:param "run" :run rid
                                                                   :hint (str "run " rid " is a run of " (:base-project e))})
-      (:ended-at e) (r/err :compose/invalid-param {:param "run" :run rid :hint "the run has ended; start a new one"})
+      ;; a run the reaper ended and marked for volume removal is revived by
+      ;; `up run=<id>` within the grace (the mark is cancelled, the data kept)
+      (and (:ended-at e) (not (:volumes-due-at e)))
+      (r/err :compose/invalid-param {:param "run" :run rid :hint "the run has ended; start a new one"})
       (and ports (not= ports (:ports e))) (r/err :compose/invalid-param {:param "ports" :run rid :was (:ports e)
                                                                          :hint "a run keeps the port policy of its first up"})
       :else (r/ok {:run rid :entry e}))))
@@ -109,6 +112,37 @@
       (r/err :compose/no-compose-file {:dir (:profile/dir p) :looked-for iso/default-files}))))
 
 (defn- mb [b] (when b (quot b (* 1024 1024))))
+
+(defn- project-free
+  "Result<nil>: ok when docker knows NOTHING labelled with compose project
+   `cp` (containers, volumes, networks), else could-not-run :project-exists
+   naming what was found. A run must own its project before it starts; an
+   engine that cannot list containers and networks by label is refused
+   (ownership cannot be proved)."
+  [ctx e cp rid]
+  (if-not (satisfies? port/IStackEngine e)
+    (could-not-run rid {:reason :project-unverifiable :project cp
+                        :hint "the engine cannot list a project's containers and networks"})
+    (let [lbl {iso/project-label cp}]
+      (r/let-ok [cs (port/-running-labelled e lbl)
+                 vs (port/-run-volumes e cp)
+                 ns (port/-networks-labelled e lbl)]
+        (if (and (empty? cs) (empty? vs) (empty? ns))
+          (r/ok nil)
+          (could-not-run rid {:reason :project-exists :project cp
+                              :found {:containers (count cs) :volumes (count vs) :networks (count ns)}
+                              :hint "a compose project of that name already exists and is not this run's; pick another run id"}))))))
+
+(defn- refuse-external
+  "Result<nil>: an external volume a service of the run mounts is refused
+   unless the preset names it in :profile/run-shared-volumes (M4)."
+  [rid model shared]
+  (let [ext (remove (set shared) (:external (iso/mounts model)))]
+    (if (seq ext)
+      (r/err :compose/fresh-external-volume
+             {:run rid :volumes (vec ext)
+              :hint "an isolated run would share this external volume read-write with the shared project; name it in :profile/run-shared-volumes to share it on purpose"})
+      (r/ok nil))))
 
 (defn- admission
   "{:budget :verdict :limits}: starting `services` (those of the run not yet
@@ -145,6 +179,10 @@
                                                   :hint "an isolated run sets these itself; rename them"})
                    (r/ok nil))
                {rid :run entry :entry} (pick-run ctx base opts)
+               ;; B1: a NEW run must own its compose project: nothing may
+               ;; already carry the project label (another checkout, a dashed
+               ;; base, a stack's private project, a hand-run -p)
+               _ (if entry (r/ok nil) (project-free ctx e (iso/compose-project base rid) rid))
                p (with-files p)
                ;; per run, like its port policy: fixed at its first up
                shared (if entry (r/ok (vec (:shared-volumes entry))) (shared-volumes p (:shared-volumes opts)))
@@ -165,6 +203,7 @@
                                                   :undeclared (vec (remove #(contains? (get model "volumes" {}) %) shared))
                                                   :hint "a run shared volume must be one the compose file declares"})
                    (r/ok nil))
+               _ (refuse-external rid model shared)
                tags (r/ok (iso/build-images model base))
                ids (port/-image-ids e (vals tags))
                pinned (let [x (iso/pin-images tags (:images entry) (into {} (for [[_ t] tags :when (get ids t)] [t (get ids t)])))]
@@ -185,6 +224,14 @@
                    :config-digest (config-digest {"config" model "override" doc} base rid)
                    :text (override/emit doc) :path path :images pinned :shared-volumes shared
                    :ports policy :planned-ports planned :env run-env :model model
+                   :volumes (let [m (iso/mounts model)]
+                              {:created (vec (sort (for [[k v] (get model "volumes" {})
+                                                         :when (not (true? (get v "external")))
+                                                         :when (not (some #{k} shared))]
+                                                     k)))
+                               :shared (vec shared)
+                               :external (:external m)})
+                   :binds (:binds (iso/mounts model))
                    :admission (cond-> {:verdict (if (r/ok? verdict) :ok :refused)
                                        :need-mb (mb (:budget/total-mem budget))
                                        :free-mb (mb (:host limits))
@@ -222,8 +269,11 @@
                                                 :dir (get-in pl [:profile :profile/dir])
                                                 :files (get-in pl [:profile :profile/files])
                                                 :override (:path pl)
+                                                :external (get-in pl [:volumes :external])
+                                                :binds (:binds pl)
                                                 :env (env/rendered (get-in pl [:profile :profile/env]))))))
       (record-run! ctx rid #(-> %
+                                (dissoc :ended-at :ended-by :volumes-due-at :claim-gone?)
                                 (assoc :images (merge (:images %) (:images pl)))
                                 (assoc-in [:digests (:profile/id p)]
                                           (config-digest {"config" (:model pl) "override" (:doc pl)} base rid))))
@@ -242,7 +292,7 @@
   [ctx p opts]
   (r/map-ok (plan-join ctx p opts)
             (fn [pl] (-> (select-keys pl [:run :new? :compose-project :path :images :shared-volumes
-                                          :ports :planned-ports :env :admission :config-digest])
+                                          :ports :planned-ports :env :admission :config-digest :volumes :binds])
                          (assoc :section (get-in pl [:profile :profile/id])
                                 :override (override/describe (:doc pl))
                                 :override-text (:text pl))))))
@@ -261,15 +311,37 @@
         (r/map-ok (port/-run-volumes e (:compose-project entry))
                   #(iso/removable (runs ctx) rid %))))))
 
+(defn- project-containers
+  "Result<[name]>: every container (running or not) of run `rid`'s project."
+  [ctx e rid]
+  (if (satisfies? port/IStackEngine e)
+    (r/map-ok (port/-running-labelled e {iso/project-label (get-in (runs ctx) [rid :compose-project])})
+              #(mapv :name %))
+    (r/ok [])))
+
 (defn- remove-volumes!
-  "Result<{:removed :kept}>: the volumes of ended run `rid` removed, by exact
-   name, never forced. Only for a run whose containers are gone."
+  "Result<{:removed :kept :not-removable}>: the volumes of ENDED run `rid`
+   removed, by exact name, never forced (M3): refused while the run still
+   has a section in the state or a container of its project exists. A
+   volume labelled with the project but not provably the run's is listed
+   under :not-removable, never removed."
   [ctx rid]
   (r/let-ok [e (engine ctx)
-             vols (removable-volumes ctx rid)]
-    (if (empty? vols)
-      (r/ok {:removed [] :kept []})
-      (port/-remove-volumes! e (mapv :name vols)))))
+             cs (project-containers ctx e rid)]
+    (let [secs (iso/run-sections (:active @(:state ctx)) rid)]
+      (cond
+        (seq secs) (r/err :compose/run-still-active {:run rid :sections secs
+                                                     :hint "take the run's sections down first"})
+        (seq cs) (r/err :compose/run-still-active {:run rid :containers cs
+                                                   :hint "containers of the run's project still exist"})
+        :else
+        (r/let-ok [all (port/-run-volumes e (get-in (runs ctx) [rid :compose-project]))]
+          (let [vols (iso/removable (runs ctx) rid all)
+                spared (vec (sort (remove (set (map :name vols)) (map :name all))))]
+            (if (empty? vols)
+              (r/ok {:removed [] :kept [] :not-removable spared})
+              (r/map-ok (port/-remove-volumes! e (mapv :name vols))
+                        #(assoc % :not-removable spared)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; down and reap
@@ -288,49 +360,142 @@
                                             :files (:files entry) :env (:env entry {}) :all? true})
                     (r/ok nil))
         _ (record-run! ctx rid #(assoc % :ended-at ((:now ctx)) :ended-by how))
+        ;; m1: a failed `down` may leave containers: never remove then
+        volumes? (and volumes? (r/ok? leftovers))
         vols (when volumes? (remove-volumes! ctx rid))]
     (cond-> {:run rid :ended? true}
-      (r/err? leftovers) (assoc :leftovers-error (select-keys leftovers [:error :stderr]))
+      (r/err? leftovers) (assoc :leftovers-error (select-keys leftovers [:error :stderr])
+                                :volumes-kept-why :leftovers-error)
       (and vols (r/ok? vols)) (assoc :volumes (:ok vols))
       (and vols (r/err? vols)) (assoc :volumes-error (select-keys vols [:error :hint]))
       (not volumes?) (assoc :volumes-kept (let [x (removable-volumes ctx rid)] (if (r/ok? x) (mapv :name (:ok x)) []))))))
 
+(defn- other-claims
+  "[{:section :agents}] of the sections of run `rid` with a live claim by an
+   agent other than `agent` (a claim is live while the state holds it: the
+   usage pass drops the ended ones)."
+  [ctx rid agent]
+  (vec (for [id (iso/run-sections (:active @(:state ctx)) rid)
+             :let [cs (remove #(= agent %) (sort (keys (get-in @(:state ctx) [:active id :claims]))))]
+             :when (seq cs)]
+         {:section id :agents (vec cs)})))
+
+(defn- ended-volumes
+  "Result: run `rid` is ended; remove its volumes when `volumes?`, else list them."
+  [ctx rid volumes?]
+  (if volumes?
+    (r/map-ok (remove-volumes! ctx rid) (fn [v] {:run rid :ended? true :volumes v}))
+    (r/ok {:run rid :ended? true
+           :volumes-kept (let [x (removable-volumes ctx rid)] (if (r/ok? x) (mapv :name (:ok x)) []))})))
+
 (defn down-run!
   "Result<{:run :sections [..] :volumes ..}>: every section of run `rid`
-   taken down (containers removed, `action` :down), the run ended; its
-   volumes removed only with `volumes?` (default kept: a failed run's data is
-   evidence)."
-  [ctx rid volumes?]
-  (cond
-    (not (get (runs ctx) rid))
-    (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (runs ctx))))})
-    ;; an ended run keeps its volumes until asked: down run=<id> volumes=true
-    (get-in (runs ctx) [rid :ended-at])
-    (if volumes?
-      (r/map-ok (remove-volumes! ctx rid) (fn [v] {:run rid :ended? true :volumes v}))
-      (r/ok {:run rid :ended? true :volumes-kept (let [x (removable-volumes ctx rid)] (if (r/ok? x) (mapv :name (:ok x)) []))}))
-    :else
-    (let [ids (iso/run-sections (:active @(:state ctx)) rid)
-          downs (mapv (fn [id] (let [x (r/bind (ops/lookup ctx id) #(ops/down-profile! ctx % :down))]
-                                 (cond-> {:section id :ok? (r/ok? x)} (r/err? x) (assoc :error x))))
-                      ids)]
-      (if (some (complement :ok?) downs)
-        (r/err :compose/stack-down-incomplete {:run rid :sections downs
-                                               :hint "the run stays recorded; down run=<id> again once fixed"})
-        (r/ok (merge {:sections downs} (end-run! ctx rid :down volumes?)))))))
+   taken down (containers removed), the run ended; its volumes removed only
+   with `volumes?` (default kept: a failed run's data is evidence). With
+   `volumes?` it is refused while an agent other than `:agent` holds a live
+   claim on a section of the run (M2), unless `:allow-shared?`. An ended run
+   with `volumes?` removes them now (cancelling any pending reaper mark)."
+  ([ctx rid volumes?] (down-run! ctx rid volumes? {}))
+  ([ctx rid volumes? {:keys [agent allow-shared?]}]
+   (let [held (other-claims ctx rid agent)]
+     (cond
+       (not (get (runs ctx) rid))
+       (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (runs ctx))))})
+
+       (and volumes? (seq held) (not allow-shared?))
+       (r/err :compose/held-by-another-section
+              {:run rid :holders held
+               :message (str "agents hold live claims on sections of run " rid ": "
+                             (str/join "; " (for [{:keys [section agents]} held]
+                                              (str section " (" (str/join ", " agents) ")"))))
+               :hint "ask the claiming agent first, or pass allow_shared=true to remove the run's volumes anyway"})
+
+       (get-in (runs ctx) [rid :ended-at])
+       (do (record-run! ctx rid #(dissoc % :volumes-due-at))
+           (ended-volumes ctx rid volumes?))
+
+       :else
+       (let [ids (iso/run-sections (:active @(:state ctx)) rid)
+             downs (mapv (fn [id] (let [x (r/bind (ops/lookup ctx id) #(ops/down-profile! ctx % :down))]
+                                    (cond-> {:section id :ok? (r/ok? x)} (r/err? x) (assoc :error x))))
+                         ids)]
+         (if (some (complement :ok?) downs)
+           (r/err :compose/stack-down-incomplete {:run rid :sections downs
+                                                  :hint "the run stays recorded; down run=<id> again once fixed"})
+           (r/ok (merge {:sections downs} (end-run! ctx rid :down volumes?)))))))))
+
+(defn grace-ms
+  "How long the reaper waits between ending a run and removing its volumes:
+   :compose/run-volumes-grace-minutes (default 60)."
+  [settings]
+  (* 60000 (or (:compose/run-volumes-grace-minutes settings) 60)))
 
 (defn after-reap!
-  "After a section reaper pass (`reaped` rows): every isolated run left with
-   no section is ended and its volumes removed (Pedro: auto-remove when the
-   run is reaped). A run still holding a section (a live claim keeps it) is
-   never touched. Answers one row per ended run."
-  [ctx reaped]
+  "After a section reaper pass (`reaped` rows, `doubtful?` true when the
+   pass judged claims on an absent or empty swarm roster). Step 1 (M1): a
+   run whose last section this pass reaped is ended, its containers gone,
+   and its volumes only MARKED for removal at now + grace; never marked when
+   the reap is doubtful or a claim of the run ended as :gone (the volumes are
+   then kept and listed). Step 2, on a LATER pass: `sweep-due!` removes them.
+   Answers one row per run ended."
+  ([ctx reaped] (after-reap! ctx reaped nil))
+  ([ctx reaped observed]
+   (if-not (satisfies? port/IIsolatedRuns (:engine ctx))
+     []
+     (let [rids (iso/ended-runs (runs ctx) (:active @(:state ctx))
+                                (keep #(some-> (:profile/id %) iso/split-id second)
+                                      (filter :ok? reaped)))
+           ;; claims judged against an absent or empty roster prove nothing
+           doubtful? (and observed (or (not= :ok (:swarm observed)) (zero? (:agents observed 0))))
+           gone (into #{} (keep #(when (= :gone (:reason %)) (some-> (:section %) iso/split-id second)))
+                      (:expired observed))
+           gone? (fn [rid] (or (contains? gone rid) (true? (get-in (runs ctx) [rid :claim-gone?]))))]
+       (mapv (fn [rid]
+               (let [row (end-run! ctx rid :reaper false)]
+                 (if (or doubtful? (gone? rid) (:leftovers-error row))
+                   (assoc row :volumes-kept-why (cond doubtful? :doubtful-roster
+                                                      (gone? rid) :claim-gone
+                                                      :else :leftovers-error))
+                   (let [due (+ ((:now ctx)) (grace-ms (:settings ctx)))]
+                     (record-run! ctx rid #(assoc % :volumes-due-at due))
+                     (assoc row :volumes-due-at due)))))
+             rids)))))
+
+(defn note-observed!
+  "Remember on each live isolated run that one of its claims ended as :gone
+   in usage pass `observed` (an agent the roster no longer lists): such a
+   run's volumes are never marked for removal by the reaper (M1)."
+  [ctx observed]
+  (doseq [rid (distinct (keep #(when (= :gone (:reason %)) (some-> (:section %) iso/split-id second))
+                              (:expired observed)))
+          :when (get (runs ctx) rid)]
+    (record-run! ctx rid #(assoc % :claim-gone? true))))
+
+(defn cancel-due!
+  "Cancel a pending volume removal of the run of isolated section `sid`
+   (`up run=<id>`, a claim or a touch on one of its sections)."
+  [ctx sid]
+  (when-let [[_ rid] (iso/split-id sid)]
+    (when (get-in (runs ctx) [rid :volumes-due-at])
+      (record-run! ctx rid #(dissoc % :volumes-due-at)))))
+
+(defn sweep-due!
+  "Step 2 of the reaper's volume removal (M1): remove the volumes of every
+   run whose mark has come due, only while it is still ended, no section of
+   it is active, it took no claim since, and no container of its project
+   exists (`remove-volumes!` checks the last two). Answers a row per run."
+  [ctx]
   (if-not (satisfies? port/IIsolatedRuns (:engine ctx))
     []
-    (let [rids (iso/ended-runs (runs ctx) (:active @(:state ctx))
-                               (keep #(some-> (:profile/id %) iso/split-id second)
-                                     (filter :ok? reaped)))]
-      (mapv #(end-run! ctx % :reaper true) rids))))
+    (let [now ((:now ctx))]
+      (vec (for [[rid e] (sort-by key (runs ctx))
+                 :let [due (:volumes-due-at e)]
+                 :when (and due (<= due now) (:ended-at e))]
+             (let [res (remove-volumes! ctx rid)]
+               (when (r/ok? res) (record-run! ctx rid #(dissoc % :volumes-due-at)))
+               (cond-> {:run rid}
+                 (r/ok? res) (assoc :volumes (:ok res))
+                 (r/err? res) (assoc :error (select-keys res [:error :sections :containers])))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; status
@@ -350,7 +515,10 @@
                        :pinned-images (:images entry {})
                        :config-digest (when (seq (:digests entry)) (sha256 (pr-str (into (sorted-map) (:digests entry)))))
                        :config-digests (into (sorted-map) (:digests entry))
-                       :volumes {:created (or vols []) :shared shared}))
+                       :volumes {:created (or vols []) :shared shared :external (vec (:external entry))}
+                       :binds (vec (:binds entry))))
+      (:volumes-due-at entry) (assoc :volumes-due-at (:volumes-due-at entry))
+      (:conflict entry) (assoc :conflict (:conflict entry))
       facts (assoc :ports (:ports facts) :images (:images facts))
       (:env entry) (assoc :env-run (into (sorted-map) (filter (fn [[k _]] (re-matches iso/reserved-var-re k))) (:env entry))))))
 
@@ -368,4 +536,5 @@
         rows (vec (for [[rid entry] (sort-by key (runs ctx))] (run-row ctx e rid entry)))]
     {:runs rows
      :stale-run-volumes (vec (for [row rows :when (:ended-at row) n (get-in row [:volumes :created])]
-                               {:run (:run row) :name n}))}))
+                               (cond-> {:run (:run row) :name n}
+                                 (:volumes-due-at row) (assoc :due-at (:volumes-due-at row)))))}))

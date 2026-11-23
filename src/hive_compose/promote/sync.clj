@@ -62,6 +62,21 @@
                     (when (seq v) [p v]))))
           (distinct (concat (keys b) (keys m) (keys t))))))
 
+(defn merge-run
+  "One isolated run record both sides changed (M3). The same run (equal
+   :base-project and :compose-project): an ended side wins. Two different
+   runs under one id: the LIVE side is kept and flagged :conflict (naming the
+   other's base and project), which `promote.isolated/removable` refuses, so
+   neither side's volumes can be removed until a human resolves it."
+  [_ m t]
+  (let [same? (and (= (:base-project m) (:base-project t))
+                   (= (:compose-project m) (:compose-project t)))]
+    (if same?
+      (if (:ended-at t) t m)
+      (let [[keep other] (if (and (:ended-at m) (not (:ended-at t))) [t m] [m t])]
+        (assoc keep :conflict {:base-project (:base-project other)
+                               :compose-project (:compose-project other)})))))
+
 (defn merge-state
   "The persisted state from `base` (last synced), `mine` (this instance) and
    `theirs` (the file now). Each is {:active {..} :current id-or-nil}."
@@ -76,6 +91,6 @@
       ;; reconciled removal (a run saw the service gone) sticks
       ;; isolated runs (FUN-D), merged like stack runs
       (some :runs [base mine theirs])
-      (assoc :runs (merge3 (:runs base) (:runs mine) (:runs theirs) (fn [_ m t] (if (:ended-at t) t m))))
+      (assoc :runs (merge3 (:runs base) (:runs mine) (:runs theirs) merge-run))
       (some :preexisting [base mine theirs])
       (assoc :preexisting (merge-marks (:preexisting base) (:preexisting mine) (:preexisting theirs))))))

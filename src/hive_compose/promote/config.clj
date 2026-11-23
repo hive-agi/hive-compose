@@ -34,6 +34,8 @@
      :compose/orphan-ttl-minutes   idle minutes before the reaper acts on a section
                                    whose last claim ended, when shorter than its TTL
                                    (default 10)
+     :compose/run-volumes-grace-minutes  how long the reaper keeps an isolated
+                                   run's volumes after ending it (default 60)
      :compose/program-grace-ms     how long a host program is watched after its
                                    start; one that exits within it is reported
                                    :exited with its code and log tail (default 3000)
@@ -68,7 +70,8 @@
    :compose/cpu-busy-percent 5
    :compose/claim-ttl-minutes 30
    :compose/orphan-ttl-minutes 10
-   :compose/program-grace-ms 3000})
+   :compose/program-grace-ms 3000
+   :compose/run-volumes-grace-minutes 60})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")

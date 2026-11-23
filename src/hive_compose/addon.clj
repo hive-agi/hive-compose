@@ -172,8 +172,13 @@
               _ (swarm/announce-reaped! ctx (:reaped reaped))
               ;; an isolated run whose last section was just reaped ends, and
               ;; its own volumes go with it (Pedro, 2026-11-23)
-              runs-ended (isolated/after-reap! ctx (:reaped reaped))
-              reaped (cond-> reaped (seq runs-ended) (assoc :runs-ended runs-ended))
+              ;; step 2 first: volumes whose grace ran out on an EARLIER pass
+              runs-swept (isolated/sweep-due! ctx)
+              _ (isolated/note-observed! ctx observed)
+              runs-ended (isolated/after-reap! ctx (:reaped reaped) observed)
+              reaped (cond-> reaped
+                       (seq runs-ended) (assoc :runs-ended runs-ended)
+                       (seq runs-swept) (assoc :runs-swept runs-swept))
               stack-runs (:reaped (stacks/reap! ctx))
               pass (cond-> (assoc reaped :observed observed)
                      (seq adopted) (assoc :adopted adopted)
@@ -372,7 +377,7 @@
                    (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p))))))
         "claim" (if-let [run (stacks/claim-run tgt)]
                   (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
-                  (on-subject #(swarm/claim! ctx % (agent-param params)
+                  (on-subject #(swarm/claim! ctx (do (isolated/cancel-due! ctx (:profile/id %)) %) (agent-param params)
                                               {:note (some-> (param params "note") str)})))
         "release" (if-let [run (stacks/claim-run tgt)]
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
@@ -390,15 +395,20 @@
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
-        "down" (if (and run-param (nil? id))
-                 (isolated/down-run! ctx run-param (boolean (flag params "volumes")))
-                 (on-subject #(ops/down-profile! ctx % :down)))
+        "down" (cond
+                 (and run-param (nil? id))
+                 (isolated/down-run! ctx run-param (boolean (flag params "volumes"))
+                                     {:agent (agent-param params) :allow-shared? (boolean allow-shared?)})
+                 (flag params "volumes")
+                 (r/err :compose/invalid-param {:param "volumes" :hint "volumes=true needs run=<id> alone (an isolated run)"})
+                 :else (on-subject #(ops/down-profile! ctx % :down)))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
         "restart" (with-opts (fn [p] (let [recreate? (flag params "recreate")]
                                        (guard p :restart recreate?
                                               #(restart/restart-profile! ctx p recreate?)))))
         "touch" (if (or tgt id)
-                  (on-subject #(ops/touch! ctx (:profile/id %)))
+                  (on-subject #(do (isolated/cancel-due! ctx (:profile/id %))
+                                   (ops/touch! ctx (:profile/id %))))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
         "ps" (on-subject #(ops/ps-profile ctx %))
         "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
@@ -446,8 +456,14 @@
                      "project. Every compose call of a run gets HIVE_RUN, HIVE_RUN_PROJECT, HIVE_PORT_OFFSET and "
                      "HIVE_PORT_<SERVICE>_<PORT> (none of the latter under ports=ephemeral: unknown before up); a call env "
                      "naming one is refused. status answers runs with ports, images, config-digest and volumes. "
-                     "down run=<id> ends a run keeping its volumes; volumes=true (or the reaper, reaping an unclaimed run) "
-                     "removes only the volumes that run created. :profile/run-shared-volumes borrows volumes of the shared "
+                     "down run=<id> ends a run keeping its volumes; volumes=true removes only the volumes that run created "
+                     "(labelled hive.compose.run/hive.compose.base by its override), refused while another agent claims a "
+                     "section of the run unless allow_shared. When the reaper reaps a run's last section it only MARKS the "
+                     "volumes for removal after :compose/run-volumes-grace-minutes (default 60, status :stale-run-volumes "
+                     ":due-at); up run=<id>, a claim or a touch on its sections in that time keeps the data. A run must own "
+                     "its compose project: a project <project>-<run> that already exists is refused. A BIND mount is shared "
+                     "with the host and with the shared project (status :binds); an external volume is refused unless named in "
+                     ":profile/run-shared-volumes. :profile/run-shared-volumes borrows volumes of the shared "
                      "project: BUILD CACHES ONLY, never a volume holding state. up dry_run=true answers the memory admission. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
@@ -458,7 +474,7 @@
                               "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
-                              "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
+                              "allow_shared" {:type "boolean" :description "[up|switch|restart|down] recreate a service another live section holds (refused by default, naming the holder section and its agents); down run=<id> volumes=true: remove the run's volumes although another agent claims a section of it"}
                               "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}

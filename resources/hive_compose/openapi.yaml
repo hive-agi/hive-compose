@@ -3877,6 +3877,7 @@ components:
       - compose/result-unreadable
       - compose/result-unwritable
       - compose/run-exists
+      - compose/run-still-active
       - compose/runner-failed
       - compose/secret-unresolved
       - compose/shared-reset-without-tenancy
@@ -5072,6 +5073,9 @@ components:
     Req_down:
       type: object
       properties:
+        allow_shared:
+          type: "boolean"
+          description: "[up|switch|restart|down] recreate a service another live section holds (refused by default, naming the holder section and its agents); down run=<id> volumes=true: remove the run's volumes although another agent claims a section of it"
         volumes:
           type: "boolean"
           description: "[down] with run=<id> alone: also remove the volumes the isolated run created"

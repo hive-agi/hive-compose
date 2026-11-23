@@ -162,7 +162,9 @@
         (is (every? (fn [[_ names]] (every? #(str/includes? % rid) names))
                     (filter #(= :remove-volumes (first %)) (stub/calls e))))))))
 
-(deftest the-reaper-removes-an-unclaimed-run-and-spares-a-claimed-one
+(def ok-roster {:swarm :ok :agents 2 :expired []})
+
+(deftest the-reaper-marks-then-removes-after-the-grace-and-spares-a-claimed-run
   (let [{:keys [ctx e clock]} (world)
         rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
     ;; a live claim (a wave claim included) keeps the section touched: the
@@ -171,14 +173,131 @@
     (swap! clock + (* 120 60000))
     (swap! (:state ctx) update-in [:active "flow-payment@dcabc123"] assoc :last-touch @clock)
     (let [pass (ops/reap! ctx)]
-      (is (empty? (isolated/after-reap! ctx (:reaped pass))))
-      (is (contains? (stub/volumes e) "dc-dcabc123_pgdata") "a claimed run keeps its volumes"))
+      (is (empty? (isolated/after-reap! ctx (:reaped pass) ok-roster)))
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "a claimed run is never marked"))
+    (swap! (:state ctx) update-in [:active "flow-payment@dcabc123"] dissoc :claims)
     (swap! clock + (* 120 60000))
-    (let [pass (ops/reap! (assoc-in ctx [:settings :compose/claim-ttl-minutes] 30))
-          ended (isolated/after-reap! ctx (:reaped pass))]
-      (is (= [rid] (map :run ended)))
-      (is (= ["dc-dcabc123_pgdata"] (get-in (first ended) [:volumes :removed])))
-      (is (contains? (stub/volumes e) "dc_pgdata")))))
+    (let [pass (ops/reap! ctx)
+          ended (isolated/after-reap! ctx (:reaped pass) ok-roster)]
+      (testing "step 1: the run ends, its volumes are only marked"
+        (is (= [rid] (map :run ended)))
+        (is (= (+ @clock (* 60 60000)) (:volumes-due-at (first ended))))
+        (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))
+        (is (= [{:run rid :name "dc-dcabc123_pgdata" :due-at (+ @clock (* 60 60000))}]
+               (:stale-run-volumes (isolated/status ctx)))))
+      (testing "the same pass sweeps nothing (not due yet)"
+        (is (empty? (isolated/sweep-due! ctx)))
+        (is (contains? (stub/volumes e) "dc-dcabc123_pgdata")))
+      (testing "step 2: a later pass past the grace removes only the run's own volumes"
+        (swap! clock + (* 61 60000))
+        (is (= [rid] (map :run (isolated/sweep-due! ctx))))
+        (is (not (contains? (stub/volumes e) "dc-dcabc123_pgdata")))
+        (is (contains? (stub/volumes e) "dc_pgdata"))))))
+
+(defn- reaped-run [ctx clock]
+  (let [rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+    (swap! clock + (* 120 60000))
+    [rid (:reaped (ops/reap! ctx))]))
+
+(deftest a-doubtful-reap-never-marks
+  (testing "an absent swarm"
+    (let [{:keys [ctx e clock]} (world)
+          [rid reaped] (reaped-run ctx clock)
+          row (first (isolated/after-reap! ctx reaped {:swarm :absent :agents 0 :expired []}))]
+      (is (= :doubtful-roster (:volumes-kept-why row)))
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))
+      (swap! clock + (* 24 60 60000))
+      (is (empty? (isolated/sweep-due! ctx)) "a clock jump of a day removes nothing either")
+      (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))))
+  (testing "an empty roster"
+    (let [{:keys [ctx clock]} (world)
+          [rid reaped] (reaped-run ctx clock)]
+      (isolated/after-reap! ctx reaped {:swarm :ok :agents 0 :expired []})
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))))
+  (testing "a claim that ended as :gone"
+    (let [{:keys [ctx clock]} (world)
+          rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+          gone {:swarm :ok :agents 3 :expired [{:section (str "flow-payment@" rid) :agent "ling-9" :reason :gone}]}]
+      (isolated/note-observed! ctx gone)
+      (swap! clock + (* 120 60000))
+      (let [row (first (isolated/after-reap! ctx (:reaped (ops/reap! ctx)) ok-roster))]
+        (is (= :claim-gone (:volumes-kept-why row)))
+        (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))))))
+
+(deftest up-claim-or-touch-cancels-a-pending-removal
+  (let [{:keys [ctx e clock]} (world)
+        [rid reaped] (reaped-run ctx clock)]
+    (isolated/after-reap! ctx reaped ok-roster)
+    (is (get-in @(:state ctx) [:runs rid :volumes-due-at]))
+    (let [x (isolated/up! ctx (preset ctx "flow-payment") {:run rid})]
+      (is (r/ok? x) (pr-str x)))
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))
+    (is (nil? (get-in @(:state ctx) [:runs rid :ended-at])))
+    (swap! clock + (* 200 60000))
+    (is (empty? (isolated/sweep-due! ctx)))
+    (is (contains? (stub/volumes e) "dc-dcabc123_pgdata")))
+  (let [{:keys [ctx clock]} (world)
+        [rid reaped] (reaped-run ctx clock)]
+    (isolated/after-reap! ctx reaped ok-roster)
+    (isolated/cancel-due! ctx (str "flow-payment@" rid))
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))))
+
+(deftest b1-a-run-must-own-its-compose-project
+  (let [{:keys [ctx e]} (world)]
+    ;; a foreign project that happens to be named dc-web: a container and a volume
+    (swap! (:world e) assoc-in [:containers "dc-web-pg-1"]
+           {:project "dc-web" :service "pg" :labels {"com.docker.compose.project" "dc-web"} :state "running"})
+    (stub/volumes! e {"dc-web_pgdata" {:labels {"com.docker.compose.project" "dc-web" "com.docker.compose.volume" "pgdata"}}})
+    (let [x (isolated/up! ctx (preset ctx "flow-sync") {:run "web"})]
+      (is (= :compose/could-not-run (:error x)))
+      (is (= :project-exists (:reason x)))
+      (is (= {:containers 1 :volumes 1 :networks 0} (:found x))))
+    (is (= :project-exists (:reason (isolated/plan ctx (preset ctx "flow-sync") {:run "web"}))) "dry_run too")
+    (is (not-any? #(= :up (first %)) (stub/calls e)) "nothing started")
+    (testing "a hand-made record cannot aim the removal at the foreign volume"
+      (swap! (:state ctx) assoc-in [:runs "web"] (assoc (iso/run-entry "dc" "web" :strip 1) :ended-at 2))
+      (is (= :compose/run-still-active (:error (isolated/down-run! ctx "web" true)))
+          "a container of the project exists")
+      (swap! (:world e) update :containers dissoc "dc-web-pg-1")
+      (let [d (isolated/down-run! ctx "web" true)]
+        (is (= [] (get-in d [:ok :volumes :removed])) (pr-str d))
+        (is (= ["dc-web_pgdata"] (get-in d [:ok :volumes :not-removable])))
+        (is (contains? (stub/volumes e) "dc-web_pgdata"))))))
+
+(deftest m2-another-agents-claim-blocks-volume-removal
+  (let [{:keys [ctx e]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+    (swap! (:state ctx) assoc-in [:active (str "flow-payment@" rid) :claims "ling-b"] {:since 1 :seen 1})
+    (let [x (isolated/down-run! ctx rid true {:agent "ling-a"})]
+      (is (= :compose/held-by-another-section (:error x)))
+      (is (= [{:section (str "flow-payment@" rid) :agents ["ling-b"]}] (:holders x))))
+    (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))
+    (testing "the caller's own claim does not block; allow_shared overrides"
+      (is (r/ok? (isolated/down-run! ctx rid true {:agent "ling-b"}))))))
+
+(deftest m3-an-ended-record-cannot-remove-a-live-runs-volumes
+  (let [{:keys [ctx e]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+    (swap! (:state ctx) assoc-in [:runs rid :ended-at] 5)
+    (let [x (isolated/down-run! ctx rid true)]
+      (is (= :compose/run-still-active (:error x)) (pr-str x)))
+    (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))))
+
+(deftest m4-external-volumes-and-binds
+  (let [{:keys [ctx e]} (world)]
+    (stub/model! e "dc" (-> model
+                            (assoc-in ["volumes" "ledger"] {"name" "ledger-prod" "external" true})
+                            (update-in ["services" "worker" "volumes"] (fnil conj [])
+                                       {"type" "volume" "source" "ledger" "target" "/l"})
+                            (update-in ["services" "worker" "volumes"] conj
+                                       {"type" "bind" "source" "/w/sync" "target" "/src" "read_only" true})))
+    (let [x (isolated/up! ctx (preset ctx "flow-sync") {})]
+      (is (= :compose/fresh-external-volume (:error x)))
+      (is (= ["ledger"] (:volumes x))))
+    (let [x (isolated/plan ctx (update (preset ctx "flow-sync") :profile/run-shared-volumes (fnil conj []) "ledger") {})]
+      (is (r/ok? x) (pr-str x))
+      (is (= ["ledger"] (get-in x [:ok :volumes :external])))
+      (is (= [{:service "worker" :source "/w/sync" :target "/src" :rw? false}] (get-in x [:ok :binds]))))))
 
 (deftest status-of-a-run
   (let [{:keys [ctx e]} (world)
@@ -199,31 +318,74 @@
 
 (def gen-run (gen/fmap #(apply str %) (gen/vector (gen/elements "abcdef0123456789") 3 12)))
 
-(def gen-volume
-  (gen/let [proj (gen/elements ["dc" "dc-r1x" "other" nil])
-            run-in-name? gen/boolean
-            key (gen/elements ["pgdata" "fb" "cache"])]
-    {:name (str (or proj "anon") "_" key (when run-in-name? "-RUN"))
-     :labels (cond-> {} proj (assoc "com.docker.compose.project" proj "com.docker.compose.volume" key))}))
+(def gen-base
+  "Bases, some with dashes, so <base>-<run> collides with <base'>-<run'>."
+  (gen/elements ["dc" "dc-x" "dc-xab" "sisf" "sisf-web" "a-b-c"]))
 
-(defspec removable-is-a-subset-of-the-runs-own-volumes 300
-  (prop/for-all [run gen-run
-                 recorded? gen/boolean
-                 vols (gen/vector gen-volume 0 8)
-                 shared (gen/elements [[] ["cache"]])]
-    (let [cp (iso/compose-project "dc" run)
-          vols (map #(-> % (update :name str/replace "RUN" run)
-                         (update :labels (fn [l] (if (= "dc-r1x" (get l "com.docker.compose.project"))
-                                                   (assoc l "com.docker.compose.project" cp) l))))
-                    vols)
-          runs (if recorded? {run (assoc (iso/run-entry "dc" run :strip 1) :shared-volumes shared)} {})
-          out (iso/removable runs run vols)]
+(defn- volume
+  "A volume of compose project `proj` with key `k`, carrying the run
+   ownership labels of [run base] when `owner` is given."
+  [proj k owner]
+  {:name (str proj "_" k)
+   :labels (cond-> {"com.docker.compose.project" proj "com.docker.compose.volume" k}
+             owner (assoc "hive.compose.run" (first owner) "hive.compose.base" (second owner)))})
+
+(def gen-case
+  "A run [base run], a world of volumes: the run's own (labelled), the same
+   project unlabelled (it existed before the run), foreign projects whose
+   name string-collides with <base>-<run> (base'-run' = base-run), prefix
+   runs, the shared project's, a borrowed cache; and a record, possibly
+   mutated."
+  (gen/let [base gen-base
+            run gen-run
+            k (gen/elements ["pgdata" "fb" "cache"])
+            pre (gen/elements ["ab" "abc"])
+            mutate (gen/elements [nil :no-isolated :other-base :other-cp :conflict :missing])
+            shared (gen/elements [[] ["cache"]])]
+    (let [cp (iso/compose-project base run)
+          ;; every split of cp at a dash other than the run's own one
+          foreign (for [i (range (count cp))
+                        :when (= \- (nth cp i))
+                        :let [b (subs cp 0 i) r (subs cp (inc i))]
+                        :when (not= [b r] [base run])]
+                    [b r])
+          vols (concat [(volume cp k [run base])
+                        (volume cp "pre" nil)
+                        (volume base k nil)
+                        (volume (str cp "x") k [(str run "x") base])
+                        (volume (iso/compose-project base (str pre run)) k [(str pre run) base])
+                        {:name (str base "_cache") :labels {"com.docker.compose.project" base}}]
+                       (for [[b r] foreign] (volume cp k [r b])))
+          rec (assoc (iso/run-entry base run :strip 1) :shared-volumes shared)
+          rec (case mutate
+                :no-isolated (dissoc rec :isolated?)
+                :other-base (assoc rec :base-project "zz")
+                :other-cp (assoc rec :compose-project base)
+                :conflict (assoc rec :conflict {:base-project "zz"})
+                rec)]
+      {:base base :run run :cp cp :vols (vec vols) :mutate mutate :shared shared
+       :runs (if (= :missing mutate) {} {run rec})})))
+
+(defspec removable-is-a-subset-of-the-runs-own-volumes 500
+  (prop/for-all [{:keys [base run cp vols runs mutate shared]} gen-case]
+    (let [out (iso/removable runs run vols)]
       (and (set/subset? (set out) (set vols))
-           (every? #(= cp (get-in % [:labels "com.docker.compose.project"])) out)
-           (every? #(str/includes? (:name %) run) out)
-           (not-any? #(= (str "dc_" %) (:name %)) shared)
-           (or recorded? (empty? out))
-           (empty? (iso/removable {"dc" {:run "dc" :base-project "dc" :compose-project "dc" :isolated? true}} "dc" vols))))))
+           ;; only volumes that carry BOTH ownership labels of this run and its project label
+           (every? #(and (= cp (get-in % [:labels "com.docker.compose.project"]))
+                         (= run (get-in % [:labels "hive.compose.run"]))
+                         (= base (get-in % [:labels "hive.compose.base"])))
+                   out)
+           ;; a foreign (base', run') sharing the project string is never taken
+           (every? #(and (= run (get-in % [:labels "hive.compose.run"]))) out)
+           ;; a borrowed cache volume is never removable
+           (not-any? (set (map #(str base "_" %) shared)) (map :name out))
+           ;; a mutated or missing record removes nothing
+           (or (nil? mutate) (empty? out))
+           ;; an unmutated record removes exactly the run's own labelled volume
+           (or (some? mutate) (= [(str cp "_" (get-in (first vols) [:labels "com.docker.compose.volume"]))]
+                                 (mapv :name out)))
+           ;; never the shared project's volumes
+           (empty? (iso/removable {base {:run base :base-project base :compose-project base :isolated? true}} base vols))))))
 
 (defspec config-digest-is-run-independent 100
   (prop/for-all [a gen-run b gen-run offset (gen/choose 0 2000)]
