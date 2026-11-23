@@ -36,6 +36,7 @@
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
             [hive-compose.promote.profile :as profile]
+            [hive-compose.promote.target :as target]
             [hive-compose.pipeline.restart :as restart]
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
@@ -214,7 +215,7 @@
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
    "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
    "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
-   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on), refused when another live section holds one of them unless allow_shared. target|profile; env; allow_orphans; allow_shared"
+   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on), refused when another live section holds one of them unless allow_shared. A target runs from the section holding its services (its dir, files and env); a recreate's env is remembered by that WHOLE section, so its other services that read a var get it at their next up. target|profile; env; allow_orphans; allow_shared"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
@@ -255,14 +256,15 @@
   [params]
   {:no-deps? (flag params "no_deps")
    :wait? (flag params "wait")
+   ;; a null value forgets that var from what the section remembers
    :env (some->> (param params "env")
-                 (into {} (map (fn [[k v]] [(name k) (env/from-param v)]))))})
+                 (into {} (map (fn [[k v]] [(name k) (when (some? v) (env/from-param v))]))))})
 
 (defn- checked-options
   "Result<opts>: `opts` when its env is an Env, else why not. The problems
    name the variable and the rule broken, never a value."
   [opts]
-  (if-let [problems (some->> (:env opts) (schema/explain schema/Env))]
+  (if-let [problems (some->> (:env opts) target/set-values (schema/explain schema/Env))]
     (r/err :compose/invalid-param {:param "env" :problems problems
                                    :hint "a value is a string or {\"pass\": \"<store path>\"}"})
     (r/ok opts)))
@@ -356,11 +358,20 @@
                                 (r/bind (ops/subject ctx {:target tgt :id id :env (:env o)})
                                         #(f (adjust % o))))))
         on-subject (fn [f] (on-subject* f (fn [p o] (profile/with-call-options p (select-keys o [:env])))))
+        ;; up, switch and restart: the subject with the compose inputs it must
+        ;; run with (remembered call env, holding section), see ops/effective-subject
+        on-effective (fn [f]
+                       (r/bind (checked-options opts)
+                               (fn [o]
+                                 (r/bind (ops/effective-subject ctx {:target tgt :id id :env (:env o)})
+                                         (fn [{:keys [profile section holder-skipped]}]
+                                           (cond-> (f (profile/with-call-options profile (dissoc o :env)) section o)
+                                             ;; a holder whose checkout is gone was not used: say so
+                                             holder-skipped (r/map-ok #(assoc % :holder-skipped holder-skipped))))))))
         ;; claim/release: target is first an active section id or a preset id
         on-section (fn [f] (r/bind (ops/section-subject ctx {:target tgt :id id}) f))
         claim-opts (fn [] (r/map-ok (ttl-minutes-param params)
-                                    (fn [t] {:note (some-> (param params "note") str) :ttl-minutes t})))
-        with-opts (fn [f] (on-subject* f profile/with-call-options))]
+                                    (fn [t] {:note (some-> (param params "note") str) :ttl-minutes t})))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
@@ -371,15 +382,19 @@
                          (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
-        "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
+        "up" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/up-profile! ctx p)))))
+        "switch" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/switch-profile! ctx p)))))
         "claim" (r/bind (claim-opts)
                         (fn [o]
                           (if-let [run (stacks/claim-run tgt)]
                             (stacks/claim! ctx run (agent-param params) o)
-                            (on-section (fn [p] (swarm/claim! ctx p (agent-param params)
-                                                              ;; a claim that must start the section passes up's guards
-                                                              (assoc o :start! #(guard p :up false (fn [] (ops/up-profile! ctx p))))))))))
+                            (on-section
+                             (fn [p0]
+                               ;; adopt and start use the inputs an up would (remembered
+                               ;; call env, holding section); the start passes up's guards
+                               (r/let-ok [{p :profile} (ops/effective-subject ctx (ops/claim-call ctx p0 tgt id))]
+                                 (swarm/claim! ctx p (agent-param params)
+                                               (assoc o :start! #(guard p :up false (fn [] (ops/up-profile! ctx p)))))))))))
         "release" (if-let [run (stacks/claim-run tgt)]
                     (stacks/release-claim! ctx run (agent-param params) {:stop? (flag params "stop")})
                     (on-section #(swarm/release-claim! ctx % (agent-param params)
@@ -399,9 +414,18 @@
                                   :project (some-> (param params "project") str)})
         "down" (on-subject #(ops/down-profile! ctx % :down))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
-        "restart" (with-opts (fn [p] (let [recreate? (flag params "recreate")]
-                                       (guard p :restart recreate?
-                                              #(restart/restart-profile! ctx p recreate?)))))
+        ;; a target is restarted from the live section holding its services (its
+        ;; dir, files and env); profile=<id> with a target names that section
+        ;; a recreate's env is remembered by the section it ran from (the holder)
+        "restart" (on-effective
+                   (fn [p section o]
+                     (let [recreate? (flag params "recreate")
+                           res (guard p :restart recreate? #(restart/restart-profile! ctx p recreate?))]
+                       (when (and recreate? (r/ok? res))
+                         (ops/remember-call-env! ctx (or section (:profile/id p)) (:env o))
+                         ;; recreated from p: an assumed section's inputs are now known
+                         (ops/inputs-known! ctx (or section (:profile/id p)) p))
+                       res)))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -458,7 +482,7 @@
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
-                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
+                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys); a null value (\"VAR\": null) forgets VAR (a no-op when not remembered); a reload that changes VAR's declared value forgets it too"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}
                               "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
@@ -577,6 +601,7 @@
               ctx' (assoc ctx :settings settings :engine (:engine fresh) :runner (:runner fresh))
               diff (config/settings-diff old settings)
               _ (swap! state assoc :cfg cfg :ctx ctx')
+              dropped (ops/drop-stale-call-env! ctx' old)
               sections (ops/rebase-sections! ctx' (:compose/projects old))]
           (r/ok (cond-> {:source source
                          :profiles (vec (sort (keys (:compose/profiles settings))))
@@ -589,7 +614,9 @@
                                          (seq (:restart-required diff))
                                          (conj (str "settings applied at the next initialize!: "
                                                     (str/join ", " (map name (:restart-required diff))))))}
-                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed"))))))))
+                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed")
+                  ;; {section [var]}: remembered call env whose declared value the reload changed
+                  (seq dropped) (assoc :call-env-dropped dropped))))))))
 
 (defn- initialize-addon! [a seed runtime-config]
   (let [{:keys [state]} a]

@@ -95,7 +95,8 @@
   [{:keys [active self project p services recreate?]}]
   (let [mine (inputs p)]
     (vec (for [{:keys [agents entry] :as h} (holders active self project services)
-               :let [differs (differences mine (inputs (:profile entry)))]
+               ;; a holder adopted with assumed inputs: what it runs from is unknown
+               :let [differs (differences mine (when-not (= :assumed (:inputs entry)) (inputs (:profile entry))))]
                :when (or recreate? (seq differs))]
            (cond-> (-> h
                        (dissoc :entry)
@@ -103,6 +104,61 @@
              (seq differs) (assoc :differs differs)
              (:orphaned-at entry) (assoc :orphaned? true)
              (empty? agents) (assoc :agents []))))))
+
+(defn section-holders
+  "[{:section id :services [s] :profile Profile}] of the active entries of
+   compose project `project` whose footprint holds any of `services` and that
+   kept the Profile they ran with, by section id. Orphaned ones count: their
+   containers still run the code they were created from, so they say where a
+   recreate must come from (liveness only decides who may object, see
+   `holders`). Pure."
+  [active project services]
+  (let [wanted (set services)]
+    (vec (for [[id a] (sort-by key active)
+               ;; an adoption whose inputs are assumed says nothing about where a recreate comes from
+               :when (and (= project (:project a)) (:profile a) (not= :assumed (:inputs a)))
+               :let [held (vec (sort (filter wanted (plan/footprint a))))]
+               :when (seq held)]
+           {:section id :services held :profile (:profile a)}))))
+
+(defn- same-inputs
+  "What two holders must share for a call to run from either: compose inputs,
+   compose project name and native profiles."
+  [p]
+  (assoc (inputs p) :project (:profile/project p) :compose-profiles (vec (:profile/compose-profiles p))))
+
+(defn pick-holder
+  "Which live section's compose inputs a call on `services` of `project` runs
+   with (card 20261123112129-701a7d69): {:holder Profile :section id} when the
+   sections holding them agree on dir, files and env (one section, or several
+   with equal inputs; the first by id answers), {:none true} when none does,
+   {:disagree [{:section :services :differs}]} when they differ, each row
+   saying what differs from the first. `only` (a section id or nil) narrows
+   the holders to that one section. Pure."
+  [active project services only]
+  (let [hs (cond->> (section-holders active project services)
+             only (filterv #(= only (:section %))))
+        [h & more] hs]
+    (cond
+      (nil? h) {:none true}
+      (every? #(= (same-inputs (:profile h)) (same-inputs (:profile %))) more)
+      {:holder (:profile h) :section (:section h)}
+      :else {:disagree (vec (for [x hs]
+                              (cond-> (select-keys x [:section :services])
+                                (not= x h) (assoc :differs (differences (inputs (:profile x))
+                                                                        (inputs (:profile h)))))))})))
+
+(defn outcomes
+  "{service \"recreated\"|\"kept\"|\"created\"|\"absent\"} of `services` from
+   the container ids before and after a call ({service id}): kept when the same
+   container still runs it, recreated when another replaced it, created when
+   it had none before, absent when it has none after. What the engine did,
+   not what was allowed. Pure."
+  [services before after]
+  (into (sorted-map)
+        (for [s services
+              :let [b (get before s) a (get after s)]]
+          [s (cond (nil? a) "absent" (nil? b) "created" (= a b) "kept" :else "recreated")])))
 
 (defn describe
   "One line naming each holder of `found`, its agents and what differs."

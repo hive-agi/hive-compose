@@ -72,17 +72,38 @@
           :hint (str "ask the owning agent first (or work in its section: claim its target), "
                      "or pass " override-param "=true to recreate anyway")}))
 
+(defn- container-ids
+  "{service id} of `services` of `p`'s project now, nil when the engine cannot
+   tell (no IContainerIds) or the read failed: the outcome is then unknown."
+  [ctx p services]
+  (let [engine (:engine ctx)]
+    (when (satisfies? port/IContainerIds engine)
+      (let [res (try (port/-container-ids engine p services)
+                     (catch Throwable _ nil))]
+        (when (r/ok? res) (:ok res))))))
+
 (defn guarded
   "Run `f` (a thunk answering a Result) unless another live section holds what
    call `mode` on `p` would recreate; `allow?` runs it anyway and the ok
-   answer carries :shared-overridden."
+   answer carries :shared-overridden, each holder row with :outcome {service
+   \"recreated\"|\"kept\"} read from the container ids before and after the
+   call (what the engine did), or :outcome-unknown true when the engine
+   cannot name its containers."
   [ctx p mode recreate? allow? f]
   (let [c (try (check ctx p mode recreate?)
                (catch Throwable t (r/err :compose/ownership-check-failed {:message (str t)})))
         found (when (r/ok? c) (seq (:ok c)))]
     (cond
       (and found (not allow?)) (refusal p found)
-      found (r/map-ok (f) #(assoc % :shared-overridden
-                                  (mapv (fn [h] (select-keys h [:section :agents :services :reason])) found)))
+      found (let [shared (vec (distinct (mapcat :services found)))
+                  before (container-ids ctx p shared)
+                  res (f)
+                  after (when (and before (r/ok? res)) (container-ids ctx p shared))]
+              (r/map-ok res #(assoc % :shared-overridden
+                                    (mapv (fn [h]
+                                            (cond-> (select-keys h [:section :agents :services :reason])
+                                              after (assoc :outcome (ownership/outcomes (:services h) before after))
+                                              (not after) (assoc :outcome-unknown true)))
+                                          found))))
       (r/err? c) (r/map-ok (f) #(assoc % :ownership-check (select-keys c [:error :message :category])))
       :else (f))))
