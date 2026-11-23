@@ -313,7 +313,13 @@
     (is (= [] (:reaped (stacks/reap! c))) "unrenewed for 4 h: the wave claim holds the run")
     (is (true? (get-in (stacks/stack-status c {:run run}) [:ok :stacks 0 :claims "coordinator:f07f8867" :wave?])))
     (is (r/ok? (stacks/release-claim! c run "coordinator:f07f8867" {})))
-    (is (get-in @(:state c) [:stacks run :orphaned-at]) "released: an orphan like any other")))
+    (is (get-in @(:state c) [:stacks run :orphaned-at]) "released: an orphan like any other")
+    (testing "a plain renewal after the wave ended says so, as a section's does"
+      (stacks/claim! c run "coordinator:f07f8867" {:note "gate" :ttl-minutes 1})
+      (swap! (:clock c) + (* 2 minute))
+      (let [res (stacks/claim! c run "coordinator:f07f8867" {})]
+        (is (string? (get-in res [:ok :wave-ended])))
+        (is (false? (get-in res [:ok :claim :wave?])))))))
 
 (deftest release-with-stop-takes-it-down
   (let [c (ctx)

@@ -597,14 +597,15 @@
         (str/blank? agent) (r/err :compose/missing-param {:param "agent"})
         (r/err? until) until
         (not (contains? (stacks ctx) rid)) (r/err :compose/unknown-run {:run rid :known (vec (sort (keys (stacks ctx))))})
-        :else (do
+        :else (let [lapsed? (sw/lapsed-wave (get-in (stacks ctx) [rid :claims agent]) t (:ok until))]
                 (record! ctx rid (fn [e] (-> e
                                              (update :claims sw/claim agent t {:note note :until (:ok until)})
                                              (assoc :last-touch t)
                                              (dissoc :orphaned-at))))
                 (let [claims (get-in (stacks ctx) [rid :claims])]
-                  (r/ok {:run rid :claims claims
-                         :claim (sw/claim-view (get claims agent) t (:claim-ttl-ms (ttls (:settings ctx))))})))))))
+                  (r/ok (cond-> {:run rid :claims claims
+                                 :claim (sw/claim-view (get claims agent) t (:claim-ttl-ms (ttls (:settings ctx))))}
+                          lapsed? (assoc :wave-ended "your wave claim had ended; this renewal without ttl_minutes holds the run as a plain claim, renewed within the claim TTL")))))))))
 
 (defn release-claim!
   "Result<{:run :claims ..}>: `agent` gives up run `rid`. With no claim left the

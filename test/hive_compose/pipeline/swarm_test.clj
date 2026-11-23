@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.swarm :as swarm]
+            [hive-compose.port :as port]
             [hive-compose.stub :as stub]
             [hive-compose.stub-runner :as stub-runner]
             [hive-compose.stub-swarm :as stub-swarm]
@@ -149,6 +150,55 @@
       (is (= ["ling-1"] (:claims (:ok res))))
       (is (= "api-repl" (get-in res [:ok :adopted :programs-not-started 0 :program/id])))
       (is (some? (get-in res [:ok :adopted :programs-not-started 0 :error]))))))
+
+(defn- gated-runner
+  "A program runner over stub runner `rn` whose -start! counts starts and, on
+   the first, waits until both claimers have entered claim! (`entered`) and
+   then up to 2 s for a second start (`second`): a claim that is not
+   serialized starts the program twice inside that window, a serialized one
+   cannot (the second claimer waits on the section lock)."
+  [rn entered starts second]
+  (reify port/IProgramRunner
+    (-facts [_ dir] (port/-facts rn dir))
+    (-start! [_ p log]
+      (swap! starts inc)
+      (.countDown ^java.util.concurrent.CountDownLatch second)
+      (.await ^java.util.concurrent.CountDownLatch entered 5 java.util.concurrent.TimeUnit/SECONDS)
+      (.await ^java.util.concurrent.CountDownLatch second 2 java.util.concurrent.TimeUnit/SECONDS)
+      (port/-start! rn p log))
+    (-alive? [_ pid] (port/-alive? rn pid))
+    (-listening? [_ port] (port/-listening? rn port))
+    (-nrepl-port [_ dir] (port/-nrepl-port rn dir))
+    (-halt! [_ pid] (port/-halt! rn pid))))
+
+(deftest concurrent-claims-on-an-untracked-running-section-start-its-programs-once
+  (let [entered (java.util.concurrent.CountDownLatch. 2)
+        second (java.util.concurrent.CountDownLatch. 2)
+        starts (atom 0)
+        c (assoc (ctx)
+                 :engine (stub/engine {} {"shop" #{"api" "postgres"}} model)
+                 :runner (gated-runner (stub-runner/runner) entered starts second))
+        p (section c "shop/api")
+        claim #(future (.countDown entered) (swarm/claim! c p % {}))
+        a (claim "ling-1")
+        b (claim "ling-2")
+        res [(deref a 10000 ::timeout) (deref b 10000 ::timeout)]]
+    (is (every? r/ok? res) (pr-str res))
+    (is (= 1 @starts) "the paired nREPL program is started once, not once per claimer")
+    (is (= #{:adopted :renewed} (set (map #(some #{:adopted :renewed} (keys (:ok %))) res)))
+        "one claimer adopts, the other finds it tracked and renews")
+    (is (= ["api-repl"] (keys (get-in @(:state c) [:active "shop/api" :programs]))) "recorded once")
+    (is (= ["ling-1" "ling-2"] (sort (keys (get-in @(:state c) [:active "shop/api" :claims])))))
+    (is (= [] (ups c)) "no engine start")))
+
+(deftest a-wave-claims-end-counts-from-after-a-slow-start
+  (let [c (ctx)
+        p (section c "shop/api")
+        res (:ok (swarm/claim! c p "coordinator:f07f8867"
+                               {:note "gate" :ttl-minutes 1
+                                :start! #(do (advance! c (* 2 minute)) (ops/up-profile! c p))}))]
+    (is (= (* 3 minute) (get-in res [:claim :until])) "now after the 2-minute up, plus 1 minute")
+    (is (= 60 (get-in res [:claim :expires-in-seconds])))))
 
 (deftest a-plain-renewal-after-the-owners-wave-ended-keeps-the-section
   (let [c (ctx)

@@ -348,7 +348,33 @@
 
 (defn- claim-ttl-ms [ctx] (* 60000 (setting ctx :compose/claim-ttl-minutes)))
 
+(defonce ^:private section-locks
+  ;; One monitor per section id, for the life of the JVM: a claim's sync,
+  ;; adopt, start and write run under it (see `claim!`). A dedicated Object per
+  ;; id from this registry, never an interned string, which any code could
+  ;; lock. Bounded by the number of section ids ever claimed.
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- section-lock
+  "The monitor `claim!` holds for section `sid`."
+  [sid]
+  (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap section-locks sid
+                    (reify java.util.function.Function (apply [_ _] (Object.)))))
+
+(declare claim-locked!)
+
 (defn claim!
+  "Result: `agent` claims section `p` (see `claim-locked!`), serialized per
+   section id: concurrent claims on one section run their state-file sync,
+   adopt, start and claim write one after another, so the second sees the
+   section the first adopted or started and renews it instead of starting
+   its host programs or containers again. Claims on other sections are not
+   held up."
+  [ctx p agent opts]
+  (locking (section-lock (:profile/id p))
+    (claim-locked! ctx p agent opts)))
+
+(defn- claim-locked!
   "Result: `agent` claims section `p`. The answer carries the section's shared
    nREPL routes with advice, so the agent drives them instead of starting its
    own JVM; `note` says what the agent works on.
@@ -371,8 +397,10 @@
   [ctx p agent {:keys [note ttl-minutes start!]}]
   (if (str/blank? agent)
     (r/err :compose/missing-param {:param "agent" :hint "the claiming agent's id"})
-    (r/let-ok [until (sw/wave-until ((:now ctx)) ttl-minutes
-                                    (setting ctx :compose/claim-max-ttl-minutes) note)]
+    ;; validated up front, so a refused wave claim starts nothing; its end is
+    ;; taken again from the clock read after a start (`until` below)
+    (r/let-ok [_valid (sw/wave-until ((:now ctx)) ttl-minutes
+                                     (setting ctx :compose/claim-max-ttl-minutes) note)]
       (let [sid (:profile/id p)
             known (synced-active ctx sid)
             adopted (when-not known (adopt-running! ctx p))
@@ -389,21 +417,25 @@
           (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
           :else
           (let [now ((:now ctx))
+                until (:ok (sw/wave-until now ttl-minutes (setting ctx :compose/claim-max-ttl-minutes) note))
                 live (some->> (agents ctx) (into #{} (map :agent/id)))
                 swarm? (when live (contains? live agent))
                 before (get-in @(:state ctx) [:active sid :claims agent])
-                lapsed? (sw/lapsed-wave before now until)]
-            (swap! (:state ctx)
-                   (fn [st] (if (get-in st [:active sid])
-                              (update-in st [:active sid]
-                                         #(-> %
-                                              (update :claims sw/claim agent now {:note note :swarm? swarm? :until until})
-                                              (assoc :last-touch now)
-                                              (dissoc :orphaned-at)))
-                              st)))
+                lapsed? (sw/lapsed-wave before now until)
+                [old _] (swap-vals! (:state ctx)
+                                    (fn [st] (if (get-in st [:active sid])
+                                               (update-in st [:active sid]
+                                                          #(-> %
+                                                               (update :claims sw/claim agent now {:note note :swarm? swarm? :until until})
+                                                               (assoc :last-touch now)
+                                                               (dissoc :orphaned-at)))
+                                               st)))
+                a (get-in @(:state ctx) [:active sid])
+                c (get-in a [:claims agent])]
             (persist! ctx)
-            (let [a (get-in @(:state ctx) [:active sid])
-                  c (get-in a [:claims agent])]
+            (if-not (get-in old [:active sid])
+              ;; the reaper forgot it between the check and the write: no claim was written
+              (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
               (r/ok (cond-> {:profile sid
                              :agent agent
                              :claims (vec (sort (keys (:claims a))))
