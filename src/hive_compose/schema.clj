@@ -80,6 +80,9 @@
    ;; the env a call gave (up/switch/restart env=), kept so a later call on the
    ;; same section never falls back to weaker env; references stay references
    [:profile/call-env {:optional true} Env]
+   ;; a target section that runs from another (holding) section's dir, files
+   ;; and env: its id; a reload then keeps those and rebases only the rest
+   [:profile/inputs-from {:optional true} ProfileId]
    [:profile/wait? {:optional true} :boolean]
    [:profile/no-deps? {:optional true} :boolean]
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]

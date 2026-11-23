@@ -48,20 +48,32 @@
   [:profile/dir :profile/files :profile/project :profile/programs :profile/env
    :profile/ttl-minutes :profile/idle-action :profile/activity])
 
+(def ^:private holder-independent
+  "Profile keys a section takes from its project even when it runs from
+   another section's checkout (:profile/inputs-from)."
+  [:profile/programs :profile/ttl-minutes :profile/idle-action :profile/activity])
+
 (defn rebase-section
   "Snapshot `snap` of an active section re-based on its project as configured
    now (`new-proj`; `old-proj` as it was when the snapshot was taken): dir,
    files, compose name, programs, env, TTL and idle action follow `new-proj`.
    The id, services and per-call flags stay; env entries the call added over
-   `old-proj`'s env stay over `new-proj`'s."
+   `old-proj`'s env stay over `new-proj`'s.
+
+   A snapshot that runs from another section's checkout
+   (:profile/inputs-from) keeps its dir, files, compose name and env: only
+   programs, TTL, idle action and activity follow the project."
   [old-proj new-proj snap]
-  (let [old-env (:project/env old-proj)
-        extra (into {} (remove (fn [[k v]] (= v (get old-env k)))) (:profile/env snap))
-        base (dissoc (project-profile new-proj) :profile/id :profile/wait?)
-        ;; a remembered call env stays strongest, even where it equals the old project's
-        env (merge (:profile/env base) extra (:profile/call-env snap))]
-    (cond-> (merge (apply dissoc snap project-derived) (dissoc base :profile/env))
-      (seq env) (assoc :profile/env env))))
+  (if (:profile/inputs-from snap)
+    (let [base (project-profile new-proj)]
+      (merge (apply dissoc snap holder-independent) (select-keys base holder-independent)))
+    (let [old-env (:project/env old-proj)
+          extra (into {} (remove (fn [[k v]] (= v (get old-env k)))) (:profile/env snap))
+          base (dissoc (project-profile new-proj) :profile/id :profile/wait?)
+          ;; a remembered call env stays strongest, even where it equals the old project's
+          env (merge (:profile/env base) extra (:profile/call-env snap))]
+      (cond-> (merge (apply dissoc snap project-derived) (dissoc base :profile/env))
+        (seq env) (assoc :profile/env env)))))
 
 ;; ---------------------------------------------------------------------------
 ;; effective compose inputs (card 20261123112129-701a7d69)
@@ -97,12 +109,16 @@
 (defn declared-env
   "The env section or preset `id` declares in `settings` now: a configured
    preset's :profile/env, else the :project/env of the project a
-   `<project>/<names>` section belongs to; nil when neither is configured."
-  [settings id]
-  (if-let [c (get-in settings [:compose/profiles id])]
-    (:profile/env c)
-    (let [[pid sec] (str/split (str id) #"/" 2)]
-      (when sec (get-in settings [:compose/projects pid :project/env])))))
+   `<project>/<names>` section belongs to; nil when neither is configured.
+   `inputs-from` (a snapshot's :profile/inputs-from): the section it runs
+   from declares instead."
+  ([settings id] (declared-env settings id nil))
+  ([settings id inputs-from]
+   (let [id (or inputs-from id)]
+     (if-let [c (get-in settings [:compose/profiles id])]
+       (:profile/env c)
+       (let [[pid sec] (str/split (str id) #"/" 2)]
+         (when sec (get-in settings [:compose/projects pid :project/env])))))))
 
 (defn peel-call-env
   "Snapshot `snap`, whose :profile/env holds its remembered call env, with

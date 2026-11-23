@@ -123,17 +123,18 @@
   (mapv #(assoc % :advice (sw/route-advice %)) rs))
 
 (defn nrepl-answer
-  "The nREPL routes a claim answers with: every route with its advice for a
-   first claim or an adoption; for a renewal (`renewed?`) only the running
-   ones, the others as a count with the hint to ask for one by path (card
+  "{:nrepl [route] :nrepl-not-running n :nrepl-hint s}, merged into a claim
+   answer: :nrepl is always a list, every route with its advice for a first
+   claim or an adoption; for a renewal (`renewed?`) only the running ones,
+   the others counted beside it with the hint to ask for one by path (card
    20261123125953-1956fd03: a renewal repeated ~1k tokens of advice)."
   [rs renewed?]
   (if-not renewed?
-    (with-advice rs)
+    {:nrepl (with-advice rs)}
     (let [{running true others false} (group-by (comp boolean :running?) rs)]
-      (cond-> {:running (with-advice (vec running))}
-        (seq others) (assoc :not-running (count others)
-                            :hint "compose nrepl path=<file> answers the route of a module that does not run")))))
+      (cond-> {:nrepl (with-advice (vec running))}
+        (seq others) (assoc :nrepl-not-running (count others)
+                            :nrepl-hint "compose nrepl path=<file> answers the route of a module that does not run")))))
 
 (defn section-routes
   "The routes of active entry `a`'s compose project: the shared nREPLs of the
@@ -452,15 +453,15 @@
             (if-not (get-in old [:active sid])
               ;; the reaper forgot it between the check and the write: no claim was written
               (r/err :compose/not-active {:profile sid :hint "the section was released meanwhile; claim again"})
-              (r/ok (cond-> {:profile sid
-                             :agent agent
-                             :claims (vec (sort (keys (:claims a))))
-                             :claim (sw/claim-view c now (claim-ttl-ms ctx))
-                             :claim-ttl-minutes (setting ctx :compose/claim-ttl-minutes)
-                             :renew (if (sw/wave? c)
-                                      "a wave claim: it holds until :until whether or not its owner stays in the swarm; claim again with ttl_minutes to move it, release when done"
-                                      "claim again (or touch) before the claim TTL runs out; release when done")
-                             :nrepl (nrepl-answer (section-routes (routes ctx) a) (and known (not taken) (not up)))}
+              (r/ok (cond-> (merge {:profile sid
+                                    :agent agent
+                                    :claims (vec (sort (keys (:claims a))))
+                                    :claim (sw/claim-view c now (claim-ttl-ms ctx))
+                                    :claim-ttl-minutes (setting ctx :compose/claim-ttl-minutes)
+                                    :renew (if (sw/wave? c)
+                                             "a wave claim: it holds until :until whether or not its owner stays in the swarm; claim again with ttl_minutes to move it, release when done"
+                                             "claim again (or touch) before the claim TTL runs out; release when done")}
+                                   (nrepl-answer (section-routes (routes ctx) a) (and known (not taken) (not up))))
                       known (assoc :renewed {:profile sid :services (:services a)})
                       taken (assoc :adopted (cond-> {:profile sid :services (:services a)}
                                               (seq (:programs taken)) (assoc :programs (:programs taken))

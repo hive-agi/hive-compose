@@ -204,7 +204,7 @@
    "switch" "make a section current, stopping what only the previous one needed. same params as up"
    "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
    "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
-   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on), refused when another live section holds one of them unless allow_shared. target|profile; env; allow_orphans; allow_shared"
+   "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on), refused when another live section holds one of them unless allow_shared. A target runs from the section holding its services (its dir, files and env); a recreate's env is remembered by that WHOLE section, so its other services that read a var get it at their next up. target|profile; env; allow_orphans; allow_shared"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
@@ -333,8 +333,10 @@
                        (r/bind (checked-options opts)
                                (fn [o]
                                  (r/bind (ops/effective-subject ctx {:target tgt :id id :env (:env o)})
-                                         (fn [{:keys [profile section]}]
-                                           (f (profile/with-call-options profile (dissoc o :env)) section o))))))
+                                         (fn [{:keys [profile section holder-skipped]}]
+                                           (cond-> (f (profile/with-call-options profile (dissoc o :env)) section o)
+                                             ;; a holder whose checkout is gone was not used: say so
+                                             holder-skipped (r/map-ok #(assoc % :holder-skipped holder-skipped))))))))
         ;; claim/release: target is first an active section id or a preset id
         on-section (fn [f] (r/bind (ops/section-subject ctx {:target tgt :id id}) f))
         claim-opts (fn [] (r/map-ok (ttl-minutes-param params)
@@ -388,7 +390,9 @@
                      (let [recreate? (flag params "recreate")
                            res (guard p :restart recreate? #(restart/restart-profile! ctx p recreate?))]
                        (when (and recreate? (r/ok? res))
-                         (ops/remember-call-env! ctx (or section (:profile/id p)) (:env o)))
+                         (ops/remember-call-env! ctx (or section (:profile/id p)) (:env o))
+                         ;; recreated from p: an assumed section's inputs are now known
+                         (ops/inputs-known! ctx (or section (:profile/id p)) p))
                        res)))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))

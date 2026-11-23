@@ -635,6 +635,10 @@
             [svc id]))))
 
 (extend-type CliEngine
+  port/IDirProbe
+  (-dir-exists? [_ dir] (.isDirectory (io/file (str dir)))))
+
+(extend-type CliEngine
   port/IContainerIds
   (-container-ids [{:keys [exec timeout-ms]} p services]
     (if (empty? services)

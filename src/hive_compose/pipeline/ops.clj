@@ -148,7 +148,14 @@
   "`p` (as `lookup` answers it for `id`) with its remembered call env taken
    off :profile/env, so a var a call forgets falls back to what `id` declares."
   [ctx id p]
-  (target/peel-call-env p (target/declared-env (:settings ctx) id)))
+  (target/peel-call-env p (target/declared-env (:settings ctx) id (:profile/inputs-from p))))
+
+(defn- dir-exists?
+  "Whether `dir` exists, through the engine's IDirProbe; an engine without
+   one counts every dir as present."
+  [ctx dir]
+  (let [e (:engine ctx)]
+    (if (satisfies? port/IDirProbe e) (boolean (port/-dir-exists? e dir)) true)))
 
 (defn- holder-of
   "{:holder Profile :section id} | {:none true} | {:disagree [..]}: the active
@@ -157,54 +164,69 @@
    remembered call env peeled off. `only` narrows to one section id."
   [ctx self project services only]
   (let [active (dissoc (:active @(:state ctx)) self)
-        pick (ownership/pick-holder active project services (when-not (= only self) only))]
-    (if-let [h (:holder pick)]
-      (assoc pick :holder (peeled ctx (:section pick) h))
-      pick)))
+        pick (ownership/pick-holder active project services (when-not (= only self) only))
+        h (:holder pick)]
+    (cond
+      (nil? h) pick
+      ;; its checkout was removed: it says nothing about where a recreate comes from
+      (and (:profile/dir h) (not (dir-exists? ctx (:profile/dir h))))
+      {:none true :holder-skipped {:section (:section pick) :dir (:profile/dir h)
+                                   :reason "its dir no longer exists"}}
+      :else (assoc pick :holder (peeled ctx (:section pick) h)))))
 
 (defn effective-subject
-  "Result<{:profile Profile :section holder-id-or-nil}>: the subject of an
-   engine-reaching call (up, switch, restart; claim's start) with the compose
-   inputs it must run with, through `promote.target/effective-profile`:
+  "Result<{:profile Profile :section holder-id-or-nil :holder-skipped ..}>:
+   the subject of an engine-reaching call (up, switch, restart; claim's start)
+   with the compose inputs it must run with, through
+   `promote.target/effective-profile`:
    - `id` (profile=): the preset or active snapshot (`lookup`), its remembered
      call env re-applied under this call's `env`;
-   - `target`: the section resolved from the project as configured now, with
-     the call env its active entry remembers (an `up` of an active section
-     never falls back to the project env), re-addressed at the active
-     section that holds the services it names (orphaned ones too: they still
-     run that code), whose dir, files and env it then uses. Holders that
-     disagree are :compose/holders-disagree naming them; `id` beside a
+   - `target`, ACTIVE: its own snapshot is its holder (the dir, files and env
+     it was created from, its remembered call env), unless its inputs are
+     only assumed (an adoption nothing explained), when the active section
+     holding its services decides as below;
+   - `target`, not active: the section resolved from the project as configured
+     now, re-addressed at the active section that holds the services it names
+     (orphaned ones too: they still run that code), whose dir, files and env
+     it then uses and whose id it records under :profile/inputs-from. A holder
+     whose dir no longer exists is skipped (:holder-skipped names it). Holders
+     that disagree are :compose/holders-disagree naming them; `id` beside a
      target names the one to use. Held by none: the project defaults.
-   `env` is this call's env; a nil value forgets that var. :section names
-   the holder the call ran from, nil when none."
+   `env` is this call's env; a nil value forgets that var. :section names the
+   holder the call ran from, nil when none."
   [ctx {:keys [target id env]}]
   (if-not (seq target)
     (r/let-ok [p (subject ctx {:id id})]
       (r/ok {:profile (target/effective-profile (peeled ctx id p) {:call-env env})}))
     (r/let-ok [p0 (subject ctx {:target target :env (target/set-values env)})]
       (let [sid (:profile/id p0)
-            own (:profile (active-entry ctx sid))
-            ce (:profile/call-env own)
-            p (cond-> (peeled ctx sid p0) (seq ce) (assoc :profile/call-env ce))
-            services (vec (:profile/services p))
-            ;; an active section runs from its own inputs, unless profile= names another
-            pick (if (and own (or (nil? id) (= id sid)))
-                   {:none true}
-                   (holder-of ctx sid (profile/project p) services id))]
-        (cond
-          (:holder pick) (r/ok {:profile (assoc (target/effective-profile p {:holder (:holder pick) :call-env env})
-                                                :profile/services services)
-                                :section (:section pick)})
-          (:disagree pick) (r/err :compose/holders-disagree
-                                  {:target sid :services services :holders (:disagree pick)
-                                   :message (str "the active sections holding " (str/join ", " services)
-                                                 " run with different compose inputs: "
-                                                 (str/join ", " (map :section (:disagree pick))))
-                                   :hint "name the section to run from with profile=<id>"})
-          (and id (not= id sid)) (r/err :compose/not-a-holder
-                                        {:profile id :services services
-                                         :hint (str id " holds none of " (str/join ", " services))})
-          :else (r/ok {:profile (target/effective-profile p {:call-env env})}))))))
+            entry (active-entry ctx sid)
+            own (:profile entry)
+            services (vec (:profile/services p0))
+            self? (and own (not= :assumed (:inputs entry)) (or (nil? id) (= id sid)))]
+        (if self?
+          ;; an active section is its own holder: what it was created from
+          (r/ok {:profile (assoc (target/effective-profile (peeled ctx sid own) {:call-env env})
+                                 :profile/services services)})
+          (let [p (cond-> (peeled ctx sid p0) (seq (:profile/call-env own)) (assoc :profile/call-env (:profile/call-env own)))
+                pick (holder-of ctx sid (profile/project p) services id)
+                skipped (:holder-skipped pick)]
+            (cond
+              (:holder pick) (r/ok {:profile (assoc (target/effective-profile p {:holder (:holder pick) :call-env env})
+                                                    :profile/services services
+                                                    :profile/inputs-from (:section pick))
+                                    :section (:section pick)})
+              (:disagree pick) (r/err :compose/holders-disagree
+                                      {:target sid :services services :holders (:disagree pick)
+                                       :message (str "the active sections holding " (str/join ", " services)
+                                                     " run with different compose inputs: "
+                                                     (str/join ", " (map :section (:disagree pick))))
+                                       :hint "name the section to run from with profile=<id>"})
+              (and id (not= id sid) (not skipped)) (r/err :compose/not-a-holder
+                                                          {:profile id :services services
+                                                           :hint (str id " holds none of " (str/join ", " services))})
+              :else (r/ok (cond-> {:profile (target/effective-profile p {:call-env env})}
+                            skipped (assoc :holder-skipped skipped))))))))))
 
 (defn claim-call
   "The `effective-subject` call of a claim on section `p` (as
@@ -237,9 +259,22 @@
    as after an up: what a recreate ran with is what the section runs with.
    Nothing when `id` is not active or `env` is empty."
   [ctx id env]
-  (when (and (seq env) (:profile (active-entry ctx id)))
+  (when-let [snap (and (seq env) (:profile (active-entry ctx id)))]
     (swap! (:state ctx) update-in [:active id :profile]
-           target/remember-call-env env (target/declared-env (:settings ctx) id))
+           target/remember-call-env env (target/declared-env (:settings ctx) id (:profile/inputs-from snap)))
+    (persist! ctx)))
+
+(defn inputs-known!
+  "A recreate of active entry `id` ran with Profile `p`: when its inputs were
+   only assumed, they are now `p`'s (its services kept), no longer assumed."
+  [ctx id p]
+  (when (= :assumed (get-in @(:state ctx) [:active id :inputs]))
+    (swap! (:state ctx) update-in [:active id]
+           (fn [a] (-> a
+                       (dissoc :inputs)
+                       (assoc :profile (cond-> (assoc p :profile/id id)
+                                         (get-in a [:profile :profile/services])
+                                         (assoc :profile/services (get-in a [:profile :profile/services])))))))
     (persist! ctx)))
 
 (defn drop-stale-call-env!
@@ -253,16 +288,17 @@
         dropped (into (sorted-map)
                       (for [[id a] (:active @(:state ctx))
                             :let [ce (get-in a [:profile :profile/call-env])
+                                  from (get-in a [:profile :profile/inputs-from])
                                   ks (when (seq ce)
-                                       (target/stale-call-env-keys (target/declared-env old id)
-                                                                   (target/declared-env new id) ce))]
+                                       (target/stale-call-env-keys (target/declared-env old id from)
+                                                                   (target/declared-env new id from) ce))]
                             :when (seq ks)]
                         [id ks]))]
     (when (seq dropped)
       (swap! (:state ctx) update :active
              (fn [m] (reduce-kv (fn [m id ks]
                                   (update-in m [id :profile] target/forget-call-env ks
-                                             (target/declared-env new id)))
+                                             (target/declared-env new id (get-in m [id :profile :profile/inputs-from]))))
                                 m dropped)))
       (persist! ctx))
     dropped))
@@ -821,8 +857,11 @@
                            :let [closure (port/-closure engine p)]
                            :when (r/ok? closure)
                            :let [running (port/-running engine p)]
-                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))]
-                       (adopt-entry p (:ok closure) now)))
+                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))
+                           ;; what a holder says it runs from, else assumed
+                           :let [{p' :profile assumed? :assumed?} (adopt-profile ctx p)]]
+                       (cond-> (adopt-entry p' (:ok closure) now)
+                         assumed? (assoc :inputs :assumed))))
         _ (swap! (:state ctx) update :active into (map (juxt :profile/id identity)) presets)
         owned (fn [project taken]
                 (into #{} (comp (filter #(= project (:project %))) (mapcat :services))
@@ -840,8 +879,10 @@
                            (if (seq unowned)
                              (let [closure (port/-closure engine (assoc whole :profile/services unowned))
                                    needs (if (r/ok? closure) (:ok closure) unowned)]
-                               (conj taken (adopt-entry (target/section proj ["adopted"] unowned)
-                                                        unowned needs now)))
+                               ;; nothing says which checkout a stray came from
+                               (conj taken (assoc (adopt-entry (target/section proj ["adopted"] unowned)
+                                                               unowned needs now)
+                                                  :inputs :assumed)))
                              taken)))
                        []
                        (sort-by key (:compose/projects settings)))
@@ -911,6 +952,7 @@
                   (:profile a) (merge (target/inputs-summary (:profile a)))
                   ;; adopted running with nothing to say how it was started
                   (= :assumed (:inputs a)) (assoc :inputs "assumed")
+                  (get-in a [:profile :profile/inputs-from]) (assoc :inputs-from (get-in a [:profile :profile/inputs-from]))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)

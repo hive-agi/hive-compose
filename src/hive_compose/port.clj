@@ -68,6 +68,12 @@
     "Result<{service percent}>: the CPU use, in percent of one core, of each
      running service of the profile's project (the busiest of its containers)."))
 
+(defprotocol IDirProbe
+  "Optional engine capability: whether a project directory is there, so a
+   section whose checkout was removed is not used as the source of a recreate."
+  (-dir-exists? [e dir]
+    "True when `dir` is an existing directory."))
+
 (defprotocol IContainerIds
   "Optional engine capability: which container runs each service now, so a
    call can say whether it recreated a service or left it alone."
