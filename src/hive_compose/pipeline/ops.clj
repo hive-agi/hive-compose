@@ -781,11 +781,17 @@
            :running (vec (filter (set running) needs))})))
 
 (defn logs-profile
-  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active."
+  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active.
+   A profile with no compose project has no container log to read and asks
+   docker nothing: :compose/programs-only (its programs log under the log dir)."
   [ctx p tail]
-  (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
-    (touch-if-active! ctx p)
-    (r/ok out)))
+  (if (program/programs-only? p)
+    (r/err :compose/programs-only
+           {:profile (:profile/id p) :verb :logs
+            :hint "no compose project, so no container logs; its programs log to files under :compose/log-dir"})
+    (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
+      (touch-if-active! ctx p)
+      (r/ok out))))
 
 ;; ---------------------------------------------------------------------------
 ;; the same by preset or active id
@@ -873,6 +879,8 @@
         now ((:now ctx))
         presets (vec (for [[id p] (sort-by key (:compose/profiles settings))
                            :when (not (active-entry ctx id))
+                           ;; no compose project: nothing runs in docker to adopt
+                           :when (not (program/programs-only? p))
                            :let [closure (port/-closure engine p)]
                            :when (r/ok? closure)
                            :let [running (port/-running engine p)]
@@ -904,7 +912,9 @@
                                                   :inputs :assumed)))
                              taken)))
                        []
-                       (sort-by key (:compose/projects settings)))
+                       ;; a project with no compose project has no stray container
+                       (remove (comp program/programs-only? target/project-profile val)
+                               (sort-by key (:compose/projects settings))))
         adopted (into presets strays)]
     (when (seq strays)
       (swap! (:state ctx) update :active

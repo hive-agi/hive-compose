@@ -68,29 +68,35 @@
   [:set [:enum :nrepl :published :cpu]])
 
 (def Profile
-  [:map
-   [:profile/id ProfileId]
-   [:profile/dir [:string {:min 1}]]
-   [:profile/files {:optional true} [:vector [:string {:min 1}]]]
-   [:profile/project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
-   [:profile/compose-profiles {:optional true} [:vector ProfileId]]
-   [:profile/services {:optional true} [:vector [:string {:min 1}]]]
-   ;; false: no compose project, only host programs (Project :project/compose?)
-   [:profile/compose? {:optional true} :boolean]
-   [:profile/programs {:optional true} [:vector Program]]
-   [:profile/env {:optional true} Env]
-   ;; the env a call gave (up/switch/restart env=), kept so a later call on the
-   ;; same section never falls back to weaker env; references stay references
-   [:profile/call-env {:optional true} Env]
-   ;; a target section that runs from another (holding) section's dir, files
-   ;; and env: its id; a reload then keeps those and rebases only the rest
-   [:profile/inputs-from {:optional true} ProfileId]
-   [:profile/wait? {:optional true} :boolean]
-   [:profile/no-deps? {:optional true} :boolean]
-   [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:profile/idle-action {:optional true} IdleAction]
-   [:profile/activity {:optional true} Activity]
-   [:profile/description {:optional true} :string]])
+  "A section or preset. `:profile/compose? false` (no compose project, only
+   host programs) together with `:profile/services` is refused: there is no
+   compose project to run those services, and up would drop them silently."
+  [:and
+   [:map
+    [:profile/id ProfileId]
+    [:profile/dir [:string {:min 1}]]
+    [:profile/files {:optional true} [:vector [:string {:min 1}]]]
+    [:profile/project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+    [:profile/compose-profiles {:optional true} [:vector ProfileId]]
+    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
+    ;; false: no compose project, only host programs (Project :project/compose?)
+    [:profile/compose? {:optional true} :boolean]
+    [:profile/programs {:optional true} [:vector Program]]
+    [:profile/env {:optional true} Env]
+    ;; the env a call gave (up/switch/restart env=), kept so a later call on the
+    ;; same section never falls back to weaker env; references stay references
+    [:profile/call-env {:optional true} Env]
+    ;; a target section that runs from another (holding) section's dir, files
+    ;; and env: its id; a reload then keeps those and rebases only the rest
+    [:profile/inputs-from {:optional true} ProfileId]
+    [:profile/wait? {:optional true} :boolean]
+    [:profile/no-deps? {:optional true} :boolean]
+    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
+    [:profile/idle-action {:optional true} IdleAction]
+    [:profile/activity {:optional true} Activity]
+    [:profile/description {:optional true} :string]]
+   [:fn {:error/message "a profile with :profile/compose? false runs no compose project, so it cannot name :profile/services"}
+    (fn [p] (not (and (false? (:profile/compose? p)) (seq (:profile/services p)))))]])
 
 (def Claim
   "An agent's declaration that it works on a section (or holds a stack run):
