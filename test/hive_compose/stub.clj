@@ -427,6 +427,9 @@
             ;; derives, so under another -p it is named after that project
             (r/ok (-> m
                       (assoc "name" (profile/project p))
+                      ;; as compose interpolates ${HIVE_PORT_OFFSET} into a service's env
+                      (cond-> (get (:profile/env p) "HIVE_PORT_OFFSET")
+                        (assoc-in ["x-interpolated" "OFFSET"] (get (:profile/env p) "HIVE_PORT_OFFSET")))
                       (update "volumes" #(into {} (for [[k v] %]
                                                     [k (cond-> v (= (get v "name") (str base "_" k))
                                                          (assoc "name" (str (profile/project p) "_" k)))])))))

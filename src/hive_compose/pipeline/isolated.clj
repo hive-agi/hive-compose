@@ -244,6 +244,10 @@
                    (r/ok nil))
                _ (refuse-external rid model shared)
                policy (r/ok (or (:ports entry) (:ports opts) :strip))
+               ;; G3: the digest is taken over the model read WITHOUT the run's
+               ;; own variables (HIVE_RUN, HIVE_PORT_..): their values differ per
+               ;; run by design and would make two runs of one checkout disagree
+               model0 (r/ok model)
                ;; M3: the run env needs the planned ports, which need the model;
                ;; read again WITH the run env, so every interpolation (HIVE_RUN,
                ;; HIVE_PORT_..) the up will see is in the model the override,
@@ -279,7 +283,8 @@
           (let [{:keys [budget verdict limits assumed]} (admission ctx model cp (remove (set running) closure)
                                                                           (:profile/run-mem-mb p))]
             (r/ok {:run rid :new? (nil? entry) :compose-project cp :profile ip :doc doc
-                   :config-digest (config-digest {"config" model "override" doc} base rid)
+                   :config-digest (config-digest {"config" model0 "override" doc} base rid)
+                   :digest-model model0
                    :text (override/emit doc) :path path :images pinned :shared-volumes shared
                    :ports policy :planned-ports planned :env run-env :model model
                    :volumes (let [m (iso/mounts model)]
@@ -343,7 +348,7 @@
                                 (update :budget (fn [b] (merge-with (fn [x y] (if (number? x) (+ x y) (merge x y)))
                                                                     b (select-keys (:budget pl) [:budget/total-mem :budget/instances]))))
                                 (assoc-in [:digests (:profile/id p)]
-                                          (config-digest {"config" (:model pl) "override" (:doc pl)} base rid))))
+                                          (config-digest {"config" (:digest-model pl) "override" (:doc pl)} base rid))))
       (let [res (ops/up-profile! ctx (:profile pl))]
         (if (r/err? res)
           (let [err (classify-failure rid res)]

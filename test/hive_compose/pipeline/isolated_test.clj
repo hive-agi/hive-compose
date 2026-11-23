@@ -523,3 +523,12 @@
         x (isolated/plan ctx (assoc (preset ctx "flow-payment") :profile/run-mem-mb 3072) {})]
     (is (= 3072 (get-in x [:ok :admission :need-mb])) (pr-str x))
     (is (= 0 (get-in x [:ok :admission :assumed-services])) "(B) a declared figure assumes nothing")))
+
+(deftest the-digest-ignores-the-runs-own-variables
+  ;; the stub interpolates HIVE_PORT_OFFSET into the model, as compose would
+  ;; into PUBLIC_URL: two runs with different offsets still agree (G3)
+  (let [{:keys [ctx]} (world)
+        a (get-in (isolated/plan ctx (preset ctx "flow-sync") {:ports {:offset 1000}}) [:ok :config-digest])
+        b (get-in (isolated/plan ctx (preset ctx "flow-sync") {:ports {:offset 2000}}) [:ok :config-digest])]
+    (is (string? a))
+    (is (= a b))))
