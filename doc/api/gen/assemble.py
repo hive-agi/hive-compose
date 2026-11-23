@@ -58,8 +58,10 @@ components["ComposeRequest"] = {
     "type": "object", "properties": req_props, "additionalProperties": True,
     "description": "The MCP `compose` tool params minus `command` (the op is the path segment / hive_call op). "
                    "Booleans also accept the strings \"true\"/\"false\" on the MCP side (addon/flag); HTTP clients should send booleans. "
-                   "Over MCP unknown keys are ignored; each Req_<command> schema below is closed (additionalProperties false) so a client learns of a typo, "
-                   "while the server still ignores what it does not read. A declared param of the wrong JSON type is answered 400 compose/invalid-param.",
+                   "Over MCP and HTTP alike a key the command does not take refuses the call before anything runs: 400 compose/invalid-param with "
+                   "unknown [names], valid [the command's params] and did-you-mean {given: nearest} (hive-compose.api/unknown-params). "
+                   "Keys the MCP host adds are always accepted (hive-compose.api/host-params: agent_id, directory, async, async-timeout-ms, _meta, any _-prefixed key). "
+                   "Each Req_<command> schema below is closed (additionalProperties false). A declared param of the wrong JSON type is answered 400 compose/invalid-param.",
     "x-source": "generated", "x-from": "hive-compose.addon/tool :inputSchema @ origin/staging"}
 
 SUBJECT = ["up", "switch", "down", "stop", "restart", "ps", "logs", "claim", "release"]
@@ -215,7 +217,7 @@ components["StackStatusResult"] = open_result("pipeline.stacks/stack-status: sta
 components["PlanResult"] = open_result("pipeline.stacks/plan: what stack-up would start, share or find running")
 components["FlakyResult"] = open_result("pipeline.flaky/flaky: test cases ranked by intermittent failure, each flaky, regression, fixed or stable")
 components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
-components["TestResult"] = open_result("pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env'd per variant; a suite without variants under a variants filter ran once and carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file")
+components["TestResult"] = open_result("pipeline.suites/test!: plan {projects, suites, cells, services: containers the stack starts} first, run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env'd per variant; a suite without variants under a variants filter ran once and carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file")
 STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why", "flaky", "test"}
 MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload",
            "faults", "stack-up", "stack-down", "why", "test"}
@@ -225,7 +227,7 @@ def ok_of(schema_ref):
     return {"allOf": [ref("Ok"), {"type": "object", "properties": {"value": schema_ref}, "required": ["value"]}]}
 
 responses = {
-  "BadRequest": {"description": "compose/missing-param, compose/invalid-param (also a body that is not a JSON object)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "BadRequest": {"description": "compose/missing-param (also `test` with neither suites nor projects and no all=true: would-run names the matrix), compose/invalid-param (a param the command does not take: unknown, valid, did-you-mean; a wrong JSON type; a body that is not a JSON object)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "NotFound": {"description": "compose/unknown-command, compose/unknown-profile, compose/unknown-target, compose/unknown-project, compose/no-projects", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Conflict": {"description": "compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "EngineFailed": {"description": "compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved, secrets/unknown-backend", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},

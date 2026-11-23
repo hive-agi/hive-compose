@@ -151,6 +151,17 @@ program whose env cannot be read is reported and not started.
 | `release target=… [stop=true]` | give the claim up; with none left the section is orphaned, or stopped now with `stop` |
 | `who` | per section: claims, what is using it, when it is reaped; per agent: the sections it works in |
 | `nrepl path=…` | which shared nREPL drives that file or directory (no path: every route) |
+| `test suites=… projects=…` | run the suite x project matrix; the answer starts with `plan {projects suites cells services}`. Neither `suites` nor `projects`: refused unless `all=true` (`dry_run=true` plans it anyway) |
+
+**Strict params.** Every command refuses a param it does not take, before
+anything runs, over MCP and the HTTP API alike: `invalid-param` with
+`unknown`, `valid` (the command's params, from `command-params`) and
+`did-you-mean` (`suite` -> `suites`, `project` -> `projects`). Only the keys
+the MCP host adds itself are always accepted: `agent_id`, `directory`,
+`async`, `async-timeout-ms`, `_meta` and any `_`-prefixed key
+(`hive-compose.api/host-params`). A `test` matrix that ran no cell (an error
+before the first one) takes down the stack it started, unless `keep_up`,
+another agent's claim, or a reused `run=`.
 
 Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`,
 `:compose/claim!`, `:compose/release!`, `:compose/nrepl-for`, `:compose/who`.

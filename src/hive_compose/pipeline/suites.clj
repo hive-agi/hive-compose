@@ -473,21 +473,47 @@
                  (:report/redacted? rep) (assoc :report/redacted? true))))
       result)))
 
+(defn- could-not-run?
+  "Whether a matrix with cell `results` ran no cell at all: none started (a
+   data phase failed before the first suite) or every one was cancelled
+   before it started."
+  [results]
+  (every? #(= :compose/interrupted (:reason %)) results))
+
+(defn- restore-run!
+  "Put run `rid`'s `entry` (as test!'s stack-up! recorded it) back into the
+   state when the state lost it while the matrix ran, so the containers it
+   started can still be taken down. Answers true when it did."
+  [ctx rid entry]
+  (when entry
+    (let [[old _] (swap-vals! (:state ctx) #(if (contains? (:stacks %) rid) % (assoc-in % [:stacks rid] entry)))]
+      (not (contains? (:stacks old) rid)))))
+
 (defn- finish!
   "The answer for `results` and `phases`, also written to
    `<state>/runs/<run>/summary.edn`. The matrix ends its claim in ONE step
    under the stack lock (stacks/end-claim!): drop its own claim, re-read the
    claims left, and take a run this call created down when every cell
    passed, every data phase answered ok, `keep-up?` is not set and no other
-   claim holds it; a reused run is never taken down. `:exit` is
-   promote.suite/matrix-exit: 0 passed, 1 failed, 2 could not run."
-  [ctx {:keys [run stack-id reuse? keep-up? skip-fails? variants?]} results phases]
+   claim holds it; a reused run is never taken down. A matrix that ran no
+   cell at all (`could-not-run?`: a data phase failed first, every cell
+   cancelled) also takes down the run it created, under the same keep-up?,
+   claim and reuse rules: nothing is left to inspect but containers. When
+   the state lost the run meanwhile, its entry as stack-up! recorded it
+   (`:entry` of `info`) is put back first so the down still finds what to
+   remove (:run-restored? true). `:exit` is promote.suite/matrix-exit: 0
+   passed, 1 failed, 2 could not run."
+  [ctx {:keys [run stack-id reuse? keep-up? skip-fails? variants? entry]} results phases]
   (let [summary (suite/matrix-summary results)
         phase-errors (vec (for [p phases :when (r/err? (:result p))]
                             {:phase (:phase p) :after-suite (:after-suite p)
-                             :error (select-keys (:result p) [:error :message :hint])}))
+                             ;; :known (the runs the state held) names a run that vanished
+                             :error (select-keys (:result p) [:error :message :hint :known :run])}))
         status (if (seq phase-errors) :error (:status summary))
-        down-wanted? (and (= :passed status) (not keep-up?) (not reuse?))
+        none-ran? (and (= :error status) (could-not-run? results))
+        down-wanted? (and (or (= :passed status) none-ran?) (not keep-up?) (not reuse?))
+        ;; only to take it down: a run lost from the state is never revived to stay
+        restored? (and down-wanted? (restore-run! ctx run entry))
         {others :others down :down} (stacks/end-claim! ctx run (agent-of ctx) {:down? down-wanted?})
         down? (and down-wanted? (empty? others))
         kept? (not (and down? (some? down) (r/ok? down)))
@@ -501,6 +527,8 @@
                                      results)
                         :stack-kept? kept?}
                  (some? skip-fails?) (assoc :skip-fails? skip-fails?)
+                 none-ran? (assoc :no-cell-ran? true)
+                 restored? (assoc :run-restored? true)
                  (seq phases) (assoc :data-phases (mapv #(-> % (dissoc :result) (assoc :ok? (r/ok? (:result %)))) phases))
                  (seq phase-errors) (assoc :data-errors phase-errors)
                  (and down (r/ok? down)) (assoc :down (:ok down))
@@ -510,6 +538,7 @@
                  (assoc :hint (str "the stack stays up"
                                    (cond reuse? " (a reused run is never taken down)"
                                          (seq others) (str " (claimed by " (str/join ", " others) ")")
+                                         keep-up? " (keep_up)"
                                          (not= :passed status) (str " for inspection (" (name status) ")")
                                          :else "")
                                    "; stack-down run=" run " releases it, the reaper after its TTL")))
@@ -603,66 +632,120 @@
               attached)
           (on-run! ctx info specs created))))))
 
+(defn- unselected?
+  "Whether `opts` select nothing: no suites, no projects, and no `run` naming
+   a recorded run (reusing a run bounds the matrix to its stack)."
+  [ctx {:keys [suites projects run]}]
+  (and (nil? (suite/parse-names suites))
+       (nil? (suite/parse-names projects))
+       (not (and run (contains? (:stacks @(:state ctx)) run)))))
+
+(defn- plan-line
+  "{:projects [..] :suites [..] :cells n :services n?}: what the matrix of
+   `cells` runs; `services` the containers its stack starts (absent when it
+   could not be counted)."
+  [cells services]
+  (cond-> {:projects (vec (sort (distinct (map :project cells))))
+           :suites (vec (sort (distinct (map :suite/id cells))))
+           :cells (count cells)}
+    (some? services) (assoc :services services)))
+
 (defn test!
-  "Result<{:run :stack :status :exit :summary :cells [cell-result] :stack-kept?
-   :reused? :summary-file}>: run the suite x project (x variant) matrix
-   `opts` {:suites names :projects names :variants names :run RunId?
-   :keep-up? :wait? (default true) :dry-run? :skip-fails?}; names as
-   promote.suite/parse-names takes them (\"X,Y\", a coll, nil for all).
-   `:skip-fails?` (nil: each suite's own :suite/skip-fails?) makes a skipped
-   case fail its cell. `:exit` is 0 every cell passed, 1 a test failed, 2
-   something could not run (2 wins). A suite's :suite/variants run as cells
-   of their own (`<suite>@<variant>`), one after the other on the same stack,
-   each with its env over the suite's, applied to the runner only.
+  "Result<{:plan :run :stack :status :exit :summary :cells [cell-result]
+   :stack-kept? :reused? :summary-file}>: run the suite x project (x variant)
+   matrix `opts` {:suites names :projects names :variants names :run RunId?
+   :keep-up? :wait? (default true) :dry-run? :skip-fails? :all?}; names as
+   promote.suite/parse-names takes them (X,Y as one string, a coll, nil for
+   all). `:skip-fails?` (nil: each suite's own :suite/skip-fails?) makes a
+   skipped case fail its cell. `:exit` is 0 every cell passed, 1 a test
+   failed, 2 something could not run (2 wins). A suite's :suite/variants run
+   as cells of their own (`<suite>@<variant>`), one after the other on the
+   same stack, each with its env over the suite's, applied to the runner only.
+
+   A real run that selects nothing (no suites, no projects, no :run of a
+   recorded run) is refused (:compose/missing-param, :would-run naming the
+   suites and projects it would have run) unless `:all?`: an empty selection
+   means every suite against every project. A dry run plans it anyway.
+
+   The answer starts with `:plan` {:projects :suites :cells :services}
+   (services: the containers the stack starts); a real run hands that line
+   to the context's optional `:progress!` (fn [ctx line]) before its
+   stack-up. In a dry run :plan also carries the stack plan-diff.
 
    Without :run (or with a :run no stack holds), a stack of its own comes up
    (hc-6 stack-up!, which claims the run id atomically) for the union of what
    the cells need. With the :run of a live, :up stack run that no other
    matrix works on, the suites run on that run: claimed first, then each
    suite consumer gets its view network, joined by the run's instances it
-   needs, removed afterwards; the run itself is never taken down. With
-   :dry-run? nothing starts: the answer is the matrix, the stack plan and
-   every runner spec (secret references rendered).
+   needs, removed afterwards; the run itself is never taken down. A run this
+   call started is taken down when every cell passed, and also when no cell
+   ran at all (see finish!), unless :keep-up? or another claim holds it.
+   With :dry-run? nothing starts: the answer is the matrix, the stack plan
+   and every runner spec (secret references rendered).
 
    Never throws: an unexpected throw answers :compose/test-threw naming the
    run and the stack-down that releases it."
-  [ctx {:keys [keep-up? dry-run? wait?] :or {wait? true} :as opts}]
+  [ctx {:keys [keep-up? dry-run? wait? all?] :or {wait? true} :as opts}]
   (let [known (atom nil)]
     (try
       (if (and (not dry-run?) (not (satisfies? port/ISuiteRunner (:suite-runner ctx))))
         (r/err :compose/no-suite-runner {:hint "the context has no ISuiteRunner (:suite-runner)"})
         (r/let-ok [{:keys [run reuse? stack cells extra specs plan] ctx' :ctx} (plan-matrix ctx opts)]
-          (let [stack-id (:stack/id stack)
-                ;; this matrix's own claim id, test:<run>:<nonce>
-                agent (claim-agent run ((or (:claim-nonce ctx) #(hex 4))))
-                ctx (assoc ctx ::agent agent)
-                ctx' (assoc ctx' ::agent agent)
-                info {:run run :stack-id stack-id :reuse? reuse? :keep-up? keep-up?
-                      :skip-fails? (:skip-fails? opts)
-                      :variants? (some? (suite/parse-names (:variants opts)))}]
-            (reset! known {:run run :stack stack-id :agent agent})
-            (cond
-              dry-run?
-              (r/map-ok (stacks/plan ctx' {:stack stack-id :run run :extra extra})
-                        (fn [p] {:run run :stack stack-id :dry-run? true :reused? reuse? :cells cells
-                                 :plan (:diff p) :text (:text p)
-                                 :runners (mapv shown-spec specs)}))
+          (if (and (not dry-run?) (not all?) (unselected? ctx opts))
+            (let [line (plan-line cells nil)]
+              (r/err :compose/missing-param
+                     {:param "suites or projects"
+                      :would-run line
+                      :message (str "no suites or projects selected: this would run every suite ("
+                                    (str/join ", " (:suites line)) ") against every project ("
+                                    (str/join ", " (:projects line)) "), " (:cells line) " cells")
+                      :hint "name suites=X,Y and/or projects=A,B, pass all=true to run the whole matrix, or dry_run=true to see its plan; nothing started"}))
+            (let [stack-id (:stack/id stack)
+                  ;; this matrix's own claim id, test:<run>:<nonce>
+                  agent (claim-agent run ((or (:claim-nonce ctx) #(hex 4))))
+                  ctx (assoc ctx ::agent agent)
+                  ctx' (assoc ctx' ::agent agent)
+                  services (if reuse?
+                             0
+                             (let [n (try (stacks/start-count ctx' {:stack stack-id :run run :extra extra})
+                                          (catch Throwable t (caught! t) nil))]
+                               (when (r/ok? n) (:ok n))))
+                  line (plan-line cells services)
+                  info {:run run :stack-id stack-id :reuse? reuse? :keep-up? keep-up?
+                        :skip-fails? (:skip-fails? opts)
+                        :variants? (some? (suite/parse-names (:variants opts)))}
+                  ;; an array map of any size keeps :plan the first key on the wire
+                  planned #(r/map-ok % (fn [a] (apply array-map :plan line (mapcat identity (dissoc a :plan)))))
+                  progress! #(when-let [f (:progress! ctx)] (f ctx line))]
+              (reset! known {:run run :stack stack-id :agent agent})
+              (cond
+                dry-run?
+                (r/map-ok (stacks/plan ctx' {:stack stack-id :run run :extra extra})
+                          (fn [p] {:plan (merge (:diff p) line)
+                                   :run run :stack stack-id :dry-run? true :reused? reuse? :cells cells
+                                   :text (:text p)
+                                   :runners (mapv shown-spec specs)}))
 
-              reuse?
-              (on-reused-run! ctx' info plan specs)
+                reuse?
+                (do (progress!)
+                    (planned (on-reused-run! ctx' info plan specs)))
 
-              :else
-              (let [up (stacks/stack-up! ctx' {:stack stack-id :run run :wait? wait? :extra extra
-                                                ;; claimed in the swap that records the run
-                                                :claim {agent {:note "compose test"
-                                                               :seen (+ ((:now ctx)) (long phase-lease-ms))}}})]
-                (if (r/err? up)
-                  (cond-> (do (unclaim! ctx run) ;; kept for inspection, not held
-                              (assoc up :run run :stack stack-id))
-                    (contains? (:stacks @(:state ctx)) run)
-                    (assoc :hint (str "the matrix stack did not come up; it is kept for inspection. stack-down run="
-                                      run " releases it")))
-                  (on-run! ctx' info specs (atom []))))))))
+                :else
+                (let [_ (progress!)
+                      up (stacks/stack-up! ctx' {:stack stack-id :run run :wait? wait? :extra extra
+                                                 ;; claimed in the swap that records the run
+                                                 :claim {agent {:note "compose test"
+                                                                :seen (+ ((:now ctx)) (long phase-lease-ms))}}})]
+                  (if (r/err? up)
+                    (cond-> (do (unclaim! ctx run) ;; kept for inspection, not held
+                                (assoc up :run run :stack stack-id :plan line))
+                      (contains? (:stacks @(:state ctx)) run)
+                      (assoc :hint (str "the matrix stack did not come up; it is kept for inspection. stack-down run="
+                                        run " releases it")))
+                    ;; the entry as recorded, so finish! can still take the run
+                    ;; down should the state lose it meanwhile
+                    (planned (on-run! ctx' (assoc info :entry (get-in @(:state ctx) [:stacks run]))
+                                      specs (atom []))))))))))
       (catch Throwable t
         (caught! t)
         (let [{:keys [run stack agent]} @known]

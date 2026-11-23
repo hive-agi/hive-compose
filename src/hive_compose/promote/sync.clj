@@ -71,7 +71,13 @@
              :current (if (= tc bc) mc (if (= mc bc) tc mc))}
       ;; stack runs (hc-6), merged like active entries; absent when no side has any
       (some :stacks [base mine theirs])
-      (assoc :stacks (merge3 (:stacks base) (:stacks mine) (:stacks theirs) merge-entry))
+      ;; A side whose state has no :stacks key at all (a file an older writer
+      ;; saved) counts as unchanged, as for the marks below: it never removes a
+      ;; run. Taken as a removal, it dropped a live, claimed run from the state
+      ;; with its containers still up (card 20261123144701-428fd846, test5174f5).
+      (assoc :stacks (let [b (:stacks base)
+                           side #(if (contains? % :stacks) (:stacks %) b)]
+                       (merge3 b (side mine) (side theirs) merge-entry)))
       ;; preexistence marks by service: an addition from either side lands, a
       ;; reconciled removal (a run saw the service gone) sticks
       (some :preexisting [base mine theirs])

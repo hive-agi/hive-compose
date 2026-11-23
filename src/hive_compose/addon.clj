@@ -234,12 +234,12 @@
    "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
    "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
    "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"
-   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need (or the live run named by run), each suite's runner (a container on the projects' view networks, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir; a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every selected suite that declares variants must declare each named one, else the call is refused; a suite without variants runs once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT restarted or re-env'd per variant, so a variant that toggles a service's own flag tests nothing (follow-up 20261123122851-6e29b6f7); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something could not run. A cell passes only when its runner exited 0 and its report parsed: an unparsable report is could-not-run; a container suite, or one that declares :suite/reports-dir or :suite/report-format, must leave a report with at least one case unless :suite/report-required? false. Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known, :service"))
+   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need (or the live run named by run), each suite's runner (a container on the projects' view networks, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir; a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed or when no cell ran at all (an error before the first cell), kept up for inspection when one failed (the reaper TTL still applies); a reused run is never taken down. The answer starts with plan {projects, suites, cells, services (containers the stack starts)}. suites=X,Y and/or projects=A,B; with neither (and no run=<live run>) the call is refused, naming what it would run, unless all=true (every suite against every project); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every selected suite that declares variants must declare each named one, else the call is refused; a suite without variants runs once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT restarted or re-env'd per variant, so a variant that toggles a service's own flag tests nothing (follow-up 20261123122851-6e29b6f7); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something could not run. A cell passes only when its runner exited 0 and its report parsed: an unparsable report is could-not-run; a container suite, or one that declares :suite/reports-dir or :suite/report-format, must leave a report with at least one case unless :suite/report-required? false. Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known, :service"))
 
 (def commands
   (vec (keys command-help)))
 
-(declare reload!)
+(declare reload! command-params)
 
 (defn- flag
   "A boolean param as sent over MCP (true, \"true\"), nil when absent."
@@ -307,12 +307,13 @@
     (some? (flag params "dry_run")) (assoc :dry-run? (flag params "dry_run"))
     (some? (flag params "wait")) (assoc :wait? (flag params "wait"))
     (param params "variants") (assoc :variants (param params "variants"))
-    (some? (flag params "skip_fails")) (assoc :skip-fails? (flag params "skip_fails"))))
+    (some? (flag params "skip_fails")) (assoc :skip-fails? (flag params "skip_fails"))
+    (some? (flag params "all")) (assoc :all? (flag params "all"))))
 
 (def test-params
   "The params `test-opts` reads; `command-params` \"test\" must equal it
    (addon_test checks), so the API never refuses what `test` reads."
-  #{"suites" "projects" "run" "keep_up" "dry_run" "wait" "variants" "skip_fails"})
+  #{"suites" "projects" "run" "keep_up" "dry_run" "wait" "variants" "skip_fails" "all"})
 
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
@@ -373,6 +374,12 @@
         claim-opts (fn [] (r/map-ok (ttl-minutes-param params)
                                     (fn [t] {:note (some-> (param params "note") str) :ttl-minutes t})))]
     (cond
+      ;; the one unknown-param check, the control API's too (api/check-params):
+      ;; a key the command does not read refuses the call before anything runs
+      (and (contains? command-params command)
+           (r/err? (api/unknown-params command (get command-params command) params)))
+      (api/unknown-params command (get command-params command) params)
+
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
                                                   :errors (:errors @(:state a))})
@@ -472,6 +479,10 @@
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
                      "SUITES: test suites=X,Y projects=A,B runs the suite x project matrix on one union stack and answers per-cell verdicts from exit code and JUnit/TAP; a failed matrix stays up for inspection. "
+                     "test with neither suites nor projects is refused unless all=true. "
+                     "STRICT PARAMS: a param a command does not take refuses the call before anything runs "
+                     "(invalid-param naming unknown, valid and did-you-mean, e.g. suite -> suites); "
+                     "the host's own keys (agent_id, directory, async, _meta, _caller_*) are always accepted. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -501,6 +512,7 @@
                               "dry_run" {:type "boolean" :description "[test] answer the matrix, the stack plan and every runner spec; start nothing"}
                               "variants" {:type "string" :description "[test] only these env variants of the suites that declare :suite/variants, a,b (default every variant); each selected suite with variants must declare every named one, else refused; a suite without variants runs once. The variant env reaches the suite RUNNER only, never the stack's consumers (no restart or re-env per variant)"}
                               "skip_fails" {:type "boolean" :description "[test] a skipped case fails its cell (the case stays skipped in the report); default each suite's :suite/skip-fails?, else false"}
+                              "all" {:type "boolean" :description "[test] run the whole matrix (every suite against every project its suites apply to) when neither suites nor projects is given; without it such a call is refused, naming what it would run (dry_run plans it anyway)"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}

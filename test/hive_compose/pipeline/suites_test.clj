@@ -57,7 +57,7 @@
 
 (deftest every-cell-passes-and-the-stack-goes-down
   (let [c (ctx)
-        res (suites/test! c {})]
+        res (suites/test! c {:all? true})]
     (is (r/ok? res) (pr-str res))
     (let [{:keys [run status exit summary cells stack-kept?]} (:ok res)]
       (is (= "test000001" run))
@@ -97,7 +97,7 @@
 
 (deftest a-failing-cell-keeps-the-stack-up
   (let [c (ctx {"smoke/shop" {:exit 1 :passed 2 :failed 1}})
-        res (suites/test! c {})
+        res (suites/test! c {:all? true})
         {:keys [run status exit summary stack-kept? hint]} (:ok res)]
     (is (r/ok? res))
     (is (= [:failed 1] [status exit]))
@@ -143,7 +143,7 @@
   (is (= 1 (get-in (suites/test! (ctx {"load" {:exit 1 :passed 0 :failed 1}}) {:suites "load"}) [:ok :exit])))
   (is (= 2 (get-in (suites/test! (ctx {"load" {:error :compose/secret-unresolved}}) {:suites "load"}) [:ok :exit])))
   (testing "2 wins over 1"
-    (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 0 :failed 1} "load" {:error :compose/runner-failed}}) {})]
+    (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 0 :failed 1} "load" {:error :compose/runner-failed}}) {:all? true})]
       (is (= [:error 2] [(get-in res [:ok :status]) (get-in res [:ok :exit])])))))
 
 (deftest skip-fails-fails-a-cell-with-a-skipped-case
@@ -215,7 +215,7 @@
           "only an explicit false opts out"))))
 
 (deftest the-answer-lists-every-case-and-why-a-cell-could-not-run
-  (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 2 :failed 1} "load" {:error :compose/secret-unresolved}}) {})
+  (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 2 :failed 1} "load" {:error :compose/secret-unresolved}}) {:all? true})
         by (into {} (map (juxt :test-id identity)) (get-in res [:ok :cells]))
         smoke (get by "smoke/shop")
         load (get by "load/shop")]
@@ -232,7 +232,7 @@
 
 (deftest keep-up-keeps-a-passing-stack
   (let [c (ctx)
-        res (suites/test! c {:keep-up? true})]
+        res (suites/test! c {:keep-up? true :all? true})]
     (is (= :passed (get-in res [:ok :status])))
     (is (true? (get-in res [:ok :stack-kept?])))
     (is (= 1 (count (:stacks @(:state c)))))))
@@ -260,7 +260,7 @@
 (deftest a-stack-that-does-not-come-up-is-kept-and-named
   (let [c (ctx)]
     (stub/health! (:engine c) "pg" "db" :unhealthy)
-    (let [res (suites/test! c {})]
+    (let [res (suites/test! c {:all? true})]
       (is (r/err? res))
       (is (= "test000001" (:run res)))
       (is (empty? (sr/suite-runs (:suite-runner c))) "no runner ran")
@@ -314,19 +314,19 @@
 (deftest data-phases-run-before-between-and-after-suites
   (let [calls (atom [])
         c (assoc (ctx) :data-phase! (fn [_ run phase] (swap! calls conj [run phase]) {:ok? true}))
-        res (suites/test! c {})]
+        res (suites/test! c {:all? true})]
     (is (= :passed (get-in res [:ok :status])))
     (is (= [["test000001" :before-suite] ["test000001" :between-suites] ["test000001" :after]] @calls)
         "two suites: one between")
     (testing "a failing phase fails the matrix and keeps the stack"
       (let [c (assoc (ctx) :data-phase! (fn [_ _ phase] (if (= phase :after) (r/err :data/reset-failed {}) :ok)))
-            res (suites/test! c {})]
+            res (suites/test! c {:all? true})]
         (is (= :error (get-in res [:ok :status])))
         (is (= :after (get-in res [:ok :data-errors 0 :phase])))
         (is (true? (get-in res [:ok :stack-kept?])))))
     (testing "a failing :before-suite runs no cell"
       (let [c (assoc (ctx) :data-phase! (fn [_ _ _] (r/err :data/seed-failed {})))
-            res (suites/test! c {})]
+            res (suites/test! c {:all? true})]
         (is (= :error (get-in res [:ok :status])))
         (is (empty? (sr/suite-runs (:suite-runner c))))))))
 
@@ -466,7 +466,7 @@
 (deftest a-throw-anywhere-keeps-the-run-named-and-releases-its-claim
   (testing "a cell that throws is an :error cell; the others still run"
     (let [c (ctx {"load" {:throws true}})
-          res (suites/test! c {})
+          res (suites/test! c {:all? true})
           cells (get-in res [:ok :cells])]
       (is (r/ok? res) (pr-str res))
       (is (= :error (:status (first (filter #(= "load" (:suite/id %)) cells)))))
@@ -476,7 +476,7 @@
   (testing "a save that throws mid-matrix answers an error naming the run"
     (let [n (atom 0)
           c (assoc (ctx) :save! (fn [_] (when (> (swap! n inc) 3) (throw (ex-info "disk full" {}))) (r/ok nil)))
-          res (suites/test! c {})]
+          res (suites/test! c {:all? true})]
       (is (r/err? res))
       (is (= "test000001" (or (:run res) (get-in res [:ok :run]))))
       (is (empty? (get-in @(:state c) [:stacks "test000001" :claims]))))))
@@ -542,7 +542,7 @@
 
 (deftest an-interrupt-stops-the-matrix
   (let [c (assoc (ctx) :record-run! (fn [_ _] (.interrupt (Thread/currentThread)) (r/ok {})))
-        res (try (suites/test! c {}) (finally (Thread/interrupted)))
+        res (try (suites/test! c {:all? true}) (finally (Thread/interrupted)))
         cells (get-in res [:ok :cells])]
     (is (r/ok? res) (pr-str res))
     (is (= 1 (count (sr/suite-runs (:suite-runner c)))) "no cell starts after the interrupt")
@@ -557,7 +557,7 @@
 
 (deftest the-summary-and-each-result-are-written-to-the-run-dir
   (let [c (ctx {"smoke/shop" {:exit 1 :passed 1 :failed 1}})
-        res (suites/test! c {})
+        res (suites/test! c {:all? true})
         run (get-in res [:ok :run])
         read (runs/read-results (:state-dir c) run)]
     (is (.isFile (io/file (get-in res [:ok :summary-file]))))
@@ -646,7 +646,7 @@
   (prop/for-all [outs (gen/vector outcome-gen 3)]
     (let [ids ["load/shop" "smoke/billing" "smoke/shop"]
           c (ctx (zipmap ids outs))
-          res (suites/test! c {})
+          res (suites/test! c {:all? true})
           {:keys [status exit cells stack-kept?]} (:ok res)
           all-pass? (every? #(= :passed (:status %)) cells)]
       (and (r/ok? res)
