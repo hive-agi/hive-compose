@@ -33,6 +33,7 @@
             [hive-compose.schema :as schema]
             [hive-dsl.result :as r]
             [hive-compose.promote.profile :as profile]
+            [hive-compose.promote.target :as target]
             [hive-compose.pipeline.restart :as restart]
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
@@ -243,14 +244,15 @@
   [params]
   {:no-deps? (flag params "no_deps")
    :wait? (flag params "wait")
+   ;; a null value forgets that var from what the section remembers
    :env (some->> (param params "env")
-                 (into {} (map (fn [[k v]] [(name k) (env/from-param v)]))))})
+                 (into {} (map (fn [[k v]] [(name k) (when (some? v) (env/from-param v))]))))})
 
 (defn- checked-options
   "Result<opts>: `opts` when its env is an Env, else why not. The problems
    name the variable and the rule broken, never a value."
   [opts]
-  (if-let [problems (some->> (:env opts) (schema/explain schema/Env))]
+  (if-let [problems (some->> (:env opts) target/set-values (schema/explain schema/Env))]
     (r/err :compose/invalid-param {:param "env" :problems problems
                                    :hint "a value is a string or {\"pass\": \"<store path>\"}"})
     (r/ok opts)))
@@ -313,7 +315,14 @@
                                 (r/bind (ops/subject ctx {:target tgt :id id :env (:env o)})
                                         #(f (adjust % o))))))
         on-subject (fn [f] (on-subject* f (fn [p o] (profile/with-call-options p (select-keys o [:env])))))
-        with-opts (fn [f] (on-subject* f profile/with-call-options))]
+        ;; up, switch and restart: the subject with the compose inputs it must
+        ;; run with (remembered call env, holding section), see ops/effective-subject
+        on-effective (fn [f]
+                       (r/bind (checked-options opts)
+                               (fn [o]
+                                 (r/bind (ops/effective-subject ctx {:target tgt :id id :env (:env o)})
+                                         (fn [{:keys [profile section]}]
+                                           (f (profile/with-call-options profile (dissoc o :env)) section o))))))]
     (cond
       (= "help" command) (r/ok {:commands command-help})
       (nil? ctx) (r/err :compose/not-initialized {:lifecycle (:lifecycle @(:state a))
@@ -324,8 +333,8 @@
                          (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
-        "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
+        "up" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/up-profile! ctx p)))))
+        "switch" (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/switch-profile! ctx p)))))
         "claim" (if-let [run (stacks/claim-run tgt)]
                   (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
                   (on-subject #(swarm/claim! ctx % (agent-param params)
@@ -350,14 +359,14 @@
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
         ;; a target is restarted from the live section holding its services (its
         ;; dir, files and env); profile=<id> with a target names that section
-        "restart" (r/bind (checked-options opts)
-                          (fn [o]
-                            (r/let-ok [p0 (ops/subject ctx {:target tgt :id id :env (:env o)})
-                                       p1 (if (seq tgt) (restart/with-holder ctx p0 id) (r/ok p0))]
-                              (let [p (profile/with-call-options p1 o)
-                                    recreate? (flag params "recreate")]
-                                (guard p :restart recreate?
-                                       #(restart/restart-profile! ctx p recreate?))))))
+        ;; a recreate's env is remembered by the section it ran from (the holder)
+        "restart" (on-effective
+                   (fn [p section o]
+                     (let [recreate? (flag params "recreate")
+                           res (guard p :restart recreate? #(restart/restart-profile! ctx p recreate?))]
+                       (when (and recreate? (r/ok? res))
+                         (ops/remember-call-env! ctx (or section (:profile/id p)) (:env o)))
+                       res)))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -411,7 +420,7 @@
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
-                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>"}
+                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys); a null value (\"VAR\": null) forgets VAR (a no-op when not remembered); a reload that changes VAR's declared value forgets it too"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}
                               "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
@@ -523,6 +532,7 @@
               ctx' (assoc ctx :settings settings :engine (:engine fresh) :runner (:runner fresh))
               diff (config/settings-diff old settings)
               _ (swap! state assoc :cfg cfg :ctx ctx')
+              dropped (ops/drop-stale-call-env! ctx' old)
               sections (ops/rebase-sections! ctx' (:compose/projects old))]
           (r/ok (cond-> {:source source
                          :profiles (vec (sort (keys (:compose/profiles settings))))
@@ -535,7 +545,9 @@
                                          (seq (:restart-required diff))
                                          (conj (str "settings applied at the next initialize!: "
                                                     (str/join ", " (map name (:restart-required diff))))))}
-                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed"))))))))
+                  (empty? diff) (assoc :note "the declared config matches what was running; nothing changed")
+                  ;; {section [var]}: remembered call env whose declared value the reload changed
+                  (seq dropped) (assoc :call-env-dropped dropped))))))))
 
 (defn- initialize-addon! [a seed runtime-config]
   (let [{:keys [state]} a]

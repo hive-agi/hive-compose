@@ -110,6 +110,7 @@
    :compose/orphans-hold-resources 409
    :compose/held-by-another-section 409
    :compose/holders-disagree 409
+   :compose/not-a-holder 400
    :compose/run-exists 409
    :compose/over-budget 409
    :compose/toxiproxy-proxy-conflict 409

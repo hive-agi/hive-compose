@@ -1513,6 +1513,19 @@ components:
                   required:
                   - pass
                   additionalProperties: false
+            call-env:
+              type: object
+              additionalProperties:
+                anyOf:
+                - type: string
+                - type: object
+                  properties:
+                    pass:
+                      type: string
+                      minLength: 1
+                  required:
+                  - pass
+                  additionalProperties: false
             wait?:
               type: boolean
             no-deps?:
@@ -1716,6 +1729,19 @@ components:
                   - id
                   - dir
               env:
+                type: object
+                additionalProperties:
+                  anyOf:
+                  - type: string
+                  - type: object
+                    properties:
+                      pass:
+                        type: string
+                        minLength: 1
+                    required:
+                    - pass
+                    additionalProperties: false
+              call-env:
                 type: object
                 additionalProperties:
                   anyOf:
@@ -2087,6 +2113,19 @@ components:
             - id
             - dir
         env:
+          type: object
+          additionalProperties:
+            anyOf:
+            - type: string
+            - type: object
+              properties:
+                pass:
+                  type: string
+                  minLength: 1
+              required:
+              - pass
+              additionalProperties: false
+        call-env:
           type: object
           additionalProperties:
             anyOf:
@@ -2982,6 +3021,19 @@ components:
                     required:
                     - pass
                     additionalProperties: false
+              call-env:
+                type: object
+                additionalProperties:
+                  anyOf:
+                  - type: string
+                  - type: object
+                    properties:
+                      pass:
+                        type: string
+                        minLength: 1
+                    required:
+                    - pass
+                    additionalProperties: false
               wait?:
                 type: boolean
               no-deps?:
@@ -3694,9 +3746,14 @@ components:
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
-            and shown only as pass:<path>'
-          allOf:
-          - $ref: '#/components/schemas/Env'
+            and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
+            a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
+            value forgets it too'
+          type: object
+          additionalProperties:
+            anyOf:
+            - $ref: '#/components/schemas/EnvValue'
+            - type: 'null'
         no_deps:
           type: boolean
           description: '[up|switch] start only the named services, not their depends_on (which must already run)'
@@ -3811,8 +3868,8 @@ components:
       - compose/forbidden-origin
       - compose/held-by-another-section
       - compose/history-unreadable
-      - compose/holders-disagree
       - compose/history-unwritable
+      - compose/holders-disagree
       - compose/inconsistent-resolution
       - compose/instance-not-ready
       - compose/instance-unhealthy
@@ -3848,6 +3905,7 @@ components:
       - compose/no-results
       - compose/no-runs
       - compose/no-trace-query
+      - compose/not-a-holder
       - compose/not-active
       - compose/not-claimed
       - compose/not-implemented
@@ -4129,6 +4187,8 @@ components:
                   enum:
                   - recreated
                   - kept
+                  - created
+                  - absent
               outcome-unknown:
                 type: boolean
             x-source: hand
@@ -4225,6 +4285,8 @@ components:
                   enum:
                   - recreated
                   - kept
+                  - created
+                  - absent
               outcome-unknown:
                 type: boolean
             x-source: hand
@@ -4347,22 +4409,22 @@ components:
           type: string
         dir:
           type: string
-          description: the project directory (checkout) the active section runs from
         files:
           type: array
           items:
             type: string
-          description: the compose files it runs with; empty = compose's defaults
         env-keys:
           type: array
           items:
             type: string
-          description: names of the env vars it runs with, never their values
+        call-env-keys:
+          type: array
+          items:
+            type: string
         env-src:
           type: object
           additionalProperties:
             type: string
-          description: value of each *_SRC var (the path of the code under test); a secret reference as pass:<path>
         services:
           type: array
           items:
@@ -4925,6 +4987,13 @@ components:
             type: string
         note:
           type: string
+        call-env-dropped:
+          type: object
+          description: '{section [var]}: remembered call env forgotten because the reload changed its declared value'
+          additionalProperties:
+            type: array
+            items:
+              type: string
       required:
       - source
       - profiles
@@ -5024,9 +5093,14 @@ components:
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
-            and shown only as pass:<path>'
-          allOf:
-          - $ref: '#/components/schemas/Env'
+            and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
+            a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
+            value forgets it too'
+          type: object
+          additionalProperties:
+            anyOf:
+            - $ref: '#/components/schemas/EnvValue'
+            - type: 'null'
         no_deps:
           type: boolean
           description: '[up|switch] start only the named services, not their depends_on (which must already run)'
@@ -5062,9 +5136,14 @@ components:
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
-            and shown only as pass:<path>'
-          allOf:
-          - $ref: '#/components/schemas/Env'
+            and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
+            a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
+            value forgets it too'
+          type: object
+          additionalProperties:
+            anyOf:
+            - $ref: '#/components/schemas/EnvValue'
+            - type: 'null'
         no_deps:
           type: boolean
           description: '[up|switch] start only the named services, not their depends_on (which must already run)'
@@ -5136,9 +5215,14 @@ components:
         env:
           description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
-            and shown only as pass:<path>'
-          allOf:
-          - $ref: '#/components/schemas/Env'
+            and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
+            a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
+            value forgets it too'
+          type: object
+          additionalProperties:
+            anyOf:
+            - $ref: '#/components/schemas/EnvValue'
+            - type: 'null'
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5538,7 +5622,7 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     Conflict:
       description: compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section
-        (pass allow_orphans / allow_shared)
+        (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)
       content:
         application/json:
           schema:

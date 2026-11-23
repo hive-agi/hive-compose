@@ -43,30 +43,34 @@
 
 (defn- session
   "An initialized addon over a stub engine; `f` gets {:call (fn [params] ..)
-   :e engine}. Every call answers {:res parsed :error? bool}."
-  [presets f]
-  (let [e (stub/engine {} {} {"dc" model})
-        state-file (str (System/getProperty "java.io.tmpdir") "/hc-envdir-" (System/nanoTime) ".edn")
-        a (addon/make-addon {:compose/engine e
-                             :compose/process-table nil
-                             :compose/runner nil
-                             :compose/state-file state-file
-                             :compose/config-source (constantly {})
-                             :compose/profiles-file "/nonexistent/profiles.edn"
-                             :compose/profiles presets
-                             :compose/projects [project]
-                             :compose/swarm? false :compose/notify? false :compose/adopt? false
-                             :compose/initial-delay-ms 3600000})]
-    (try
-      (.initialize! ^hive_addon.protocol.IAddon a {})
-      (f {:e e
-          :call (fn [params]
-                  (let [res ((:handler (addon/tool a)) params)]
-                    {:res (json/read-str (get-in res [:content 0 :text]) :key-fn keyword)
-                     :error? (boolean (:isError res))}))})
-      (finally
-        (.shutdown! ^hive_addon.protocol.IAddon a)
-        (.delete (java.io.File. state-file))))))
+   :e engine :state (fn [] state-atom)}. Every call answers {:res parsed
+   :error? bool}. `extra` merges into the addon config."
+  ([presets f] (session presets f {}))
+  ([presets f extra]
+   (let [e (stub/engine {} {} {"dc" model})
+         state-file (str (System/getProperty "java.io.tmpdir") "/hc-envdir-" (System/nanoTime) ".edn")
+         a (addon/make-addon (merge {:compose/engine e
+                                     :compose/process-table nil
+                                     :compose/runner nil
+                                     :compose/state-file state-file
+                                     :compose/config-source (constantly {})
+                                     :compose/profiles-file "/nonexistent/profiles.edn"
+                                     :compose/profiles presets
+                                     :compose/projects [project]
+                                     :compose/swarm? false :compose/notify? false :compose/adopt? false
+                                     :compose/initial-delay-ms 3600000}
+                                    extra))]
+     (try
+       (.initialize! ^hive_addon.protocol.IAddon a {})
+       (f {:e e
+           :state (fn [] (:state (:ctx @(:state a))))
+           :call (fn [params]
+                   (let [res ((:handler (addon/tool a)) params)]
+                     {:res (json/read-str (get-in res [:content 0 :text]) :key-fn keyword)
+                      :error? (boolean (:isError res))}))})
+       (finally
+         (.shutdown! ^hive_addon.protocol.IAddon a)
+         (.delete (java.io.File. state-file)))))))
 
 (defn- last-restart [e] (:profile (peek (stub/restarts e))))
 (defn- last-up [e] (:profile (peek (stub/ups e))))
@@ -221,8 +225,8 @@
                (is (every? #(= {:postgres "recreated"} (:outcome %)) rows))))))
 
 (deftest outcomes-are-pure
-  (is (= {"a" "kept" "b" "recreated" "c" "recreated"}
-         (own/outcomes ["a" "b" "c"] {"a" "1" "b" "2"} {"a" "1" "b" "3" "c" "4"}))))
+  (is (= {"a" "kept" "b" "recreated" "c" "created" "d" "absent"}
+         (own/outcomes ["a" "b" "c" "d"] {"a" "1" "b" "2" "d" "5"} {"a" "1" "b" "3" "c" "4"}))))
 
 ;; ---------------------------------------------------------------------------
 ;; status names the checkout under test
@@ -242,6 +246,74 @@
                       (:env-src row)))
                (is (not (re-find #"secret-ish" text)) "a non-_SRC value is never shown")
                (is (not (re-find #"Gitea/ci/token" text)) "nor a reference")))))
+
+;; ---------------------------------------------------------------------------
+;; review #62: B1, B2, M1, M2
+
+(deftest b1-a-plain-up-of-an-active-target-keeps-its-call-env-and-recreates-nothing
+  (session []
+           (fn [{:keys [call e]}]
+             (is (not (:error? (call {"command" "up" "target" "dc/envoy" "env" {"GW" "192.168.2.106"}}))))
+             (let [before (stub/container-ids e "dc")]
+               (is (not (:error? (call {"command" "up" "target" "dc/envoy"}))))
+               (is (= "192.168.2.106" (get-in (last-up e) [:profile/env "GW"])) "the remembered env, not the project's")
+               (is (= before (stub/container-ids e "dc")) "nothing was recreated")))))
+
+(deftest b2b-a-null-forgets-a-remembered-var
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             (call {"command" "up" "profile" "flow-payment" "env" {"SISF_PAYMENT_SRC" "../../wt/hotfix"}})
+             (let [row #(first (filter (fn [r] (= "flow-payment" (:id r))) (:profiles (:res (call {"command" "status"})))))]
+               (is (= ["SISF_PAYMENT_SRC"] (:call-env-keys (row))) "status says which keys a call gave")
+               (is (not (:error? (call {"command" "up" "profile" "flow-payment"
+                                        "env" {"SISF_PAYMENT_SRC" nil "NEVER_SET" nil}}))))
+               (is (= "../../wt/pv01-merge-sisf-payment" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"]))
+                   "back to the preset's value")
+               (is (not (contains? (:profile/env (last-up e)) "NEVER_SET")) "a null for an unremembered var is a no-op")
+               (is (= [] (:call-env-keys (row))))))))
+
+(deftest b2c-a-reload-that-edits-a-declared-var-drops-its-remembered-value
+  (let [declared (atom {:compose/profiles [flow-payment]})]
+    (session []
+             (fn [{:keys [call e]}]
+               (call {"command" "up" "profile" "flow-payment"
+                      "env" {"SISF_PAYMENT_SRC" "../../wt/hotfix" "SISF_SYNC_SRC" "../../wt/hotfix-sync"}})
+               (swap! declared assoc-in [:compose/profiles 0 :profile/env "SISF_PAYMENT_SRC"] "../../wt/edited")
+               (let [{:keys [res]} (call {"command" "reload"})]
+                 (is (= {:flow-payment ["SISF_PAYMENT_SRC"]} (:call-env-dropped res))))
+               (call {"command" "up" "profile" "flow-payment"})
+               (is (= "../../wt/edited" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])) "the edit is the newer intent")
+               (is (= "../../wt/hotfix-sync" (get-in (last-up e) [:profile/env "SISF_SYNC_SRC"]))
+                   "a remembered var whose declared value did not change stays"))
+             {:compose/profiles nil :compose/config-source (fn [] @declared)})))
+
+(defspec stale-call-env-keys-law 200
+  (prop/for-all [old gen-env new gen-env remembered gen-env]
+    (let [ks (set (target/stale-call-env-keys old new remembered))]
+      (every? (fn [k] (= (contains? ks k)
+                         (not= (get old k ::none) (get new k ::none))))
+              (keys remembered)))))
+
+(deftest m1-an-orphaned-holder-still-says-where-a-restart-comes-from
+  (session [flow-payment]
+           (fn [{:keys [call e state]}]
+             (call {"command" "up" "profile" "flow-payment"})
+             (swap! (state) assoc-in [:active "flow-payment" :orphaned-at] 1)
+             (is (not (:error? (call {"command" "restart" "target" "dc/sisf-payment" "recreate" true}))))
+             (is (= "/w/pv01" (:profile/dir (last-restart e))) "not the project dir"))))
+
+(deftest m2-a-recreate-env-is-remembered-by-the-holding-section
+  (session [flow-payment]
+           (fn [{:keys [call e]}]
+             ;; postgres reads none of the *_SRC vars, as in dc
+             (stub/reads! e "dc" "postgres" ["PGDATA"])
+             (call {"command" "up" "profile" "flow-payment"})
+             (is (not (:error? (call {"command" "restart" "target" "dc/sisf-payment" "recreate" true "allow_shared" true
+                                      "env" {"SISF_PAYMENT_SRC" "../../wt/hotfix"}}))))
+             (let [before (stub/container-ids e "dc")]
+               (call {"command" "up" "profile" "flow-payment"})
+               (is (= "../../wt/hotfix" (get-in (last-up e) [:profile/env "SISF_PAYMENT_SRC"])))
+               (is (= before (stub/container-ids e "dc")) "the holder's next up does not recreate back")))))
 
 (deftest an-inactive-preset-row-carries-no-inputs
   (session [flow-payment]

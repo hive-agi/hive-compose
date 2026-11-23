@@ -620,6 +620,8 @@
    `<id>\t<service>` line each. Loads no compose file."
   [p]
   ["docker" "ps" "-a" "--no-trunc" "--filter" (str "label=com.docker.compose.project=" (profile/project p))
+   ;; a `compose run` one-off carries the same service label: never the service's container
+   "--filter" "label=com.docker.compose.oneoff=False"
    "--format" "{{.ID}}\t{{.Label \"com.docker.compose.service\"}}"])
 
 (defn service-container-ids

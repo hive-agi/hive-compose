@@ -225,16 +225,23 @@ project's `:project/env` from the addon config, so repeat in `:profile/env` ever
 value the preset's services need.
 
 Precedence, weakest to strongest: `:project/env` (target sections only) <
-`:profile/env` < the `env` of a call. The env a call gave is remembered by the
-section (`:profile/call-env` in the state file, `pass` references kept as
-references), so a later `up`, `restart` or reaper pass of the same section
-never falls back to weaker env. `restart target=<svc>` of a service a live
-section holds runs with that section's dir, files and env; when several live
-sections hold it with different inputs the restart is refused
-(`holders-disagree`, naming them) and `profile=<id>` picks one. `status` shows
-an active section's `dir`, `files`, `env-keys` (names only) and `env-src` (the
-value of each `*_SRC` variable, the checkout under test). An `allow_shared`
-answer says per shared service whether the engine `recreated` it or `kept` it.
+`:profile/env` < the `env` of a call. The env a call gave (`up`, `switch`, a
+recreating `restart`) is remembered by the section (`:profile/call-env` in the
+state file, `pass` references kept as references), so a later `up` (by target
+or profile), `restart` or reaper pass of the same section never falls back to
+weaker env; `status` lists those vars as `call-env-keys`. `env={"VAR": null}`
+forgets VAR (a no-op when it is not remembered), and a `reload` that changes
+VAR's declared value (preset or project env) forgets it too, reporting
+`call-env-dropped {section [VAR]}`. An in-place `restart` recreates nothing, so
+its env is not remembered. `restart target=<svc>` (and `up`/`switch target=`
+of a section not yet active) of a service an active section holds, orphaned or
+not, runs with that section's dir, files and env, and a recreate's env is
+remembered by that section; when several hold it with different inputs the
+call is refused (`holders-disagree`, naming them) and `profile=<id>` picks one.
+`status` shows an active section's `dir`, `files`, `env-keys` (names only) and
+`env-src` (the value of each `*_SRC` variable that looks like a path, the
+checkout under test). An `allow_shared` answer says per shared service whether
+the engine `recreated`, `kept`, `created` it or left it `absent`.
 
 ## Safety
 

@@ -18,6 +18,7 @@
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
             [hive-compose.promote.config :as config]
+            [hive-compose.promote.ownership :as ownership]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
@@ -141,6 +142,103 @@
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
+
+(defn- peeled
+  "`p` (as `lookup` answers it for `id`) with its remembered call env taken
+   off :profile/env, so a var a call forgets falls back to what `id` declares."
+  [ctx id p]
+  (target/peel-call-env p (target/declared-env (:settings ctx) id)))
+
+(defn- holder-of
+  "{:holder Profile :section id} | {:none true} | {:disagree [..]}: the active
+   section other than `self` whose compose inputs a call on `services` of
+   compose project `project` runs with (`promote.ownership/pick-holder`), its
+   remembered call env peeled off. `only` narrows to one section id."
+  [ctx self project services only]
+  (let [active (dissoc (:active @(:state ctx)) self)
+        pick (ownership/pick-holder active project services (when-not (= only self) only))]
+    (if-let [h (:holder pick)]
+      (assoc pick :holder (peeled ctx (:section pick) h))
+      pick)))
+
+(defn effective-subject
+  "Result<{:profile Profile :section holder-id-or-nil}>: the subject of an
+   engine-reaching call (up, switch, restart; claim's start) with the compose
+   inputs it must run with, through `promote.target/effective-profile`:
+   - `id` (profile=): the preset or active snapshot (`lookup`), its remembered
+     call env re-applied under this call's `env`;
+   - `target`: the section resolved from the project as configured now, with
+     the call env its active entry remembers (an `up` of an active section
+     never falls back to the project env), re-addressed at the active
+     section that holds the services it names (orphaned ones too: they still
+     run that code), whose dir, files and env it then uses. Holders that
+     disagree are :compose/holders-disagree naming them; `id` beside a
+     target names the one to use. Held by none: the project defaults.
+   `env` is this call's env; a nil value forgets that var. :section names
+   the holder the call ran from, nil when none."
+  [ctx {:keys [target id env]}]
+  (if-not (seq target)
+    (r/let-ok [p (subject ctx {:id id})]
+      (r/ok {:profile (target/effective-profile (peeled ctx id p) {:call-env env})}))
+    (r/let-ok [p0 (subject ctx {:target target :env (target/set-values env)})]
+      (let [sid (:profile/id p0)
+            own (:profile (active-entry ctx sid))
+            ce (:profile/call-env own)
+            p (cond-> (peeled ctx sid p0) (seq ce) (assoc :profile/call-env ce))
+            services (vec (:profile/services p))
+            ;; an active section runs from its own inputs, unless profile= names another
+            pick (if (and own (or (nil? id) (= id sid)))
+                   {:none true}
+                   (holder-of ctx sid (profile/project p) services id))]
+        (cond
+          (:holder pick) (r/ok {:profile (assoc (target/effective-profile p {:holder (:holder pick) :call-env env})
+                                                :profile/services services)
+                                :section (:section pick)})
+          (:disagree pick) (r/err :compose/holders-disagree
+                                  {:target sid :services services :holders (:disagree pick)
+                                   :message (str "the active sections holding " (str/join ", " services)
+                                                 " run with different compose inputs: "
+                                                 (str/join ", " (map :section (:disagree pick))))
+                                   :hint "name the section to run from with profile=<id>"})
+          (and id (not= id sid)) (r/err :compose/not-a-holder
+                                        {:profile id :services services
+                                         :hint (str id " holds none of " (str/join ", " services))})
+          :else (r/ok {:profile (target/effective-profile p {:call-env env})}))))))
+
+(defn remember-call-env!
+  "Active entry `id` remembers call env `env` (a nil value forgets that var),
+   as after an up: what a recreate ran with is what the section runs with.
+   Nothing when `id` is not active or `env` is empty."
+  [ctx id env]
+  (when (and (seq env) (:profile (active-entry ctx id)))
+    (swap! (:state ctx) update-in [:active id :profile]
+           target/remember-call-env env (target/declared-env (:settings ctx) id))
+    (persist! ctx)))
+
+(defn drop-stale-call-env!
+  "After a reload from Settings `old` to the ones in `ctx`: in every active
+   entry, forget the remembered call env keys whose DECLARED value (preset
+   env, or the project env of a section) changed, since the edit is the
+   newer intent (`promote.target/stale-call-env-keys`). Answers {id [key]}
+   of what was dropped."
+  [ctx old]
+  (let [new (:settings ctx)
+        dropped (into (sorted-map)
+                      (for [[id a] (:active @(:state ctx))
+                            :let [ce (get-in a [:profile :profile/call-env])
+                                  ks (when (seq ce)
+                                       (target/stale-call-env-keys (target/declared-env old id)
+                                                                   (target/declared-env new id) ce))]
+                            :when (seq ks)]
+                        [id ks]))]
+    (when (seq dropped)
+      (swap! (:state ctx) update :active
+             (fn [m] (reduce-kv (fn [m id ks]
+                                  (update-in m [id :profile] target/forget-call-env ks
+                                             (target/declared-env new id)))
+                                m dropped)))
+      (persist! ctx))
+    dropped))
 
 (defn rebase-sections!
   "After the configured projects changed from `old-projects` to the ones in

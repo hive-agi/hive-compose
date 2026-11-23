@@ -1,6 +1,7 @@
 (ns hive-compose.promote.profile
   "Pure reads over a Profile value and the Settings that default it."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [hive-compose.promote.target :as target]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -46,8 +47,7 @@
   (cond-> p
     (some? no-deps?) (assoc :profile/no-deps? (boolean no-deps?))
     (some? wait?) (assoc :profile/wait? (boolean wait?))
-    (seq env) (-> (update :profile/env merge env)
-                  (update :profile/call-env merge env))))
+    (seq env) (target/with-call-env env)))
 
 (defn up-services
   "What `up` starts for `p` whose depends_on closure is `closure`: only its

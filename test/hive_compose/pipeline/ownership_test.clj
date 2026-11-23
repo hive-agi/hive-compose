@@ -99,7 +99,8 @@
     (is (= [{:section "dc/envoy" :agents ["ling-gu05"]
              :services ["auth-service" "envoy" "sisf-web-relay"] :reason "config-differs"}]
            (mapv #(dissoc % :outcome) (:shared-overridden res))))
-    (is (= #{"recreated" "kept"} (into #{"recreated" "kept"} (vals (:outcome (first (:shared-overridden res))))))
+    (is (= #{"recreated" "kept" "created" "absent"}
+           (into #{"recreated" "kept" "created" "absent"} (vals (:outcome (first (:shared-overridden res))))))
         "each shared service says what the engine did")
     (is (= 1 (count calls)))))
 

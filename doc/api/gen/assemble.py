@@ -49,7 +49,9 @@ for p, spec in props.items():
     if p == "command": continue
     s = copy.deepcopy(spec)
     if p == "env":   # the tool says only {type: object}; the call is checked against schema/Env (addon/checked-options)
-        s = {"description": spec["description"], "allOf": [ref("Env")]}
+        # a null value forgets that var from the section's remembered call env
+        s = {"description": spec["description"], "type": "object",
+             "additionalProperties": {"anyOf": [ref("EnvValue"), {"type": "null"}]}}
     req_props[p] = s
 req_props["agent_id"] = {"type": "string", "description": "stamped by the MCP host on every call; claim/release fall back to it when agent is absent (addon/agent-param)"}
 components["ComposeRequest"] = {
@@ -110,7 +112,7 @@ components["StepReport"] = obj({"id": ref("ProfileId"), "project": S, "action": 
 guard = {"orphans-overridden": arr(obj({"pid": I, "name": S, "holds": {"type": "object"}})),
          "orphan-check": obj({"error": S, "message": S, "category": S}),
          "shared-overridden": arr(obj({"section": S, "agents": arr(S), "services": arr(S), "reason": {"enum": ["recreate", "config-differs"]},
-                                       "outcome": {"type": "object", "description": "per shared service what the engine did, from container ids before and after the call", "additionalProperties": {"enum": ["recreated", "kept"]}},
+                                       "outcome": {"type": "object", "description": "per shared service what the engine did, from container ids before and after the call", "additionalProperties": {"enum": ["recreated", "kept", "created", "absent"]}},
                                        "outcome-unknown": B})),
          "ownership-check": obj({"error": S, "message": S, "category": S})}
 components["UpResult"] = obj(dict({"profile": S, "project": S, "services": arr(S), "out": S, "needs": arr(S),
@@ -128,7 +130,8 @@ components["UsageReason"] = obj({"claim": S, "agent": S, "port": I, "peers": I, 
     "source": {"enum": ["nrepl", "published", "cpu"]}}, desc="promote.swarm/usage reason: {claim} | {agent} | {port peers source} | {service cpu source}")
 components["StatusRow"] = obj({"id": S, "project": S, "active?": B, "section?": B, "ttl-minutes": I,
     "idle-action": ref("IdleAction"), "activity": arr(S), "description": S, "config-ok?": B, "config-project": S,
-    "dir": S, "files": arr(S), "env-keys": arr(S), "env-src": {"type": "object", "additionalProperties": S},
+    "dir": S, "files": arr(S), "env-keys": arr(S), "call-env-keys": arr(S),
+    "env-src": {"type": "object", "additionalProperties": S},
     "services": arr(S), "idle-seconds": I, "reap-in-seconds": I, "reap-blocked?": B,
     "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I})},
     "orphaned?": B, "usage": ref("Usage"), "in-use-via": arr(S), "programs": arr(ref("ProgramRow"))},
@@ -173,7 +176,10 @@ keyed = obj({"added": arr(S), "removed": arr(S), "changed": arr(S)})
 components["ReloadResult"] = obj({"source": {"enum": ["config-source", "host-config", "none"]}, "profiles": arr(S),
     "projects": arr(S), "changed": obj({"projects": keyed, "profiles": keyed, "settings": arr(S), "restart-required": arr(S)}),
     "sections": obj({"rebased": arr(S), "kept": arr(obj({"id": S, "reason": {"enum": ["project-removed"]}}))}),
-    "not-reloaded": arr(S), "note": S}, ["source", "profiles", "projects", "changed", "sections", "not-reloaded"])
+    "not-reloaded": arr(S), "note": S,
+    "call-env-dropped": {"type": "object", "description": "{section [var]}: remembered call env forgotten because the reload changed its declared value",
+                         "additionalProperties": arr(S)}},
+    ["source", "profiles", "projects", "changed", "sections", "not-reloaded"])
 components["HelpResult"] = obj({"commands": {"type": "object", "additionalProperties": S}}, ["commands"])
 components["AdoptResult"] = obj({"adopted": arr(S)}, ["adopted"])
 
@@ -207,7 +213,7 @@ def ok_of(schema_ref):
 responses = {
   "BadRequest": {"description": "compose/missing-param, compose/invalid-param (also a body that is not a JSON object)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "NotFound": {"description": "compose/unknown-command, compose/unknown-profile, compose/unknown-target, compose/unknown-project, compose/no-projects", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
-  "Conflict": {"description": "compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "Conflict": {"description": "compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "EngineFailed": {"description": "compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved, secrets/unknown-backend", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Forbidden": {"description": "compose/forbidden-origin: Host not a loopback name, or an Origin header from a web page", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "UnsupportedMediaType": {"description": "compose/unsupported-media-type: a POST without Content-Type application/json", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},

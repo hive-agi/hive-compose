@@ -105,16 +105,25 @@
              (empty? agents) (assoc :agents []))))))
 
 (defn section-holders
-  "[{:section id :services [s] :profile Profile}] of the live active entries
-   of compose project `project` (`self` included) whose footprint holds any of
-   `services` and that kept the Profile they ran with, by section id. Pure."
+  "[{:section id :services [s] :profile Profile}] of the active entries of
+   compose project `project` whose footprint holds any of `services` and that
+   kept the Profile they ran with, by section id. Orphaned ones count: their
+   containers still run the code they were created from, so they say where a
+   recreate must come from (liveness only decides who may object, see
+   `holders`). Pure."
   [active project services]
   (let [wanted (set services)]
     (vec (for [[id a] (sort-by key active)
-               :when (and (= project (:project a)) (live? a) (:profile a))
+               :when (and (= project (:project a)) (:profile a))
                :let [held (vec (sort (filter wanted (plan/footprint a))))]
                :when (seq held)]
            {:section id :services held :profile (:profile a)}))))
+
+(defn- same-inputs
+  "What two holders must share for a call to run from either: compose inputs,
+   compose project name and native profiles."
+  [p]
+  (assoc (inputs p) :project (:profile/project p) :compose-profiles (vec (:profile/compose-profiles p))))
 
 (defn pick-holder
   "Which live section's compose inputs a call on `services` of `project` runs
@@ -130,7 +139,7 @@
         [h & more] hs]
     (cond
       (nil? h) {:none true}
-      (every? #(= (inputs (:profile h)) (inputs (:profile %))) more)
+      (every? #(= (same-inputs (:profile h)) (same-inputs (:profile %))) more)
       {:holder (:profile h) :section (:section h)}
       :else {:disagree (vec (for [x hs]
                               (cond-> (select-keys x [:section :services])
@@ -138,13 +147,16 @@
                                                                         (inputs (:profile h)))))))})))
 
 (defn outcomes
-  "{service \"recreated\"|\"kept\"} of `services` from the container ids before
-   and after a call ({service id}): kept when the same container still runs it,
-   recreated otherwise. What the engine did, not what was allowed. Pure."
+  "{service \"recreated\"|\"kept\"|\"created\"|\"absent\"} of `services` from
+   the container ids before and after a call ({service id}): kept when the same
+   container still runs it, recreated when another replaced it, created when
+   it had none before, absent when it has none after. What the engine did,
+   not what was allowed. Pure."
   [services before after]
   (into (sorted-map)
-        (for [s services]
-          [s (if (and (some? (get before s)) (= (get before s) (get after s))) "kept" "recreated")])))
+        (for [s services
+              :let [b (get before s) a (get after s)]]
+          [s (cond (nil? a) "absent" (nil? b) "created" (= a b) "kept" :else "recreated")])))
 
 (defn describe
   "One line naming each holder of `found`, its agents and what differs."
