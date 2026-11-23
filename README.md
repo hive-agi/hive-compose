@@ -140,6 +140,7 @@ program whose env cannot be read is reported and not started.
 | `up target=… \| profile=…` | start a section alongside whatever runs |
 | `switch target=…` | make it current; stop what only the previous section needed |
 | `down` / `stop` | remove / stop a section's containers, sparing services other active sections need |
+| `build target=… [services=a,b] [no_cache] [pull]` | build the section's images under its compose project name (see Build) |
 | `touch` | reset a section's idle clock (`ps` and `logs` touch too) |
 | `ps` / `logs tail=N` | inspect |
 | `status` | active sections, idle time, seconds until reaped |
@@ -154,6 +155,31 @@ program whose env cannot be read is reported and not started.
 
 Hooks for other addons: `:compose/touch!`, `:compose/status`, `:compose/tick!`,
 `:compose/claim!`, `:compose/release!`, `:compose/nrepl-for`, `:compose/who`.
+
+## Build: images under the section's compose project
+
+`docker compose build` run by hand in a checkout tags `<checkout-dir>-<svc>`,
+which the shared project never runs. `build` builds with the section's
+effective compose inputs (the dir, files and env an `up` of it runs with; a
+target held by a live section runs from that section's checkout) and under its
+compose project name, so the tag is the one its containers use
+(`<project>-<svc>`, or the service's `image:`):
+
+```
+compose build target=dc/sisf-payment              # every service of the closure that declares build:
+compose build profile=flow-payment services=sisf-payment no_cache=true pull=true
+```
+
+The answer lists `built [{service image id}]` (ids read after the build),
+`project`, `dir` and `duration-ms`. A build creates, recreates and stops no
+container: `running-old-image` names the active sections that keep the old
+image until recreated (`restart recreate=true`). A named service outside the
+section is `unknown-names`, one without `build:` `invalid-param`; nothing to
+build is an ok answer saying so. Builds of one compose project run one at a
+time (a second call answers `build-busy`); each runs under
+`:compose/build-timeout-ms` (default 30 minutes). A failed build is
+`build-failed` (HTTP 502) with the failing service and the last 30 lines of
+the build output.
 
 ## Swarm work
 

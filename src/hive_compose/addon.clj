@@ -38,6 +38,8 @@
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.target :as target]
             [hive-compose.pipeline.restart :as restart]
+            [hive-compose.pipeline.build :as build]
+            [hive-compose.promote.build :as build-law]
             [hive-compose.pipeline.swarm :as swarm]
             [hive-compose.adapter.swarm :as swarm-adapter]
             [hive-compose.adapter.procnet :as procnet]
@@ -150,6 +152,8 @@
      :settings settings
      :state state
      :faults (atom {})
+     ;; {compose-project {:section :services :since}}: one build per project at a time
+     :builds (atom {})
      :toxiproxy (:compose/toxiproxy cfg)
      :now (or (:compose/now cfg) now-ms)
      :save! (or (:compose/save! cfg) (fn [_] (sync!)))
@@ -216,6 +220,7 @@
    "down" "remove a section's containers (never volumes), keeping what other sections need; :kept names those and :note says when nothing was removed. target|profile"
    "stop" "stop a section's containers, keeping what other sections need; :kept names those and :note says when nothing was stopped. target|profile"
    "restart" "restart a section's services in place even when other sections need them; recreate=true recreates the containers (never their depends_on), refused when another live section holds one of them unless allow_shared. A target runs from the section holding its services (its dir, files and env); a recreate's env is remembered by that WHOLE section, so its other services that read a var get it at their next up. target|profile; env; allow_orphans; allow_shared"
+   "build" "build a section's images with the section's effective compose inputs (the dir, files and env an up of it runs with; a target runs from the section holding its services) under its compose project name, so the tags are the ones the project's containers run (<project>-<service> or the service's image:), never <checkout-dir>-<service>. Creates, recreates and stops no container: :running-old-image names the active sections whose containers keep the old image until recreated (restart recreate=true). Builds of one compose project run one at a time (a second call is refused with build-busy). target|profile; services=a,b (default every service of the section's closure that declares build:; one not in the section is unknown-names, one with no build: invalid-param); no_cache; pull. Answers built [{service image id}], project, dir, duration-ms; a failed build is build-failed with the failing service and the last lines of the build output"
    "touch" "reset the idle clock. target|profile for one section; none for every active one; project to narrow"
    "ps" "what a section needs and which of it runs. target|profile"
    "logs" "last log lines of a section. target|profile; tail"
@@ -426,6 +431,14 @@
                          ;; recreated from p: an assumed section's inputs are now known
                          (ops/inputs-known! ctx (or section (:profile/id p)) p))
                        res)))
+        ;; a build runs with the inputs an up of the section would (its dir,
+        ;; files, env and compose project; a target from its holder) and
+        ;; creates no container, so no ownership or orphan guard
+        "build" (on-effective
+                 (fn [p _ _]
+                   (build/build! ctx p {:services (build-law/parse-services (param params "services"))
+                                        :no-cache? (flag params "no_cache")
+                                        :pull? (flag params "pull")})))
         "touch" (if (or tgt id)
                   (on-subject #(ops/touch! ctx (:profile/id %)))
                   (ops/touch-all! ctx (some-> (param params "project") str)))
@@ -469,6 +482,7 @@
                      "a section while it is claimed, agents work in its project or new nREPL connections reach it, "
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
                      "A WAVE claim (claim ttl_minutes=.. note=.., up to 8 h, owner may be a coordinator) holds until it ends or is released, even when its owner parks or leaves the swarm. "
+                     "BUILD: build target=<project/name>|profile=<id> [services=a,b] [no_cache] [pull] builds the section's images with its effective compose inputs under its compose project name (tags <project>-<service>, never <checkout-dir>-<service>); it recreates nothing and names the active sections still running the old image. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
                      "SUITES: test suites=X,Y projects=A,B runs the suite x project matrix on one union stack and answers per-cell verdicts from exit code and JUnit/TAP; a failed matrix stays up for inspection. "
@@ -482,7 +496,10 @@
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
-                              "env" {:type "object" :description "[up|switch|restart] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys); a null value (\"VAR\": null) forgets VAR (a no-op when not remembered); a reload that changes VAR's declared value forgets it too"}
+                              "env" {:type "object" :description "[up|switch|restart|build] extra environment for compose interpolation, e.g. {\"HOST_GATEWAY_IP\": \"192.168.1.5\"}; a value {\"pass\": \"<store path>\"} is read from pass when the containers are created, and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys); a null value (\"VAR\": null) forgets VAR (a no-op when not remembered); a reload that changes VAR's declared value forgets it too"}
+                              "services" {:type "string" :description "[build] the services to build, a,b (default every service of the section's closure that declares build:); each must be in the section and declare build:"}
+                              "no_cache" {:type "boolean" :description "[build] build without the layer cache (--no-cache)"}
+                              "pull" {:type "boolean" :description "[build] pull newer base images first (--pull)"}
                               "project" {:type "string" :description "[touch] with no target: only the sections of this project; [nrepl] only this project's routes; [flaky] only runs against this project"}
                               "suite" {:type "string" :description "[flaky] only cases of this suite"}
                               "limit" {:type "integer" :description "[flaky] how many ranked cases (default 20)"}
@@ -510,7 +527,7 @@
 
 (def ^:private subject-commands
   "Commands that resolve a section from target or profile (ops/subject)."
-  #{"up" "switch" "down" "stop" "restart" "touch" "ps" "logs" "claim" "release"})
+  #{"up" "switch" "down" "stop" "restart" "build" "touch" "ps" "logs" "claim" "release"})
 
 (def command-params
   "{command #{param}}: the params each command reads, the one source the

@@ -62,7 +62,7 @@ components["ComposeRequest"] = {
                    "while the server still ignores what it does not read. A declared param of the wrong JSON type is answered 400 compose/invalid-param.",
     "x-source": "generated", "x-from": "hive-compose.addon/tool :inputSchema @ origin/staging"}
 
-SUBJECT = ["up", "switch", "down", "stop", "restart", "ps", "logs", "claim", "release"]
+SUBJECT = ["up", "switch", "down", "stop", "restart", "build", "ps", "logs", "claim", "release"]
 def request_for(cmd):
     ps = tool["command-params"][cmd]  # hive-compose.addon/command-params: what the API enforces
     if not ps:
@@ -124,6 +124,15 @@ components["UpResult"] = obj(dict({"profile": S, "project": S, "services": arr(S
 components["DownResult"] = {"allOf": [ref("StepReport"), obj({"out": S})], "x-source": "hand", "description": "ops/down-profile!"}
 components["RestartResult"] = obj(dict({"profile": S, "project": S, "services": arr(S),
     "action": {"enum": ["restart", "recreate"]}, "out": S, "note": S}, **guard), ["profile", "project", "services", "action"])
+components["BuildResult"] = obj(dict({"profile": S, "project": {"type": "string", "description": "the compose project name the images were built under: a tag is <project>-<service> unless the service sets image:"},
+    "dir": {"type": "string", "description": "the project directory the build ran in (the holding section's for a held target)"},
+    "built": arr(obj({"service": S, "image": S, "id": nullable(S)}, ["service", "image", "id"])),
+    "running-old-image": {"description": "active sections whose containers keep the image they were created from until recreated",
+                          **arr(obj({"section": S, "services": arr(S)}, ["section", "services"]))},
+    "duration-ms": I, "note": S, "image-ids-error": {"type": "object"},
+    "holder-skipped": guard["holder-skipped"]}),
+    ["profile", "project", "built", "running-old-image", "duration-ms"],
+    desc="pipeline.build/build!: the images built with the section's effective compose inputs; nothing to build is built [] with a note")
 components["TouchResult"] = {"oneOf": [obj({"profile": S, "last-touch": I}, ["profile", "last-touch"]),
                                        obj({"touched": arr(S), "last-touch": I}, ["touched", "last-touch"])], "x-source": "hand"}
 components["PsResult"] = obj({"profile": S, "project": S, "needs": arr(S), "running": arr(S)}, ["profile", "project", "needs", "running"])
@@ -198,6 +207,7 @@ components["AdoptResult"] = obj({"adopted": arr(S)}, ["adopted"])
 
 RESULT = {"help": "HelpResult", "status": "StatusResult", "targets": "TargetsResult", "programs": "ProgramsResult",
           "up": "UpResult", "switch": "UpResult", "down": "DownResult", "stop": "DownResult", "restart": "RestartResult",
+          "build": "BuildResult",
           "touch": "TouchResult", "ps": "PsResult", "logs": "LogsResult", "claim": "ClaimResult", "release": "ReleaseResult",
           "who": "WhoResult", "nrepl": "NreplResult", "reap": "ReaperPass", "adopt": "AdoptResult",
           "projects": "ProjectsResult", "reload": "ReloadResult",
@@ -217,7 +227,7 @@ components["FlakyResult"] = open_result("pipeline.flaky/flaky: test cases ranked
 components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
 components["TestResult"] = open_result("pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env'd per variant; a suite without variants under a variants filter ran once and carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file")
 STACKS = {"faults", "stack-up", "stack-down", "stack-status", "plan", "why", "flaky", "test"}
-MUTATES = {"up", "switch", "down", "stop", "restart", "touch", "claim", "release", "reap", "adopt", "reload",
+MUTATES = {"up", "switch", "down", "stop", "restart", "build", "touch", "claim", "release", "reap", "adopt", "reload",
            "faults", "stack-up", "stack-down", "why", "test"}
 assert set(RESULT) == set(tool["commands"]), set(tool["commands"]) ^ set(RESULT)
 
@@ -227,8 +237,8 @@ def ok_of(schema_ref):
 responses = {
   "BadRequest": {"description": "compose/missing-param, compose/invalid-param (also a body that is not a JSON object)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "NotFound": {"description": "compose/unknown-command, compose/unknown-profile, compose/unknown-target, compose/unknown-project, compose/no-projects", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
-  "Conflict": {"description": "compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
-  "EngineFailed": {"description": "compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved, secrets/unknown-backend", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "Conflict": {"description": "compose/build-busy (one build per compose project at a time), compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
+  "EngineFailed": {"description": "compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/build-failed (service, exit, output-tail, timed-out?), compose/secret-unresolved, secrets/unknown-backend", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Forbidden": {"description": "compose/forbidden-origin: Host not a loopback name, or an Origin header from a web page", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "UnsupportedMediaType": {"description": "compose/unsupported-media-type: a POST without Content-Type application/json", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
   "Internal": {"description": "compose/dispatch-threw, compose/internal and any unmapped category (class and message only)", "content": {"application/json": {"schema": ref("ErrorEnvelope")}}},
@@ -254,7 +264,7 @@ for cmd in tool["commands"]:
         op["responses"]["503"] = {"$ref": "#/components/responses/Unavailable"}
     if cmd in SUBJECT or cmd in ("touch",) or cmd in STACKS:
         op["responses"]["404"] = {"$ref": "#/components/responses/NotFound"}
-    if cmd in ("up", "switch", "restart", "touch", "release", "claim") or cmd in STACKS:
+    if cmd in ("up", "switch", "restart", "build", "touch", "release", "claim") or cmd in STACKS:
         op["responses"]["409"] = {"$ref": "#/components/responses/Conflict"}
     if cmd in SUBJECT or cmd in ("targets", "projects", "reload") or cmd in STACKS:
         op["responses"]["502"] = {"$ref": "#/components/responses/EngineFailed"}

@@ -433,6 +433,65 @@
     (or (fault world :container-ids)
         (r/ok (select-keys (get-in @world [:cids (profile/project p)] {}) services)))))
 
+;; ---------------------------------------------------------------------------
+;; IImageBuilder: a model service with :build? true declares `build:`; its
+;; image is its :image, else <compose project>-<service>. Every build is
+;; recorded as [:build project services opts] and under :builds with the
+;; Profile it ran with; each built image gets a fresh id. `build-fails!`
+;; makes a build fail with a given output.
+
+(defn- image-of [project svc m]
+  (or (:image m) (str project "-" svc)))
+
+(extend-type StubEngine
+  port/IImageBuilder
+  (-build-facts [{:keys [world]} p]
+    (record! world [:build-facts (:profile/id p)])
+    (or (fault world :build-facts)
+        (unset world p)
+        (let [project (profile/project p)
+              model (get-in @world [:projects project])
+              targets (or (seq (:profile/services p)) (enabled model (:profile/compose-profiles p)))]
+          (if-let [missing (first (remove model targets))]
+            (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " missing)})
+            (r/ok (into (sorted-map)
+                        (for [s (closure model targets)
+                              :let [m (get model s)]]
+                          [s {:build? (boolean (:build? m)) :image (image-of project s m)}])))))))
+  (-build! [{:keys [world]} p services opts]
+    (record! world [:build (profile/project p) (vec services) opts])
+    (swap! world update :builds (fnil conj []) {:profile p :services (vec services) :opts opts})
+    (or (fault world :build)
+        (when-let [out (:build-fails @world)]
+          (r/err :compose/command-failed {:exit 17 :stderr out}))
+        (let [project (profile/project p)
+              model (get-in @world [:projects project])]
+          (swap! world (fn [w]
+                         (reduce (fn [w s]
+                                   (let [w (update w :image-seq (fnil inc 0))]
+                                     (assoc-in w [:image-ids (image-of project s (get model s))]
+                                               (format "sha256:%064d" (:image-seq w)))))
+                                 w services)))
+          (r/ok {:out "built"}))))
+  (-image-ids [{:keys [world]} refs]
+    (or (fault world :image-ids)
+        (r/ok (select-keys (:image-ids @world {}) refs)))))
+
+(defn build-fails!
+  "Make every build fail (exit 17) with output `text`; nil makes builds pass."
+  [e text]
+  (swap! (:world e) assoc :build-fails text))
+
+(defn builds
+  "[{:profile :services :opts}] of every -build! so far."
+  [e]
+  (:builds @(:world e) []))
+
+(defn image-ids
+  "{ref id} of the images the stub world holds."
+  [e]
+  (:image-ids @(:world e) {}))
+
 (defn ups
   "[{:profile :services}] of every -up! so far: the Profile each ran with."
   [e]

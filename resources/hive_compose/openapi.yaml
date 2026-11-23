@@ -452,6 +452,63 @@ paths:
           $ref: '#/components/responses/Conflict'
         '502':
           $ref: '#/components/responses/EngineFailed'
+  /v1/build:
+    post:
+      operationId: build
+      summary: 'build a section''s images with the section''s effective compose inputs (the dir, files and env an
+        up of it runs '
+      description: 'build a section''s images with the section''s effective compose inputs (the dir, files and env
+        an up of it runs with; a target runs from the section holding its services) under its compose project name,
+        so the tags are the ones the project''s containers run (<project>-<service> or the service''s image:), never
+        <checkout-dir>-<service>. Creates, recreates and stops no container: :running-old-image names the active
+        sections whose containers keep the old image until recreated (restart recreate=true). Builds of one compose
+        project run one at a time (a second call is refused with build-busy). target|profile; services=a,b (default
+        every service of the section''s closure that declares build:; one not in the section is unknown-names, one
+        with no build: invalid-param); no_cache; pull. Answers built [{service image id}], project, dir, duration-ms;
+        a failed build is build-failed with the failing service and the last lines of the build output'
+      tags:
+      - sections
+      x-hive-call-op: build
+      x-mcp:
+        tool: compose
+        command: build
+      x-mutates: true
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Req_build'
+      responses:
+        '200':
+          description: Result ok
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/Ok'
+                - type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/BuildResult'
+                  required:
+                  - value
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/EngineFailed'
   /v1/touch:
     post:
       operationId: touch
@@ -3142,6 +3199,9 @@ components:
         up-timeout-ms:
           type: integer
           minimum: 1000
+        build-timeout-ms:
+          type: integer
+          minimum: 1000
         adopt?:
           type: boolean
         programs?:
@@ -3828,6 +3888,10 @@ components:
           type: boolean
           description: '[test] a skipped case fails its cell (the case stays skipped in the report); default each
             suite''s :suite/skip-fails?, else false'
+        services:
+          type: string
+          description: '[build] the services to build, a,b (default every service of the section''s closure that
+            declares build:); each must be in the section and declare build:'
         project:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
@@ -3862,11 +3926,14 @@ components:
         keep_up:
           type: boolean
           description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
+        pull:
+          type: boolean
+          description: '[build] pull newer base images first (--pull)'
         dry_run:
           type: boolean
           description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
         env:
-          description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
+          description: '[up|switch|restart|build] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
             a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
@@ -3913,6 +3980,9 @@ components:
           type: boolean
           description: '[up|switch|restart] go ahead although processes a dead docker daemon left running still
             hold the section''s volumes or ports (refused by default, naming them)'
+        no_cache:
+          type: boolean
+          description: '[build] build without the layer cache (--no-cache)'
         test:
           type: string
           description: '[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>'
@@ -3982,6 +4052,9 @@ components:
       - compose/alias-shadows-service
       - compose/api-bind-failed
       - compose/attach-threw
+      - compose/build-busy
+      - compose/build-failed
+      - compose/build-unsupported
       - compose/bundle-unwritable
       - compose/cell-threw
       - compose/claim-ttl-over-max
@@ -4480,6 +4553,79 @@ components:
       - project
       - services
       - action
+      x-source: hand
+    BuildResult:
+      type: object
+      properties:
+        profile:
+          type: string
+        project:
+          type: string
+          description: 'the compose project name the images were built under: a tag is <project>-<service> unless
+            the service sets image:'
+        dir:
+          type: string
+          description: the project directory the build ran in (the holding section's for a held target)
+        built:
+          type: array
+          items:
+            type: object
+            properties:
+              service:
+                type: string
+              image:
+                type: string
+              id:
+                anyOf:
+                - type: string
+                - type: 'null'
+            required:
+            - service
+            - image
+            - id
+            x-source: hand
+        running-old-image:
+          description: active sections whose containers keep the image they were created from until recreated
+          type: array
+          items:
+            type: object
+            properties:
+              section:
+                type: string
+              services:
+                type: array
+                items:
+                  type: string
+            required:
+            - section
+            - services
+            x-source: hand
+        duration-ms:
+          type: integer
+        note:
+          type: string
+        image-ids-error:
+          type: object
+        holder-skipped:
+          type: object
+          properties:
+            section:
+              type: string
+            dir:
+              type: string
+            reason:
+              type: string
+          description: 'the section holding these services was not used: its dir no longer exists; the call ran
+            from the project defaults'
+          x-source: hand
+      required:
+      - profile
+      - project
+      - built
+      - running-old-image
+      - duration-ms
+      description: 'pipeline.build/build!: the images built with the section''s effective compose inputs; nothing
+        to build is built [] with a note'
       x-source: hand
     TouchResult:
       oneOf:
@@ -5360,7 +5506,7 @@ components:
           description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
             the holder section and its agents)'
         env:
-          description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
+          description: '[up|switch|restart|build] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
             a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
@@ -5404,7 +5550,7 @@ components:
           description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
             the holder section and its agents)'
         env:
-          description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
+          description: '[up|switch|restart|build] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
             a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
@@ -5484,7 +5630,7 @@ components:
           description: '[up|switch|restart] recreate a service another live section holds (refused by default, naming
             the holder section and its agents)'
         env:
-          description: '[up|switch|restart] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
+          description: '[up|switch|restart|build] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
             "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
             and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
             a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
@@ -5501,6 +5647,45 @@ components:
           type: boolean
           description: '[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting
             them in place'
+        target:
+          type: string
+          description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
+            or a,b'
+      additionalProperties: false
+      x-source: generated
+      x-params-from: hive-compose.addon/command-params (the API refuses any other key)
+      x-requires-one-of:
+      - target
+      - profile
+      description: 'target resolves a section; else profile looks up a preset or active section id (ops/subject).
+        Neither: missing-param.'
+    Req_build:
+      type: object
+      properties:
+        env:
+          description: '[up|switch|restart|build] extra environment for compose interpolation, e.g. {"HOST_GATEWAY_IP":
+            "192.168.1.5"}; a value {"pass": "<store path>"} is read from pass when the containers are created,
+            and shown only as pass:<path>. The section remembers it for later up/restart/reaper passes (status call-env-keys);
+            a null value ("VAR": null) forgets VAR (a no-op when not remembered); a reload that changes VAR''s declared
+            value forgets it too'
+          type: object
+          additionalProperties:
+            anyOf:
+            - $ref: '#/components/schemas/EnvValue'
+            - type: 'null'
+        no_cache:
+          type: boolean
+          description: '[build] build without the layer cache (--no-cache)'
+        profile:
+          type: string
+          description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
+        pull:
+          type: boolean
+          description: '[build] pull newer base images first (--pull)'
+        services:
+          type: string
+          description: '[build] the services to build, a,b (default every service of the section''s closure that
+            declares build:); each must be in the section and declare build:'
         target:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name,
@@ -5895,15 +6080,16 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     Conflict:
-      description: compose/not-active, compose/not-claimed, compose/orphans-hold-resources, compose/held-by-another-section
-        (pass allow_orphans / allow_shared), compose/holders-disagree (pass profile=<id>)
+      description: compose/build-busy (one build per compose project at a time), compose/not-active, compose/not-claimed,
+        compose/orphans-hold-resources, compose/held-by-another-section (pass allow_orphans / allow_shared), compose/holders-disagree
+        (pass profile=<id>)
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     EngineFailed:
-      description: compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/secret-unresolved,
-        secrets/unknown-backend
+      description: compose/command-failed (docker compose exited non-zero; stderr scrubbed and clipped), compose/build-failed
+        (service, exit, output-tail, timed-out?), compose/secret-unresolved, secrets/unknown-backend
       content:
         application/json:
           schema:

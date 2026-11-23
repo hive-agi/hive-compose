@@ -82,6 +82,27 @@
      profile's compose project, by label (no compose file is loaded). A service
      with no container is absent."))
 
+(defprotocol IImageBuilder
+  "Optional engine capability: build the images of a section's services with
+   the section's compose inputs and under its compose project name, so the
+   tags are the ones the project's containers run (card
+   20261123112858-6f2c31bc). A build creates, recreates and stops no
+   container. See `hive-compose.promote.build` for the data."
+  (-build-facts [e profile]
+    "Result<{service {:build? bool :image ref}}>: every service of the
+     profile's depends_on closure (its named services, else what its native
+     profiles enable), whether it declares `build:`, and the image reference
+     compose tags its build with (`image:`, else `<project>-<service>`).")
+  (-build! [e profile services opts]
+    "Result<{:out}>: `compose build` of `services` with the profile's dir,
+     files, project name, native profiles and env (secret references read
+     now, as for an up). `opts` {:no-cache? bool :pull? bool}. Runs under the
+     build timeout. A failing build is :compose/command-failed carrying :exit
+     and :stderr (clipped to its tail); one past the timeout :shell/timeout.")
+  (-image-ids [e refs]
+    "Result<{ref id}>: the image id (sha256:..) each of image references
+     `refs` names now."))
+
 (defprotocol ISwarm
   "The agents working beside the addon and the channel that reaches them."
   (-agents [s]

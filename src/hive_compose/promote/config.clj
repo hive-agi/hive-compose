@@ -15,6 +15,7 @@
      :compose/state-file           default ~/.local/state/hive-compose/state.edn
      :compose/timeout-ms           per compose call (default 60000)
      :compose/up-timeout-ms        per `up`, pulls included (default 600000)
+     :compose/build-timeout-ms     per `build` (default 1800000, 30 minutes)
      :compose/adopt?               adopt running stacks of configured profiles (default true)
      :compose/swarm?               count agents working in a project's directories as
                                    use of its sections (default true)
@@ -63,6 +64,7 @@
    :compose/default-idle-action :stop
    :compose/timeout-ms 60000
    :compose/up-timeout-ms 600000
+   :compose/build-timeout-ms 1800000
    :compose/adopt? true
    :compose/programs? true
    :compose/swarm? true
