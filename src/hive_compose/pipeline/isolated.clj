@@ -107,8 +107,11 @@
   [p]
   (if (seq (:profile/files p))
     (r/ok p)
+    ;; M8: compose's own default lookup reads the base file AND its override
+    ;; partner (compose.override.yaml / docker-compose.override.yml)
     (if-let [f (files/first-existing (:profile/dir p) iso/default-files)]
-      (r/ok (assoc p :profile/files [f]))
+      (r/ok (assoc p :profile/files (into [f] (keep #(files/first-existing (:profile/dir p) [%])
+                                                    [(iso/override-partner f)]))))
       (r/err :compose/no-compose-file {:dir (:profile/dir p) :looked-for iso/default-files}))))
 
 (defn- mb [b] (when b (quot b (* 1024 1024))))
@@ -133,6 +136,31 @@
                               :found {:containers (count cs) :volumes (count vs) :networks (count ns)}
                               :hint "a compose project of that name already exists and is not this run's; pick another run id"}))))))
 
+(defn- ports-free
+  "Result<nil> (M7): the host ports run `rid` plans (`planned` {svc {port
+   host}}) must not be planned by another live run, nor have a listener on
+   this host now (IProgramRunner/-listening?, when the context has a
+   runner). Else invalid-param naming the clashes."
+  [ctx e rid planned]
+  (let [mine (into {} (for [[s m] planned [k h] m] [h [s k]]))
+        theirs (into {} (for [[orid oe] (runs ctx)
+                              :when (and (not= orid rid) (not (:ended-at oe)))
+                              [s m] (:planned-ports oe) [k h] m]
+                          [h {:run orid :service s :port k}]))
+        rn (:runner ctx)
+        clash (vec (sort-by :host
+                            (for [[h [s k]] mine
+                                  :let [o (get theirs h)
+                                        busy? (and (nil? o) rn (satisfies? port/IProgramRunner rn) (port/-listening? rn h))]
+                                  :when (or o busy?)]
+                              (cond-> {:host h :service s :port k}
+                                o (assoc :run (:run o))
+                                busy? (assoc :listening? true)))))]
+    (if (seq clash)
+      (r/err :compose/invalid-param {:param "ports" :run rid :clashes clash
+                                     :hint "another live run plans these host ports, or something listens on them: use another offset"})
+      (r/ok nil))))
+
 (defn- refuse-external
   "Result<nil>: an external volume a service of the run mounts is refused
    unless the preset names it in :profile/run-shared-volumes (M4)."
@@ -151,12 +179,18 @@
    A service with no mem_limit counts at :compose/default-resources :mem."
   [ctx model cp services]
   (let [settings (:settings ctx)
-        d (:compose/default-resources settings)
-        dflt (when (map? d) (resources/parse-mem (:mem d)))
+        ;; M2: a service with no memory figure counts at
+        ;; :compose/run-default-service-mem-mb (default 128), never at 0
+        dflt (* 1024 1024 (or (:compose/run-default-service-mem-mb settings) 128))
+        assumed (vec (sort (remove (set (keys (iso/demand model services nil resources/parse-mem))) services)))
         budget (iso/budget cp (iso/demand model services dflt resources/parse-mem) 1)
-        lims (resources/limits settings nil (stacks/mem-available ctx))]
-    {:budget budget :limits lims
-     :verdict (resources/admit budget lims #{} (stacks/others-mem ctx budget))}))
+        lims (resources/limits settings nil (stacks/mem-available ctx))
+        ;; every OTHER live isolated run counts, beside the stack runs
+        runs-mem (reduce + 0 (for [[_ e] (runs ctx)
+                                   :when (and (not (:ended-at e)) (not= cp (:compose-project e)))]
+                               (get-in e [:budget :budget/total-mem] 0)))]
+    {:budget budget :limits lims :assumed assumed
+     :verdict (resources/admit budget lims #{} (+ runs-mem (stacks/others-mem ctx budget)))}))
 
 (defn- would-stop
   "Ids of the live sections and stack runs whose memory a refused run would
@@ -204,22 +238,40 @@
                                                   :hint "a run shared volume must be one the compose file declares"})
                    (r/ok nil))
                _ (refuse-external rid model shared)
-               tags (r/ok (iso/build-images model base))
+               policy (r/ok (or (:ports entry) (:ports opts) :strip))
+               ;; M3: the run env needs the planned ports, which need the model;
+               ;; read again WITH the run env, so every interpolation (HIVE_RUN,
+               ;; HIVE_PORT_..) the up will see is in the model the override,
+               ;; the ports and the digest are computed from
+               model (let [env (iso/run-env base rid policy (override/planned-ports model policy))
+                           m (port/-model e (-> p (dissoc :profile/override)
+                                                (assoc :profile/project (iso/compose-project base rid)
+                                                       :profile/base-project base)
+                                                (update :profile/env merge env)))]
+                       (if (r/err? m) (could-not-run rid {:reason :config-invalid :detail (select-keys m [:error :stderr])}) m))
+               planned (r/ok (override/planned-ports model policy))
+               run-env (r/ok (iso/run-env base rid policy planned))
+               ;; a run's own containers already listen on its ports when a
+               ;; second section joins: only a NEW run is probed
+               _ (if entry (r/ok nil) (ports-free ctx e rid planned))
+               cp (r/ok (iso/compose-project base rid))
+               path (r/ok (iso/override-path (state-file ctx) cp))
+               ip0 (r/ok (-> (iso/isolate p rid path (:profile/files p))
+                             (update :profile/env merge run-env)))
+               ;; B1: pin only what the section's closure runs (plus what the
+               ;; run recorded); B2: every image of it, by id
+               closure (port/-closure e (dissoc ip0 :profile/override))
+               tags (r/ok (merge (select-keys (iso/closure-images model base (keys (:images entry)))
+                                              (keys (:images entry)))
+                                 (iso/closure-images model base closure)))
                ids (port/-image-ids e (vals tags))
                pinned (let [x (iso/pin-images tags (:images entry) (into {} (for [[_ t] tags :when (get ids t)] [t (get ids t)])))]
                         (if (:error x) (could-not-run rid (:error x)) (r/ok (:ok x))))
-               policy (r/ok (or (:ports entry) (:ports opts) :strip))
                doc (override/override-doc model (iso/spec model base rid {:ports policy :images pinned
                                                                           :shared-volumes shared}))]
-      (let [cp (iso/compose-project base rid)
-            path (iso/override-path (state-file ctx) cp)
-            planned (override/planned-ports model policy)
-            run-env (iso/run-env base rid policy planned)
-            ip (-> (iso/isolate p rid path (:profile/files p))
-                   (update :profile/env merge run-env))]
-        (r/let-ok [closure (port/-closure e (dissoc ip :profile/override))
-                   running (r/ok (if entry (let [x (port/-running e ip)] (if (r/ok? x) (:ok x) #{})) #{}))]
-          (let [{:keys [budget verdict limits]} (admission ctx model cp (remove (set running) closure))]
+      (let [ip ip0]
+        (r/let-ok [running (r/ok (if entry (let [x (port/-running e ip)] (if (r/ok? x) (:ok x) #{})) #{}))]
+          (let [{:keys [budget verdict limits assumed]} (admission ctx model cp (remove (set running) closure))]
             (r/ok {:run rid :new? (nil? entry) :compose-project cp :profile ip :doc doc
                    :config-digest (config-digest {"config" model "override" doc} base rid)
                    :text (override/emit doc) :path path :images pinned :shared-volumes shared
@@ -232,7 +284,13 @@
                                :shared (vec shared)
                                :external (:external m)})
                    :binds (:binds (iso/mounts model))
+                   :budget budget
+                   :budget budget
                    :admission (cond-> {:verdict (if (r/ok? verdict) :ok :refused)
+                                       :assumed-services (count assumed)
+                                       :assumed-mb-each (or (get-in ctx [:settings :compose/run-default-service-mem-mb]) 128)
+                                       :assumed-services (count assumed)
+                                       :assumed-mb-each (or (get-in ctx [:settings :compose/run-default-service-mem-mb]) 128)
                                        :need-mb (mb (:budget/total-mem budget))
                                        :free-mb (mb (:host limits))
                                        :available-mb (mb (:available limits))
@@ -249,6 +307,8 @@
   [rid res]
   (could-not-run rid (merge (iso/classify (:stderr res))
                             {:detail (select-keys res [:error :exit :stderr])})))
+
+(declare end-run! grace-ms)
 
 (defn up!
   "Result: section `p` (call options applied) up inside isolated run
@@ -269,17 +329,31 @@
                                                 :dir (get-in pl [:profile :profile/dir])
                                                 :files (get-in pl [:profile :profile/files])
                                                 :override (:path pl)
+                                                :planned-ports (:planned-ports pl)
                                                 :external (get-in pl [:volumes :external])
                                                 :binds (:binds pl)
                                                 :env (env/rendered (get-in pl [:profile :profile/env]))))))
       (record-run! ctx rid #(-> %
                                 (dissoc :ended-at :ended-by :volumes-due-at :claim-gone?)
-                                (assoc :images (merge (:images %) (:images pl)))
+                                ;; m1: key-wise, so a merge of two instances keeps both
+                                (update :images (fnil merge {}) (:images pl))
+                                (update :budget (fn [b] (merge-with (fn [x y] (if (number? x) (+ x y) (merge x y)))
+                                                                    b (select-keys (:budget pl) [:budget/total-mem :budget/instances]))))
                                 (assoc-in [:digests (:profile/id p)]
                                           (config-digest {"config" (:model pl) "override" (:doc pl)} base rid))))
       (let [res (ops/up-profile! ctx (:profile pl))]
         (if (r/err? res)
-          (classify-failure rid res)
+          (let [err (classify-failure rid res)]
+            ;; M1: a NEW run that could not come up is ended at once: its
+            ;; started containers removed, its volumes kept and marked as for
+            ;; any ended run (the grace lets a human read them)
+            (if (and (:new? pl) (empty? (iso/run-sections (:active @(:state ctx)) rid)))
+              (let [row (end-run! ctx rid :could-not-run false)
+                    due (+ ((:now ctx)) (grace-ms (:settings ctx)))]
+                (when (:ended-at (get (runs ctx) rid))
+                  (record-run! ctx rid #(assoc % :volumes-due-at due)))
+                (assoc err :run-ended (select-keys row [:ended? :leftovers-error])))
+              err))
           (let [facts (port/-run-facts e (:profile pl))]
             (r/ok (cond-> (assoc (:ok res) :run rid :compose-project (:compose-project pl)
                                  :override (override/describe (:doc pl)) :env-run (:env pl))
@@ -294,6 +368,7 @@
             (fn [pl] (-> (select-keys pl [:run :new? :compose-project :path :images :shared-volumes
                                           :ports :planned-ports :env :admission :config-digest :volumes :binds])
                          (assoc :section (get-in pl [:profile :profile/id])
+                                :files (get-in pl [:profile :profile/files])
                                 :override (override/describe (:doc pl))
                                 :override-text (:text pl))))))
 
@@ -359,7 +434,8 @@
                     (port/-down-project! e {:project (:compose-project entry) :dir (:dir entry)
                                             :files (:files entry) :env (:env entry {}) :all? true})
                     (r/ok nil))
-        _ (record-run! ctx rid #(assoc % :ended-at ((:now ctx)) :ended-by how))
+        ;; m9: a failed `down` does not end the run: a later down retries it
+        _ (when (r/ok? leftovers) (record-run! ctx rid #(assoc % :ended-at ((:now ctx)) :ended-by how)))
         ;; m1: a failed `down` may leave containers: never remove then
         volumes? (and volumes? (r/ok? leftovers))
         vols (when volumes? (remove-volumes! ctx rid))]
@@ -478,6 +554,22 @@
   (when-let [[_ rid] (iso/split-id sid)]
     (when (get-in (runs ctx) [rid :volumes-due-at])
       (record-run! ctx rid #(dissoc % :volumes-due-at)))))
+
+(defn end-orphans!
+  "M1: end every isolated run never ended that holds no section and no live
+   claim, once it started more than the default TTL ago (an up that failed
+   half way, a hive-mcp that died during it). Its containers go, its volumes
+   are kept and marked as for any ended run. Answers a row per run."
+  [ctx]
+  (if-not (satisfies? port/IIsolatedRuns (:engine ctx))
+    []
+    (let [now ((:now ctx))
+          ttl (* 60000 (or (get-in ctx [:settings :compose/default-ttl-minutes]) 60))]
+      (vec (for [rid (iso/orphaned-runs (runs ctx) (:active @(:state ctx)) now ttl)]
+             (let [row (end-run! ctx rid :orphaned false)]
+               (when (:ended-at (get (runs ctx) rid))
+                 (record-run! ctx rid #(assoc % :volumes-due-at (+ now (grace-ms (:settings ctx))))))
+               (assoc row :reason :no-section)))))))
 
 (defn sweep-due!
   "Step 2 of the reaper's volume removal (M1): remove the volumes of every

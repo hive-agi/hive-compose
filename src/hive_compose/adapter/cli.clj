@@ -51,16 +51,22 @@
 (declare lines parse-json-rows parse-labels)
 
 (defn image-ls-argv
-  "Every local image as `<repo>:<tag>\\t<full id>`, one a line."
+  "Every local image as `<repo>:<tag>\\t<full id>\\t<repo>@<digest>`, one a line."
   []
-  ["docker" "image" "ls" "--no-trunc" "--format" "{{.Repository}}:{{.Tag}}\t{{.ID}}"])
+  ["docker" "image" "ls" "--no-trunc" "--digests" "--format" "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Repository}}@{{.Digest}}"])
 
 (defn image-ids
-  "{image id} of those of `images` that `image-ls-argv` output `s` lists; an
-   image named without a tag counts as `:latest`."
+  "{image id} of those of `images` (refs normalised: `docker.io/library/x:t`,
+   a tagless ref as `:latest`, `x@sha256:..` by its repo digest) that
+   `image-ls-argv` output `s` lists."
   [s images]
-  (let [have (into {} (for [l (lines s) :let [[ref id] (str/split l #"\t" 2)] :when (seq id)] [ref id]))]
-    (into (sorted-map) (keep (fn [i] (when-let [id (or (have i) (have (str i ":latest")))] [i id]))) images)))
+  (let [have (into {} (for [l (lines s)
+                            :let [[ref id dig] (str/split l #"\t" 3)]
+                            :when (seq id)
+                            k [ref dig]
+                            :when (and (seq k) (not (str/includes? k "<none>")))]
+                        [k id]))]
+    (into (sorted-map) (keep (fn [i] (when-let [id (have (isolated/normalize-ref i))] [i id]))) images)))
 
 (defn project-ids-argv
   "Full ids of the running containers of compose project `cp`, by label."
@@ -797,10 +803,13 @@
   ;; By label: no compose file is loaded; one inspect gives ports and images.
   (-run-facts [{:keys [exec timeout-ms]} p]
     (r/let-ok [ids (r/map-ok (run-argv exec (project-ids-argv (profile/project p)) timeout-ms) lines)]
-      (if (empty? ids)
-        (r/ok {:ports {} :images {}})
-        (parsed (run-argv exec (inspect-argv ids) timeout-ms) :compose/unparseable
-                (comp isolated/container-facts parse-json-rows)))))
+      ;; m10: one inspect per container, so one that exits between ps and
+      ;; inspect ("No such object") drops out instead of failing the row
+      (let [rows (into [] (mapcat (fn [id]
+                                    (let [x (run-argv exec (inspect-argv [id]) timeout-ms)]
+                                      (if (r/ok? x) (try (parse-json-rows (:ok x)) (catch Exception _ [])) []))))
+                       ids)]
+        (r/ok (isolated/container-facts rows)))))
   (-run-volumes [{:keys [exec timeout-ms]} cp]
     (parsed (run-argv exec (volume-ls-argv cp) timeout-ms) :compose/unparseable volume-rows))
   ;; The single volume-removing call (see the port's docstring): exact names,

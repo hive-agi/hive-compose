@@ -432,7 +432,14 @@
                                                          (assoc "name" (str (profile/project p) "_" k)))])))))
             (r/err :compose/command-failed {:exit 1 :stderr "no configuration file provided: not found\n"})))))
   (-image-ids [{:keys [world]} images]
-    (r/ok (into (sorted-map) (keep (fn [i] (when-let [id (get-in @world [:images i])] [i id]))) images)))
+    ;; as the CLI adapter: a ref is matched normalised (`x` is `x:latest`)
+    (r/ok (into (sorted-map)
+                (keep (fn [i] (let [n ((requiring-resolve 'hive-compose.promote.isolated/normalize-ref) i)
+                                    have (:images @world)]
+                                (when-let [id (or (get have i) (get have n)
+                                                  (get have (clojure.string/replace n #":latest$" "")))]
+                                  [i id]))))
+                images)))
   (-run-facts [{:keys [world]} p]
     (let [cp (profile/project p)]
       (r/ok {:ports (get-in @world [:bindings cp] {})
@@ -464,8 +471,8 @@
     (doseq [[k v] (get model "volumes")
             :when (not (get v "external"))
             ;; borrowed through the override (declared external there)
-            :when (not (some-> (:profile/override p) slurp
-                               (clojure.string/includes? (str "\"" k "\":\n    \"external\": true"))))
+            :when (not (some->> (:profile/override p) slurp
+                                (re-find (re-pattern (str "(?m)^  \"" k "\":\\n(?:    .*\\n)*?    \"external\": true")))))
             :when (or (nil? (get v "name")) (= (get v "name") (str base "_" k)))]
       ;; as compose: the override's `labels:` of the volume land on it at creation
       (swap! (:world e) assoc-in [:volumes (str cp "_" k)]

@@ -42,7 +42,7 @@
                        {"dc" {"postgres" {} "web" {:deps ["postgres"]} "worker" {}}})
         clock (atom 1000)]
     (stub/model! e "dc" model)
-    (stub/images! e {"dc-web" "sha256:aaa"})
+    (stub/images! e {"dc-web" "sha256:aaa" "postgres:16" "sha256:pg" "busybox:latest" "sha256:bb"})
     (stub/volumes! e {"dc_pgdata" {:labels {"com.docker.compose.project" "dc" "com.docker.compose.volume" "pgdata"}}
                       "ext" {:labels {}}})
     {:e e :dir dir :clock clock
@@ -92,14 +92,17 @@
         (is (str/includes? text "\"image\": \"sha256:aaa\""))
         (is (str/includes? text "\"name\": \"dc_go_cache\""))
         (is (str/includes? text "\"name\": \"dc-dcabc123_ledger_dcabc123\"") "an explicit name never leaks into a run")
-        (is (not (str/includes? text "pgdata")) "a compose-derived name is fresh under the run's -p")))
+        (is (not (str/includes? text "pgdata_dcabc123")) "a compose-derived name is fresh under the run's -p: no rename")
+        (is (str/includes? text "\"hive.compose.run\": \"dcabc123\"") "B1: the run's volumes carry its ownership labels")
+        (is (str/includes? text "\"driver\": !reset null") "B3: a borrowed volume resets its driver")))
     (testing "a second run keeps its own port policy"
       (is (= :compose/invalid-param (:error (isolated/up! ctx (preset ctx "flow-sync") {:run rid :ports :strip})))))))
 
 (deftest image-pinning
   (let [{:keys [ctx e]} (world)
         rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
-    (is (= {"web" "sha256:aaa"} (get-in @(:state ctx) [:runs rid :images])))
+    (is (= {"web" "sha256:aaa" "postgres" "sha256:pg"} (get-in @(:state ctx) [:runs rid :images]))
+        "B2: every image of the section's closure (web + postgres), not worker (outside it)")
     (stub/images! e {"dc-web" "sha256:bbb"})
     (let [x (isolated/up! ctx (preset ctx "flow-sync") {:run rid})]
       (is (= :compose/could-not-run (:error x)))
@@ -433,3 +436,61 @@
       (is (r/ok? down) (pr-str down))
       (is (empty? (:active @(:state ctx))))
       (is (= #{"postgres" "web"} (stub/running e "dc")) "the shared project never moved"))))
+
+(deftest b1-an-image-outside-the-closure-may-be-missing
+  (let [{:keys [ctx e]} (world)]
+    ;; worker is not in flow-payment's closure (web + postgres); its image is absent
+    (stub/model! e "dc" (assoc-in model ["services" "worker"] {"build" {"context" "."}}))
+    (let [x (isolated/up! ctx (preset ctx "flow-payment") {})]
+      (is (r/ok? x) (pr-str x))
+      (is (not (contains? (get-in @(:state ctx) [:runs (get-in x [:ok :run]) :images]) "worker"))))))
+
+(deftest b2-a-moved-tag-of-an-image-service-is-refused
+  (let [{:keys [ctx e]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+    (stub/images! e {"postgres:16" "sha256:pg2"})
+    (let [x (isolated/up! ctx (preset ctx "flow-sync") {:run rid})]
+      (is (= :image-changed (:reason x)) (pr-str x))
+      (is (= "postgres" (:service x))))))
+
+(deftest m1-a-new-run-that-could-not-come-up-is-ended
+  (let [{:keys [ctx e]} (world)]
+    (swap! (:world e) assoc :up-stderr "Error response from daemon: Bind for 0.0.0.0:5434 failed: port is already allocated")
+    (let [x (isolated/up! ctx (preset ctx "flow-sync") {:ports :keep})
+          rid (:run x)]
+      (is (= :compose/could-not-run (:error x)))
+      (is (get-in @(:state ctx) [:runs rid :ended-at]) "ended, not leaked")
+      (is (get-in @(:state ctx) [:runs rid :volumes-due-at]) "volumes kept and marked as for any ended run"))))
+
+(deftest m1-the-reaper-ends-an-orphaned-run
+  (let [{:keys [ctx clock]} (world)]
+    (swap! (:state ctx) assoc-in [:runs "dczzz111"] (iso/run-entry "dc" "dczzz111" :strip 1000))
+    (is (empty? (isolated/end-orphans! ctx)) "younger than the TTL")
+    (swap! clock + (* 61 60000))
+    (is (= ["dczzz111"] (map :run (isolated/end-orphans! ctx))))
+    (is (get-in @(:state ctx) [:runs "dczzz111" :ended-at]))))
+
+(deftest m2-uncapped-services-are-assumed-not-free
+  (let [{:keys [ctx]} (world)
+        x (isolated/plan ctx (preset ctx "flow-payment") {})]
+    (is (= 2 (get-in x [:ok :admission :assumed-services])) (pr-str x))
+    (is (= 256 (get-in x [:ok :admission :need-mb])))))
+
+(deftest m7-a-live-runs-ports-are-not-planned-twice
+  (let [{:keys [ctx]} (world)]
+    (is (r/ok? (isolated/up! ctx (preset ctx "flow-sync") {:ports {:offset 1000}})))
+    (let [ctx2 (assoc ctx :rand-hex (constantly "def456"))
+          x (isolated/up! ctx2 (preset ctx2 "flow-sync") {:ports {:offset 1000}})]
+      (is (= :compose/invalid-param (:error x)))
+      (is (= [6434] (map :host (:clashes x)))))))
+
+(deftest m8-default-files-come-in-compose-pairs
+  (let [{:keys [ctx dir]} (world)]
+    (spit (io/file dir "compose.override.yaml") "services: {}\n")
+    (let [x (isolated/plan ctx (dissoc (preset ctx "flow-sync") :profile/files) {})]
+      (is (r/ok? x) (pr-str x))
+      (is (= ["compose.yaml" "compose.override.yaml"] (get-in x [:ok :files]))))))
+
+(deftest m3-a-configured-profile-id-may-not-hold-an-at
+  (is (seq (hive-compose.schema/explain hive-compose.schema/Settings
+                                        {:compose/profiles {"x@abc123" {:profile/id "x@abc123" :profile/dir "/w"}}}))))

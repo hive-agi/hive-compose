@@ -175,7 +175,8 @@
               ;; step 2 first: volumes whose grace ran out on an EARLIER pass
               runs-swept (isolated/sweep-due! ctx)
               _ (isolated/note-observed! ctx observed)
-              runs-ended (isolated/after-reap! ctx (:reaped reaped) observed)
+              runs-ended (into (isolated/after-reap! ctx (:reaped reaped) observed)
+                               (when (= :ok (:swarm observed)) (isolated/end-orphans! ctx)))
               reaped (cond-> reaped
                        (seq runs-ended) (assoc :runs-ended runs-ended)
                        (seq runs-swept) (assoc :runs-swept runs-swept))

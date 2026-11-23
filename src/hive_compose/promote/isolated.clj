@@ -121,6 +121,33 @@
   [model base]
   (into (sorted-map) (for [s (override/build-only model)] [s (override/pinned-image base s)])))
 
+(defn normalize-ref
+  "An image reference as `docker image ls` prints it: `docker.io/library/x:t`
+   and `docker.io/x:t` drop the default registry, a tagless ref gets
+   `:latest`, a digest ref (`x@sha256:..`) is kept whole."
+  [ref]
+  (let [r (str ref)
+        r (str/replace r #"^docker\.io/(library/)?" "")
+        r (str/replace r #"^index\.docker\.io/(library/)?" "")
+        last-seg (last (str/split r #"/"))]
+    (cond
+      (str/includes? r "@") r
+      (str/includes? last-seg ":") r
+      :else (str r ":latest"))))
+
+(defn closure-images
+  "{service ref} of the services `closure` of `model` runs (B1/B2): its
+   `image:` (normalised), else for a build-only service the tag the shared
+   project `base` built (`<base>-<service>:latest`)."
+  [model base closure]
+  (into (sorted-map)
+        (for [s closure
+              :let [sm (get-in model ["services" s])]
+              :when sm]
+          [s (normalize-ref (if (str/blank? (str (get sm "image")))
+                              (override/pinned-image base s)
+                              (get sm "image")))])))
+
 (defn pin-images
   "Result-like {:ok {service id}} | {:error ..}: the image ids a run pins
    for its build-only services `tags` ({service tag}), given what the run
@@ -137,7 +164,8 @@
                 was (assoc-in acc [:ok s] was)
                 now (assoc-in acc [:ok s] now)
                 :else (reduced {:error {:reason :image-missing :service s :image tag
-                                        :hint "up (or build) the shared section first: an isolated run never builds"}}))))
+                                        :hint (str "an isolated run never pulls nor builds: `docker pull " tag
+                                                   "`, or up (build) the shared section, first")}}))))
           {:ok (sorted-map)}
           (sort-by key tags)))
 
@@ -228,6 +256,13 @@
    compose's default lookup."
   ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
 
+(defn override-partner
+  "The override file compose reads with default file `f` when given no -f:
+   compose.yaml -> compose.override.yaml, docker-compose.yml ->
+   docker-compose.override.yml (same stem, `.override` before the extension)."
+  [f]
+  (str/replace (str f) #"\.(ya?ml)$" ".override.$1"))
+
 (defn override-path
   "Where the override of compose project `cp` is written: `isolated/` beside
    the state file."
@@ -302,6 +337,17 @@
                    :when (and e (not (:ended-at e)) (empty? (run-sections active r)))]
                r))))
 
+(defn orphaned-runs
+  "Runs of `runs` never ended that hold NO section in `active` and started
+   more than `ttl-ms` before `now` (M1): an up that failed half way or a
+   hive-mcp that died during it left containers nobody answers for."
+  [runs active now ttl-ms]
+  (vec (sort (for [[r e] runs
+                   :when (and (:isolated? e) (not (:ended-at e))
+                              (empty? (run-sections active r))
+                              (>= (- now (:started-at e now)) ttl-ms))]
+               r))))
+
 ;; ---------------------------------------------------------------------------
 ;; failures
 
@@ -310,7 +356,9 @@
    compose printed (`stderr`)."
   [stderr]
   (let [s (str stderr)
-        svc (some->> (re-find #"(?:container|Container) ([A-Za-z0-9_.-]+)" s) second)
+        ;; m7: compose names the CONTAINER (<project>-<service>-<n>); answer the service
+        svc (some->> (re-find #"(?:container|Container) ([A-Za-z0-9_.-]+)" s) second
+                     (re-find #"^(?:.*?-[a-z0-9]{3,40}-)?(.+?)(?:-\d+)?$") second)
         port (some->> (re-find #"(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::)?:(\d+)(?: failed|: bind)" s) second parse-long)
         port (or port (some->> (re-find #"port (\d+)" s) second parse-long))]
     (cond-> {:reason (cond
@@ -324,21 +372,6 @@
 
 ;; ---------------------------------------------------------------------------
 ;; ports as data
-
-(defn bindings
-  "{service {\"<target>/<proto>\" host-port}} of `ps --format json` rows
-   (running containers): the host port docker bound to each container port."
-  [rows]
-  (reduce (fn [acc row]
-            (let [svc (get row "Service")]
-              (reduce (fn [acc pub]
-                        (let [h (get pub "PublishedPort") t (get pub "TargetPort")]
-                          (if (and svc (int? h) (pos? h) (int? t))
-                            (assoc-in acc [svc (str t "/" (get pub "Protocol" "tcp"))] (long h))
-                            acc)))
-                      acc (get row "Publishers"))))
-          (sorted-map)
-          (filter #(= "running" (get % "State")) rows)))
 
 ;; ---------------------------------------------------------------------------
 ;; volumes (Pedro, 2026-11-23: the single exception to "never remove a volume")

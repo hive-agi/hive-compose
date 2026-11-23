@@ -560,7 +560,11 @@
 (def Settings
   [:map
    [:compose/projects [:map-of :string Project]]
-   [:compose/profiles [:map-of :string Profile]]
+   ;; m3: `@` is reserved for the derived ids of isolated runs (<id>@<run>)
+   [:compose/profiles [:map-of [:re {:error/message "a configured profile id may not contain @ (reserved for <id>@<run>)"}
+                                #"^[^@]+$"]
+                       [:and Profile [:fn {:error/message "a configured profile id may not contain @"}
+                                      #(not (re-find #"@" (str (:profile/id %))))]]]]
    [:compose/tick-seconds [:int {:min 5}]]
    [:compose/default-ttl-minutes [:int {:min 1}]]
    [:compose/default-idle-action IdleAction]
@@ -588,7 +592,10 @@
    ;; FUN-D M1: how long the reaper keeps an isolated run's volumes after
    ;; ending the run before it removes them (up run=<id>, a claim or a touch
    ;; on a section of the run cancels the removal)
-   [:compose/run-volumes-grace-minutes {:optional true} [:int {:min 1}]]])
+   [:compose/run-volumes-grace-minutes {:optional true} [:int {:min 1}]]
+   ;; FUN-D M2: the memory an isolated run's admission assumes for a
+   ;; service whose compose file sets no mem_limit
+   [:compose/run-default-service-mem-mb {:optional true} [:int {:min 1}]]])
 
 (def InstanceCaps
   "The caps the stack plan resolved for one instance: `:mem` in bytes and
@@ -649,7 +656,8 @@
    [:map {:closed true} [:offset [:int {:min -65535 :max 65535}]]]
    [:map {:closed true}
     [:publish [:map-of [:string {:min 1}]
-               [:map-of [:int {:min 1 :max 65535}] [:int {:min 0 :max 65535}]]]]]])
+               [:map-of [:or [:int {:min 1 :max 65535}] [:re #"^[0-9]{1,5}(/(tcp|udp|sctp))?\z"]]
+                [:int {:min 0 :max 65535}]]]]]])
 
 (def OverrideSpec
   "What the override of one private copy changes. `:override/names` the

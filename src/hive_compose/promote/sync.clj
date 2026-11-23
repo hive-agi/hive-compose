@@ -72,7 +72,10 @@
   (let [same? (and (= (:base-project m) (:base-project t))
                    (= (:compose-project m) (:compose-project t)))]
     (if same?
-      (if (:ended-at t) t m)
+      ;; m1: the pins and digests both sides recorded are kept key by key
+      (-> (if (:ended-at t) t m)
+          (assoc :images (merge (:images m) (:images t))
+                 :digests (merge (:digests m) (:digests t))))
       (let [[keep other] (if (and (:ended-at m) (not (:ended-at t))) [t m] [m t])]
         (assoc keep :conflict {:base-project (:base-project other)
                                :compose-project (:compose-project other)})))))

@@ -209,3 +209,45 @@
     (is (= #{"HIVE_PORT_GW_8090" "HIVE_PORT_GW_5432" "HIVE_PORT_ENVOY_10000" "HIVE_PORT_ENVOY_10001" "HIVE_PORT_ENVOY_9901"}
            (set (filter #(and (clojure.string/starts-with? % "HIVE_PORT_") (not= % "HIVE_PORT_OFFSET")) (keys (hive-compose.promote.isolated/run-env "dc" "r01" {:offset 1000} (ov/planned-ports shapes {:offset 1000}))))))
         "one variable per published port; none for the ephemeral one")))
+
+(deftest b3-a-shared-volume-with-a-driver-is-valid
+  (let [m {"name" "dc-r01" "services" {"go" {"image" "x" "volumes" [{"type" "volume" "source" "go_cache" "target" "/c"}]}}
+           "volumes" {"go_cache" {"name" "dc-r01_go_cache" "driver" "local" "driver_opts" {"o" "x"} "labels" {"a" "b"}}
+                      "m2" {"name" "maven-repo" "driver" "local"}}}
+        doc (ok (ov/override-doc m {:override/images-from "dc" :override/shared-volumes ["go_cache" "m2"]
+                                    :override/ports :keep :override/names :none}))]
+    (is (= {"external" true "name" "dc_go_cache"
+            "driver" ov/reset-null "driver_opts" ov/reset-null "labels" ov/reset-null}
+           (get-in doc ["volumes" "go_cache"]))
+        "compose refuses external beside driver: they are reset; the derived name is the base's")
+    (is (= "maven-repo" (get-in doc ["volumes" "m2" "name"])) "an explicit base name is used as is")
+    (is (str/includes? (ov/emit doc) "\"driver\": !reset null"))))
+
+(deftest b2-every-pinned-image-is-used-by-id
+  (let [doc (ok (ov/override-doc model {:override/images-from "dc" :override/ports :keep :override/names :none
+                                        :override/images {"postgres" "sha256:p" "web" "sha256:w"}}))]
+    (is (= {"image" "sha256:p" "pull_policy" "never"} (get-in doc ["services" "postgres"]))
+        "an image: service is pinned by id and never pulled")
+    (is (= {"image" "sha256:w" "pull_policy" "never" "build" ov/reset-null} (get-in doc ["services" "web"])))
+    (is (nil? (get-in doc ["services" "worker"])) "a service outside the pinned set is untouched")))
+
+(deftest m5-networks
+  (let [base {"name" "dc-r01" "services" {"a" {"image" "x"}}}]
+    (is (= {"net" {"name" "dc-r01_net"}}
+           (get (ok (ov/override-doc (assoc base "networks" {"net" {"name" "funeraria-network"}
+                                                             "default" {"name" "dc-r01_default"}})
+                                     {:override/images-from "dc"}))
+                "networks"))
+        "an explicit network name is renamed per run; a derived one needs nothing")
+    (is (= :compose/invalid-override
+           (:error (ov/override-doc (assoc base "networks" {"ext" {"name" "x" "external" true}}) {:override/images-from "dc"}))))
+    (is (= :compose/invalid-override
+           (:error (ov/override-doc (assoc base "networks" {"n" {"ipam" {"config" [{"subnet" "10.9.0.0/24"}]}}})
+                                    {:override/images-from "dc"}))))
+    (is (= ["n"] (:networks (ov/override-doc (assoc base "services" {"a" {"image" "x" "networks" {"n" {"ipv4_address" "10.9.0.5"}}}})
+                                             {:override/images-from "dc"}))))))
+
+(deftest m6-udp-under-publish
+  (is (= (ov/tagged "!override" [{"target" 53 "protocol" "udp" "host_ip" "127.0.0.1" "published" "1053"}])
+         (get-in (ok (ov/override-doc model {:override/ports {:publish {"worker" {"53/udp" 1053}}}}))
+                 ["services" "worker" "ports"]))))

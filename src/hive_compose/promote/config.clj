@@ -75,7 +75,8 @@
    :compose/claim-max-ttl-minutes 480
    :compose/orphan-ttl-minutes 10
    :compose/program-grace-ms 3000
-   :compose/run-volumes-grace-minutes 60})
+   :compose/run-volumes-grace-minutes 60
+   :compose/run-default-service-mem-mb 128})
 
 (def default-profiles-file "~/.config/hive-mcp/compose-profiles.edn")
 (def default-state-file "~/.local/state/hive-compose/state.edn")

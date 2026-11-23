@@ -201,8 +201,11 @@
                       (concat
                        (for [[s _] with-ports :when (not (contains? pub s))] [s reset-list])
                        (for [[s m] pub]
-                         [s (tagged "!override" (vec (for [[c h] (sort m)]
-                                                       (port-entry c "127.0.0.1" "tcp" (when (pos? h) h)))))]))))))
+                         ;; m6: a key "53/udp" publishes a udp port
+                         [s (tagged "!override" (vec (for [[c h] (sort-by (comp str key) m)
+                                                           :let [[t proto] (str/split (str c) #"/" 2)]]
+                                                       (port-entry (parse-long t) "127.0.0.1" (or proto "tcp")
+                                                                   (when (pos? h) h)))))]))))))
       :else (invalid {:ports policy}))))
 
 (defn- name-resets
@@ -248,9 +251,52 @@
     (if-let [unknown (seq (remove #(contains? (get model "volumes" {}) %) ks))]
       (invalid {:volumes (vec (sort unknown)) :hint "run shared volumes names volumes the model does not declare"})
       ;; an already external volume is shared as the file declares it
-      (r/ok (into (sorted-map) (for [k (distinct ks)
-                                     :when (not (true? (get-in model ["volumes" k "external"])))]
-                                 [k {"external" true "name" (str base "_" k)}]))))))
+      ;; B3: compose refuses `external` beside driver/driver_opts/labels, so
+      ;; those are reset; the name is the one the SHARED project uses: its
+      ;; explicit `name:`, else the one compose derives, <base>_<key> (the
+      ;; model is read under the copy's -p, where a derived name shows as
+      ;; <copy>_<key>)
+      (r/ok (into (sorted-map)
+                  (for [k (distinct ks)
+                        :let [v (get-in model ["volumes" k])
+                              nm (get v "name")
+                              derived? (or (nil? nm) (= nm (str (get model "name") "_" k)))]
+                        :when (not (true? (get v "external")))]
+                    [k {"external" true
+                        "name" (if derived? (str base "_" k) nm)
+                        "driver" reset-null "driver_opts" reset-null "labels" reset-null}]))))))
+
+(defn- networks-entries
+  "Result<{key {\"name\" new}}> (M5): every non-external top-level network
+   of `model` with an explicit name gets the copy's own name `<project>_<key>`
+   (a fixed name would join the copy to the shared project's network). A
+   fixed subnet, a static address or an external network cannot be copied:
+   invalid-override naming the network."
+  [model]
+  (let [project (get model "name")
+        nets (get model "networks" {})
+        static (for [[svc sm] (sort-by key (services model))
+                     :let [ns (get sm "networks")]
+                     :when (map? ns)
+                     [n cfg] ns
+                     :when (or (get cfg "ipv4_address") (get cfg "ipv6_address"))]
+                 {:network n :service svc})]
+    (cond
+      (seq static)
+      (invalid {:networks (vec (distinct (map :network static))) :static-addresses (vec static)
+                :hint "a static ipv4_address/ipv6_address would clash with the shared project's; an isolated copy cannot run it"})
+      (some (fn [[_ v]] (true? (get v "external"))) nets)
+      (invalid {:networks (vec (sort (for [[k v] nets :when (true? (get v "external"))] k)))
+                :hint "an external network would join the copy to the shared project's services"})
+      (some (fn [[_ v]] (some #(get % "subnet") (get-in v ["ipam" "config"]))) nets)
+      (invalid {:networks (vec (sort (for [[k v] nets :when (some #(get % "subnet") (get-in v ["ipam" "config"]))] k)))
+                :hint "a fixed ipam subnet would overlap the shared project's network"})
+      :else
+      (r/ok (into (sorted-map)
+                  (for [[k v] nets
+                        :let [nm (get v "name")]
+                        :when (and nm (not= nm (str project "_" k)))]
+                    [k {"name" (str project "_" k)}]))))))
 
 (defn override-doc
   "Result<doc>: the override document of OverrideSpec `spec` over compose
@@ -263,11 +309,18 @@
                ports (ports-entries model (get spec :override/ports :strip))
                vols (volume-renames model (:override/fresh-volumes spec) (:override/run spec))]
       (let [pinned (:override/images spec)
+            ;; B2: every service :override/images names is pinned by id and
+            ;; never built nor pulled; without a map, the build-only services
+            ;; take the shared project's tag
             images (when-let [p (:override/images-from spec)]
                      (into (sorted-map)
-                           (map (fn [s] [s {"build" reset-null "image" (get pinned s (pinned-image p s))
-                                            "pull_policy" "never"}]))
-                           (build-only model)))
+                           (concat
+                            (when-not (seq pinned)
+                              (for [s (build-only model)]
+                                [s {"build" reset-null "image" (pinned-image p s) "pull_policy" "never"}]))
+                            (for [[s id] pinned :when (contains? (services model) s)]
+                              [s (cond-> {"image" id "pull_policy" "never"}
+                                   (some? (get-in model ["services" s "build"])) (assoc "build" reset-null))]))))
             svcs (merge-with merge
                              (into (sorted-map) (map (fn [s] [s {"container_name" reset-null}])) names)
                              (into (sorted-map) (map (fn [[s v]] [s {"ports" v}])) ports)
@@ -280,9 +333,11 @@
                                           :when (not (contains? shared k))]
                                       [k {"labels" (into (sorted-map) labels)}])))
                 vols (merge-with merge labelled vols shared)]
-            (r/ok (cond-> {}
-                    (seq svcs) (assoc "services" (into (sorted-map) svcs))
-                    (seq vols) (assoc "volumes" (into (sorted-map) vols))))))))))
+            (r/let-ok [nets (if (:override/images-from spec) (networks-entries model) (r/ok {}))]
+              (r/ok (cond-> {}
+                      (seq svcs) (assoc "services" (into (sorted-map) svcs))
+                      (seq vols) (assoc "volumes" (into (sorted-map) vols))
+                      (seq nets) (assoc "networks" nets))))))))))
 
 (defn describe
   "One line per service and volume override document `doc` changes, for
