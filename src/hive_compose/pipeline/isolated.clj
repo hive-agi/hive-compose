@@ -362,7 +362,8 @@
                   (record-run! ctx rid #(assoc % :volumes-due-at due)))
                 (assoc err :run-ended (select-keys row [:ended? :leftovers-error])))
               err))
-          (let [facts (port/-run-facts e (:profile pl))]
+          (let [facts (port/-run-facts e (:profile pl))
+                _ (record-run! ctx rid #(assoc % :had-section? true))]
             (r/ok (cond-> (assoc (:ok res) :run rid :compose-project (:compose-project pl)
                                  :override (override/describe (:doc pl)) :env-run (:env pl)
                                  ;; (A) the pinned ids, the same map status answers
@@ -494,7 +495,8 @@
                :message (str "agents hold live claims on sections of run " rid ": "
                              (str/join "; " (for [{:keys [section agents]} held]
                                               (str section " (" (str/join ", " agents) ")"))))
-               :hint "ask the claiming agent first, or pass allow_shared=true to remove the run's volumes anyway"})
+               :hint (str "ask the claiming agent first, or pass allow_shared=true to remove the run's volumes anyway"
+                          (when (nil? agent) "; this call names no agent (agent/agent_id), so every claim counts as another's"))})
 
        (get-in (runs ctx) [rid :ended-at])
        (do (record-run! ctx rid #(dissoc % :volumes-due-at))
@@ -516,6 +518,30 @@
   [settings]
   (* 60000 (or (:compose/run-volumes-grace-minutes settings) 60)))
 
+(defn doubtful-why
+  "Why usage pass `observed` cannot be trusted to judge claims, nil when it
+   can: :clock-jump when the reaper's gap since its previous pass exceeded
+   the bound (an NTP step, a suspend and resume: every claim looks expired),
+   :doubtful-roster when the swarm is absent or lists no agent. A doubtful
+   pass marks nothing and removes nothing. nil `observed` (no usage pass, a
+   direct call) is trusted."
+  [observed]
+  (cond
+    (nil? observed) nil
+    (:clock-jump? observed) :clock-jump
+    (or (not= :ok (:swarm observed)) (zero? (:agents observed 0))) :doubtful-roster
+    :else nil))
+
+(defn clock-jump?
+  "True when the reaper's pass at `now` follows its previous one (`prev-at`,
+   nil on the first pass) by more than the bound:
+   :compose/reaper-max-gap-minutes, else max(3 x the tick, 10 minutes)."
+  [settings prev-at now]
+  (let [bound (if-let [m (:compose/reaper-max-gap-minutes settings)]
+                (* 60000 m)
+                (max (* 3 1000 (or (:compose/tick-seconds settings) 60)) (* 10 60000)))]
+    (boolean (and prev-at (> (- now prev-at) bound)))))
+
 (defn after-reap!
   "After a section reaper pass (`reaped` rows, `doubtful?` true when the
    pass judged claims on an absent or empty swarm roster). Step 1 (M1): a
@@ -531,15 +557,16 @@
      (let [rids (iso/ended-runs (runs ctx) (:active @(:state ctx))
                                 (keep #(some-> (:profile/id %) iso/split-id second)
                                       (filter :ok? reaped)))
-           ;; claims judged against an absent or empty roster prove nothing
-           doubtful? (and observed (or (not= :ok (:swarm observed)) (zero? (:agents observed 0))))
+           ;; claims judged against an absent or empty roster, or across a
+           ;; clock jump, prove nothing (R2-M2)
+           doubt (doubtful-why observed)
            gone (into #{} (keep #(when (= :gone (:reason %)) (some-> (:section %) iso/split-id second)))
                       (:expired observed))
            gone? (fn [rid] (or (contains? gone rid) (true? (get-in (runs ctx) [rid :claim-gone?]))))]
        (mapv (fn [rid]
                (let [row (end-run! ctx rid :reaper false)]
-                 (if (or doubtful? (gone? rid) (:leftovers-error row))
-                   (assoc row :volumes-kept-why (cond doubtful? :doubtful-roster
+                 (if (or doubt (gone? rid) (:leftovers-error row))
+                   (assoc row :volumes-kept-why (cond doubt doubt
                                                       (gone? rid) :claim-gone
                                                       :else :leftovers-error))
                    (let [due (+ ((:now ctx)) (grace-ms (:settings ctx)))]
@@ -557,47 +584,77 @@
           :when (get (runs ctx) rid)]
     (record-run! ctx rid #(assoc % :claim-gone? true))))
 
+(defn cancel-run-due!
+  "Cancel a pending volume removal of run `rid`; true when one was pending.
+   Reached by run id, so it works when the run has no section left (R2-M1:
+   a marked run's sections are all gone)."
+  [ctx rid]
+  (if (get-in (runs ctx) [rid :volumes-due-at])
+    (do (record-run! ctx rid #(dissoc % :volumes-due-at)) true)
+    false))
+
 (defn cancel-due!
   "Cancel a pending volume removal of the run of isolated section `sid`
    (`up run=<id>`, a claim or a touch on one of its sections)."
   [ctx sid]
   (when-let [[_ rid] (iso/split-id sid)]
-    (when (get-in (runs ctx) [rid :volumes-due-at])
-      (record-run! ctx rid #(dissoc % :volumes-due-at)))))
+    (cancel-run-due! ctx rid)))
+
+(defn end-if-empty!
+  "N1: after an explicit down or stop of isolated section `sid`, end its run
+   when no section is left, with its volumes KEPT and UNMARKED: only `down
+   run=<id> volumes=true` removes them. Answers the end row, or nil."
+  [ctx sid]
+  (when-let [[_ rid] (iso/split-id sid)]
+    (when (and (get (runs ctx) rid) (not (get-in (runs ctx) [rid :ended-at]))
+               (empty? (iso/run-sections (:active @(:state ctx)) rid)))
+      (let [row (end-run! ctx rid :down false)]
+        (record-run! ctx rid #(dissoc % :volumes-due-at))
+        row))))
 
 (defn end-orphans!
-  "M1: end every isolated run never ended that holds no section and no live
-   claim, once it started more than the default TTL ago (an up that failed
-   half way, a hive-mcp that died during it). Its containers go, its volumes
-   are kept and marked as for any ended run. Answers a row per run."
-  [ctx]
-  (if-not (satisfies? port/IIsolatedRuns (:engine ctx))
-    []
-    (let [now ((:now ctx))
-          ttl (* 60000 (or (get-in ctx [:settings :compose/default-ttl-minutes]) 60))]
-      (vec (for [rid (iso/orphaned-runs (runs ctx) (:active @(:state ctx)) now ttl)]
-             (let [row (end-run! ctx rid :orphaned false)]
-               (when (:ended-at (get (runs ctx) rid))
-                 (record-run! ctx rid #(assoc % :volumes-due-at (+ now (grace-ms (:settings ctx))))))
-               (assoc row :reason :no-section)))))))
+  "M1: end every isolated run never ended that holds no section, once it
+   started more than the default TTL ago (an up that failed half way, a
+   hive-mcp that died during it). Its containers go. Its volumes are marked
+   for removal only when the run NEVER had a section (nothing anyone could
+   have claimed); a run that had one (R2-B1: a section lost some other way)
+   is ended with its volumes KEPT and UNMARKED. Nothing at all on a doubtful
+   pass (`observed`: an absent or empty roster, a clock jump). Answers a row
+   per run."
+  ([ctx] (end-orphans! ctx nil))
+  ([ctx observed]
+   (if (or (not (satisfies? port/IIsolatedRuns (:engine ctx))) (and observed (doubtful-why observed)))
+     []
+     (let [now ((:now ctx))
+           ttl (* 60000 (or (get-in ctx [:settings :compose/default-ttl-minutes]) 60))]
+       (vec (for [rid (iso/orphaned-runs (runs ctx) (:active @(:state ctx)) now ttl)]
+              (let [had? (get-in (runs ctx) [rid :had-section?])
+                    row (end-run! ctx rid :orphaned false)]
+                (when (and (not had?) (:ended-at (get (runs ctx) rid)))
+                  (record-run! ctx rid #(assoc % :volumes-due-at (+ now (grace-ms (:settings ctx))))))
+                (cond-> (assoc row :reason :no-section)
+                  had? (assoc :volumes-kept-why :had-section)))))))))
 
 (defn sweep-due!
   "Step 2 of the reaper's volume removal (M1): remove the volumes of every
    run whose mark has come due, only while it is still ended, no section of
    it is active, it took no claim since, and no container of its project
-   exists (`remove-volumes!` checks the last two). Answers a row per run."
-  [ctx]
-  (if-not (satisfies? port/IIsolatedRuns (:engine ctx))
-    []
-    (let [now ((:now ctx))]
-      (vec (for [[rid e] (sort-by key (runs ctx))
-                 :let [due (:volumes-due-at e)]
-                 :when (and due (<= due now) (:ended-at e))]
-             (let [res (remove-volumes! ctx rid)]
-               (when (r/ok? res) (record-run! ctx rid #(dissoc % :volumes-due-at)))
-               (cond-> {:run rid}
-                 (r/ok? res) (assoc :volumes (:ok res))
-                 (r/err? res) (assoc :error (select-keys res [:error :sections :containers])))))))))
+   exists (`remove-volumes!` checks the last two). Nothing on a doubtful pass
+   (`observed`, see `doubtful-why`: a clock jump, an absent or empty roster).
+   Answers a row per run."
+  ([ctx] (sweep-due! ctx nil))
+  ([ctx observed]
+   (if (or (not (satisfies? port/IIsolatedRuns (:engine ctx))) (and observed (doubtful-why observed)))
+     []
+     (let [now ((:now ctx))]
+       (vec (for [[rid e] (sort-by key (runs ctx))
+                  :let [due (:volumes-due-at e)]
+                  :when (and due (<= due now) (:ended-at e))]
+              (let [res (remove-volumes! ctx rid)]
+                (when (r/ok? res) (record-run! ctx rid #(dissoc % :volumes-due-at)))
+                (cond-> {:run rid}
+                  (r/ok? res) (assoc :volumes (:ok res))
+                  (r/err? res) (assoc :error (select-keys res [:error :sections :containers]))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; status

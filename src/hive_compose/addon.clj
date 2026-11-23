@@ -180,15 +180,20 @@
               adopted (when (and (not adopted?) (get-in ctx [:settings :compose/adopt?]))
                         (ops/adopt! ctx))
               observed (swarm/observe! ctx)
+              ;; R2-M2: a pass far later than the previous one (a clock step,
+              ;; a suspend) judges every claim stale: a doubtful pass
+              observed (cond-> observed
+                         (isolated/clock-jump? (:settings ctx) (get-in @state [:last-pass :at]) ((:now ctx)))
+                         (assoc :clock-jump? true))
               reaped (ops/reap! ctx)
               _ (swarm/announce-reaped! ctx (:reaped reaped))
               ;; an isolated run whose last section was just reaped ends, and
               ;; its own volumes go with it (Pedro, 2026-11-23)
               ;; step 2 first: volumes whose grace ran out on an EARLIER pass
-              runs-swept (isolated/sweep-due! ctx)
+              runs-swept (isolated/sweep-due! ctx observed)
               _ (isolated/note-observed! ctx observed)
               runs-ended (into (isolated/after-reap! ctx (:reaped reaped) observed)
-                               (when (= :ok (:swarm observed)) (isolated/end-orphans! ctx)))
+                               (isolated/end-orphans! ctx observed))
               reaped (cond-> reaped
                        (seq runs-ended) (assoc :runs-ended runs-ended)
                        (seq runs-swept) (assoc :runs-swept runs-swept))
@@ -443,8 +448,15 @@
                    (announced ctx (on-effective (fn [p _ _] (guard p :up false #(ops/switch-profile! ctx p))))))
         "claim" (r/bind (claim-opts)
                         (fn [o]
-                          (if-let [run (stacks/claim-run tgt)]
-                            (stacks/claim! ctx run (agent-param params) o)
+                          (cond
+                            (stacks/claim-run tgt)
+                            (stacks/claim! ctx (stacks/claim-run tgt) (agent-param params) o)
+                            ;; R2-M1: a run marked for volume removal has no section left
+                            ;; to resolve: the claim keeps its data by run id, first
+                            (and in-run? (isolated/cancel-run-due! ctx run-param))
+                            (r/ok {:run run-param :mark-cancelled true
+                                   :hint "the run's volumes are kept; up run=<id> brings its sections back"})
+                            :else
                             (on-section
                              (fn [p0]
                                ;; a claim on an isolated run's section cancels a pending volume removal
@@ -477,8 +489,16 @@
                                      {:agent (agent-param params) :allow-shared? (boolean allow-shared?)})
                  (flag params "volumes")
                  (r/err :compose/invalid-param {:param "volumes" :hint "volumes=true needs run=<id> alone (an isolated run)"})
-                 :else (on-subject #(ops/down-profile! ctx % :down)))
-        "stop" (on-subject #(ops/down-profile! ctx % :stop))
+                 ;; N1: the run's LAST section taken down ends the run, its
+                 ;; volumes kept and unmarked (only volumes=true removes them)
+                 :else (on-subject #(r/map-ok (ops/down-profile! ctx % :down)
+                                              (fn [res] (if-let [row (isolated/end-if-empty! ctx (:profile/id %))]
+                                                          (assoc res :run-ended row)
+                                                          res)))))
+        "stop" (on-subject #(r/map-ok (ops/down-profile! ctx % :stop)
+                                      (fn [res] (if-let [row (isolated/end-if-empty! ctx (:profile/id %))]
+                                                  (assoc res :run-ended row)
+                                                  res))))
         ;; a target is restarted from the live section holding its services (its
         ;; dir, files and env); profile=<id> with a target names that section
         ;; a recreate's env is remembered by the section it ran from (the holder)
@@ -491,10 +511,15 @@
                          ;; recreated from p: an assumed section's inputs are now known
                          (ops/inputs-known! ctx (or section (:profile/id p)) p))
                        res)))
-        "touch" (if (or tgt id)
+        "touch" (cond
+                  ;; R2-M1: a marked run is kept by run id, before any section lookup
+                  (and in-run? (isolated/cancel-run-due! ctx run-param))
+                  (r/ok {:run run-param :mark-cancelled true
+                         :hint "the run's volumes are kept; up run=<id> brings its sections back"})
+                  (or tgt id)
                   (on-subject #(do (isolated/cancel-due! ctx (:profile/id %))
                                    (ops/touch! ctx (:profile/id %))))
-                  (ops/touch-all! ctx (some-> (param params "project") str)))
+                  :else (ops/touch-all! ctx (some-> (param params "project") str)))
         "ps" (on-subject #(ops/ps-profile ctx %))
         "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
         "reap" (r/ok (tick! a))

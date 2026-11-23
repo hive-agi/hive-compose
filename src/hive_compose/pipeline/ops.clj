@@ -786,9 +786,14 @@
 
 (defn reconcile!
   "Forget active profiles none of whose services still run (taken down outside
-   the addon), stopping the programs they alone hold. Answers the forgotten ids."
+   the addon), stopping the programs they alone hold. Answers the forgotten ids.
+   An isolated run's section (`:profile/run`) is never forgotten here: after a
+   docker or host restart its containers are stopped, not gone, and its
+   claims (wave claims included) must survive; such a section is left to the
+   TTL reaper and its claims (FUN-D R2-B1)."
   [ctx]
   (let [dropped (vec (for [[id a] (:active @(:state ctx))
+                           :when (not (get-in a [:profile :profile/run]))
                            :let [running (r/bind (lookup ctx id) #(port/-running (:engine ctx) %))]
                            :when (and (r/ok? running) (not-any? (:ok running) (:services a)))]
                        id))]

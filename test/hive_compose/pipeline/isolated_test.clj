@@ -18,6 +18,7 @@
             [hive-compose.port :as port]
             [hive-compose.promote.isolated :as iso]
             [hive-compose.stub :as stub]
+            [hive-compose.stub-runner]
             [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
@@ -545,3 +546,135 @@
         "the run's section is no holder of the shared project's services")
     (is (empty? (filter #(= "flow-payment" (:section %)) (holders (str "flow-payment@" rid) (str "dc-" rid))))
         "the shared section is no holder of the run's services")))
+
+;; ---------------------------------------------------------------------------
+;; round 2 of the data review
+
+(defn- stop-containers!
+  "As a docker or host restart leaves them: the run's containers exist, stopped."
+  [e cp]
+  (swap! (:world e) assoc-in [:running cp] #{}))
+
+(deftest r2-b1-reconcile-keeps-an-isolated-section-and-its-claim
+  (let [{:keys [ctx e]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+        sid (str "flow-payment@" rid)]
+    (swap! (:state ctx) assoc-in [:active sid :claims "x"] {:since 1 :seen 1 :until 999999999999 :note "gate"})
+    (stop-containers! e (str "dc-" rid))
+    (is (= [] (ops/reconcile! ctx)) "an isolated section is never forgotten by reconcile")
+    (is (get-in @(:state ctx) [:active sid :claims "x"]) "its wave claim survives")))
+
+(deftest r2-b1-end-orphans-is-doubtful-on-an-empty-roster
+  (let [{:keys [ctx clock]} (world)]
+    (swap! (:state ctx) assoc-in [:runs "dczzz111"] (iso/run-entry "dc" "dczzz111" :strip 1000))
+    (swap! clock + (* 61 60000))
+    (is (empty? (isolated/end-orphans! ctx {:swarm :ok :agents 0 :expired []})) "agents=0 is doubtful: nothing ends")
+    (is (nil? (get-in @(:state ctx) [:runs "dczzz111" :ended-at])))))
+
+(deftest r2-b1-a-run-that-had-a-section-is-orphan-ended-kept-and-unmarked
+  (let [{:keys [ctx clock]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+    ;; its section is lost some other way (a hand-edited or merged state)
+    (swap! (:state ctx) update :active dissoc (str "flow-payment@" rid))
+    (swap! clock + (* 61 60000))
+    (let [row (first (isolated/end-orphans! ctx ok-roster))]
+      (is (= :had-section (:volumes-kept-why row)))
+      (is (get-in @(:state ctx) [:runs rid :ended-at]))
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "kept and UNMARKED"))))
+
+(deftest r2-b1-restart-scenario-end-to-end-removes-no-volume
+  (let [{:keys [ctx e clock]} (world)
+        a (hive-compose.addon/make-addon)
+        _ (swap! (:state a) assoc :ctx ctx :lifecycle :active)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+        sid (str "flow-payment@" rid)]
+    (swap! (:state ctx) assoc-in [:active sid :claims "x"] {:since 1 :seen 1 :until (+ @clock (* 8 60 60000)) :note "gate"})
+    ;; the host restarts: the run's containers are stopped, the swarm lists nobody
+    (stop-containers! e (str "dc-" rid))
+    (dotimes [_ 3]
+      (swap! clock + (* 61 60000))
+      (let [pass (hive-compose.addon/tick! a)]
+        (is (nil? (:error pass)) (pr-str pass))))
+    (is (contains? (stub/volumes e) (str "dc-" rid "_pgdata")) "no volume is removed")
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "the run is never marked")
+    (is (empty? (filter #(= :remove-volumes (first %)) (stub/calls e))))))
+
+(deftest r2-m1-claim-and-touch-cancel-a-mark-through-the-tool
+  (doseq [command ["claim" "touch"]]
+    (let [{:keys [ctx clock]} (world)
+          a (hive-compose.addon/make-addon)
+          _ (swap! (:state a) assoc :ctx ctx :lifecycle :active)
+          [rid reaped] (reaped-run ctx clock)]
+      (isolated/after-reap! ctx reaped ok-roster)
+      (is (get-in @(:state ctx) [:runs rid :volumes-due-at]) "marked")
+      (let [x (hive-compose.addon/dispatch a command {"profile" "flow-payment" "run" rid "agent" "ling-1"})]
+        (is (r/ok? x) (str command " " (pr-str x)))
+        (is (true? (get-in x [:ok :mark-cancelled])) command))
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) (str command " cancels the mark")))))
+
+(deftest r2-m2-a-clock-jump-with-an-ok-roster-marks-nothing
+  (do
+    (is (isolated/clock-jump? {} 0 (* 6 60 60000)) "+6h is a jump")
+    (is (not (isolated/clock-jump? {} 0 (* 5 60000))) "+5 min is not")
+    (is (not (isolated/clock-jump? {} nil 999999)) "the first pass is not")
+    (is (isolated/clock-jump? {:compose/reaper-max-gap-minutes 2} 0 (* 3 60000)) "the bound is a setting"))
+  (let [{:keys [ctx e clock]} (world)
+        [rid reaped] (reaped-run ctx clock)
+        jumped (assoc ok-roster :clock-jump? true)
+        row (first (isolated/after-reap! ctx reaped jumped))]
+    (is (= :clock-jump (:volumes-kept-why row)))
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])))
+    (swap! (:state ctx) assoc-in [:runs rid :volumes-due-at] 1)
+    (is (empty? (isolated/sweep-due! ctx jumped)) "a jumped pass removes nothing either")
+    (is (contains? (stub/volumes e) (str "dc-" rid "_pgdata"))))
+  (testing "through the reaper: an ok roster and +6h"
+    (let [{:keys [ctx e clock]} (world)
+          sw (reify hive-compose.port/ISwarm
+               (-agents [_] (hive-dsl.result/ok [{:agent/id "a1" :agent/status :working} {:agent/id "a2" :agent/status :idle}]))
+               (-notify! [_ _ _] (hive-dsl.result/ok {:channel :direct})))
+          ctx (assoc ctx :swarm sw :settings (assoc (:settings ctx) :compose/swarm? true))
+          a (hive-compose.addon/make-addon)
+          _ (swap! (:state a) assoc :ctx ctx :lifecycle :active)
+          rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])]
+      (is (= :ok (get-in (hive-compose.addon/tick! a) [:observed :swarm])) "the roster is ok")
+      (swap! clock + (* 6 60 60000))
+      (let [pass (hive-compose.addon/tick! a)]
+        (is (nil? (:error pass)) (pr-str pass))
+        (is (true? (get-in pass [:observed :clock-jump?]))))
+      (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "no mark after a +6h jump")
+      (is (contains? (stub/volumes e) (str "dc-" rid "_pgdata"))))))
+
+(deftest n1-an-explicit-down-of-the-last-section-keeps-the-volumes
+  (let [{:keys [ctx e clock]} (world)
+        a (hive-compose.addon/make-addon)
+        _ (swap! (:state a) assoc :ctx ctx :lifecycle :active)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+        d (hive-compose.addon/dispatch a "down" {"profile" "flow-payment" "run" rid})]
+    (is (r/ok? d) (pr-str d))
+    (is (get-in @(:state ctx) [:runs rid :ended-at]) "the run ends")
+    (dotimes [_ 3]
+      (swap! clock + (* 61 60000))
+      (isolated/end-orphans! ctx ok-roster)
+      (isolated/sweep-due! ctx ok-roster))
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "no mark")
+    (is (contains? (stub/volumes e) (str "dc-" rid "_pgdata")) "no volume removed")
+    (is (= [(str "dc-" rid "_pgdata")] (map :name (filter #(= rid (:run %)) (:stale-run-volumes (isolated/status ctx)))))
+        "status still names the kept volumes")))
+
+(deftest m4-dry-run-without-a-run-is-refused
+  (let [{:keys [ctx e]} (world)
+        a (hive-compose.addon/make-addon)
+        _ (swap! (:state a) assoc :ctx ctx :lifecycle :active)
+        x (hive-compose.addon/dispatch a "up" {"profile" "flow-sync" "dry_run" true})]
+    (is (= :compose/invalid-param (:error x)))
+    (is (= "dry_run" (:param x)))
+    (is (not-any? #(= :up (first %)) (stub/calls e)) "no real up")))
+
+(deftest m7-a-listener-on-a-planned-port-refuses-the-run
+  (let [{:keys [ctx]} (world)
+        rn (hive-compose.stub-runner/runner)
+        _ (hive-compose.stub-runner/listen! rn 6434)
+        ctx (assoc ctx :runner rn)
+        x (isolated/up! ctx (preset ctx "flow-sync") {:ports {:offset 1000}})]
+    (is (= :compose/invalid-param (:error x)) (pr-str x))
+    (is (= [{:host 6434 :service "postgres" :port "5432" :listening? true}] (:clashes x)))))

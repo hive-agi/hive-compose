@@ -628,7 +628,11 @@
    [:compose/run-volumes-grace-minutes {:optional true} [:int {:min 1}]]
    ;; FUN-D M2: the memory an isolated run's admission assumes for a
    ;; service whose compose file sets no mem_limit
-   [:compose/run-default-service-mem-mb {:optional true} [:int {:min 1}]]])
+   [:compose/run-default-service-mem-mb {:optional true} [:int {:min 1}]]
+   ;; FUN-D R2-M2: a reaper pass more than this after the previous one (an
+   ;; NTP step, a suspend) is doubtful: it marks and removes no volume.
+   ;; Default max(3 x :compose/tick-seconds, 10 minutes)
+   [:compose/reaper-max-gap-minutes {:optional true} [:int {:min 1}]]])
 
 (def InstanceCaps
   "The caps the stack plan resolved for one instance: `:mem` in bytes and
