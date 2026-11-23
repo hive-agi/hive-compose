@@ -9,6 +9,8 @@
             [clojure.test.check.properties :as prop]
             [hive-compose.adapter.cli :as cli]
             [hive-compose.addon]
+            [hive-compose.pipeline.swarm]
+            [hive-compose.schema]
             [hive-compose.promote.config]
             [hive-compose.pipeline.isolated :as isolated]
             [hive-compose.pipeline.ops :as ops]
@@ -494,3 +496,21 @@
 (deftest m3-a-configured-profile-id-may-not-hold-an-at
   (is (seq (hive-compose.schema/explain hive-compose.schema/Settings
                                         {:compose/profiles {"x@abc123" {:profile/id "x@abc123" :profile/dir "/w"}}}))))
+
+(deftest a-wave-claim-keeps-a-run-past-its-ttl
+  (let [{:keys [ctx e clock]} (world)
+        rid (get-in (isolated/up! ctx (preset ctx "flow-payment") {}) [:ok :run])
+        sid (str "flow-payment@" rid)
+        p (:ok (ops/lookup ctx sid))
+        c (hive-compose.pipeline.swarm/claim! ctx p "coordinator:x" {:ttl-minutes 480 :note "gate"})]
+    (is (r/ok? c) (pr-str c))
+    (is (get-in @(:state ctx) [:active sid :claims "coordinator:x" :until]) "an isolated section takes a wave claim")
+    (dotimes [_ 3]
+      (swap! clock + (* 120 60000))
+      (let [observed (hive-compose.pipeline.swarm/observe! ctx)
+            pass (ops/reap! ctx)]
+        (is (empty? (isolated/after-reap! ctx (:reaped pass) observed)))
+        (is (empty? (isolated/sweep-due! ctx)))))
+    (is (contains? (:active @(:state ctx)) sid) "the section is never reaped under a live wave claim")
+    (is (nil? (get-in @(:state ctx) [:runs rid :volumes-due-at])) "nor marked for volume removal")
+    (is (contains? (stub/volumes e) "dc-dcabc123_pgdata"))))
