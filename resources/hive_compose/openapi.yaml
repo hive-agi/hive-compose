@@ -408,7 +408,9 @@ paths:
         the containe
       description: restart a section's services in place even when other sections need them; recreate=true recreates
         the containers (never their depends_on), refused when another live section holds one of them unless allow_shared.
-        target|profile; env; allow_orphans; allow_shared
+        A target runs from the section holding its services (its dir, files and env); a recreate's env is remembered
+        by that WHOLE section, so its other services that read a var get it at their next up. target|profile; env;
+        allow_orphans; allow_shared
       tags:
       - sections
       x-hive-call-op: restart
@@ -1533,6 +1535,9 @@ components:
                   required:
                   - pass
                   additionalProperties: false
+            inputs-from:
+              type: string
+              pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
             wait?:
               type: boolean
             no-deps?:
@@ -1767,6 +1772,9 @@ components:
                     required:
                     - pass
                     additionalProperties: false
+              inputs-from:
+                type: string
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
               wait?:
                 type: boolean
               no-deps?:
@@ -2159,6 +2167,9 @@ components:
               required:
               - pass
               additionalProperties: false
+        inputs-from:
+          type: string
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
         wait?:
           type: boolean
         no-deps?:
@@ -3055,6 +3066,9 @@ components:
                     required:
                     - pass
                     additionalProperties: false
+              inputs-from:
+                type: string
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$
               wait?:
                 type: boolean
               no-deps?:
@@ -4233,6 +4247,18 @@ components:
             category:
               type: string
           x-source: hand
+        holder-skipped:
+          type: object
+          properties:
+            section:
+              type: string
+            dir:
+              type: string
+            reason:
+              type: string
+          description: 'the section holding these services was not used: its dir no longer exists; the call ran
+            from the project defaults'
+          x-source: hand
       required:
       - profile
       - project
@@ -4330,6 +4356,18 @@ components:
               type: string
             category:
               type: string
+          x-source: hand
+        holder-skipped:
+          type: object
+          properties:
+            section:
+              type: string
+            dir:
+              type: string
+            reason:
+              type: string
+          description: 'the section holding these services was not used: its dir no longer exists; the call ran
+            from the project defaults'
           x-source: hand
       required:
       - profile
@@ -4456,6 +4494,9 @@ components:
           type: array
           items:
             type: string
+        inputs-from:
+          type: string
+          description: the section whose dir, files and env this target section runs from
         inputs:
           enum:
           - assumed
@@ -4786,25 +4827,16 @@ components:
               type: integer
           x-source: hand
         nrepl:
-          description: every route with advice on a first claim or an adoption; on a renewal only the running ones,
-            the others counted
-          oneOf:
-          - type: array
-            items:
-              $ref: '#/components/schemas/Route'
-          - type: object
-            properties:
-              running:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Route'
-              not-running:
-                type: integer
-              hint:
-                type: string
-            required:
-            - running
-            x-source: hand
+          description: every route with advice on a first claim or an adoption; on a renewal only the running ones
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+        nrepl-not-running:
+          type: integer
+          description: 'renewal only: how many routes of the section do not run (left out of nrepl)'
+        nrepl-hint:
+          type: string
+          description: 'renewal only: how to get the route of a module that does not run'
         started:
           $ref: '#/components/schemas/UpResult'
         renewed:
