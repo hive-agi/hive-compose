@@ -19,6 +19,9 @@
             [hive-addon.protocol :as addon]
             [hive-compose.adapter.cli :as cli]
             [hive-compose.adapter.host :as host]
+            [hive-compose.adapter.suite-runner :as suite-runner]
+            [hive-compose.pipeline.data :as data]
+            [hive-compose.pipeline.suites :as suites]
             [hive-compose.boundary.files :as files]
             [hive-compose.boundary.history :as history]
             [hive-compose.pipeline.faults :as faults]
@@ -126,6 +129,14 @@
     {:engine (or (:compose/engine cfg)
                  (cli/make-engine (merge settings (select-keys cfg [:compose/resolver]))))
      :runner (or (:compose/runner cfg) (host/make-runner cfg))
+     ;; hc-8 suites under their hc-16b caps, secrets read at spawn
+     :suite-runner (or (:compose/suite-runner cfg)
+                       (suite-runner/make-runner (select-keys cfg [:compose/resolver :compose/systemd-scope?])))
+     ;; every cell result goes to the flake history (hc-13) ...
+     :record-run! (fn [ctx run] (flaky/record-run! ctx run))
+     ;; ... and the stack's data lifecycle runs around and between suites (hc-9)
+     :data-phase! (fn [ctx run phase] (data/run-phase! ctx run phase))
+     :default-resources (:compose/default-resources settings)
      :swarm (or (:compose/swarm cfg) (swarm-adapter/make-swarm))
      :activity (or (:compose/activity-probe cfg) (procnet/make-activity))
      :processes (if (contains? cfg :compose/process-table)
@@ -222,7 +233,8 @@
    "stack-down" "take a stack run down: consumers, view networks, then the instances no other live run or section keeps (never volumes, never what ran before the run). run, or stack for every run of it"
    "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
    "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
-   "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"))
+   "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"
+   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need (or the live run named by run), each suite's runner (a container on the projects' view networks, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir; a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every selected suite that declares variants must declare each named one, else the call is refused; a suite without variants runs once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT restarted or re-env'd per variant, so a variant that toggles a service's own flag tests nothing (follow-up 20261123122851-6e29b6f7); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something could not run. A cell passes only when its runner exited 0 and its report parsed: an unparsable report is could-not-run; a container suite, or one that declares :suite/reports-dir or :suite/report-format, must leave a report with at least one case unless :suite/report-required? false. Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known, :service"))
 
 (def commands
   (vec (keys command-help)))
@@ -282,6 +294,25 @@
     (param params "stack") (assoc :stack (str (param params "stack")))
     (param params "run") (assoc :run (str (param params "run")))
     (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
+
+(defn- test-opts
+  "The options of `test` from the tool params: suites, projects (\"X,Y\" or a
+   list), run, keep_up, dry_run, wait."
+  [params]
+  (cond-> {}
+    (param params "suites") (assoc :suites (param params "suites"))
+    (param params "projects") (assoc :projects (param params "projects"))
+    (param params "run") (assoc :run (str (param params "run")))
+    (some? (flag params "keep_up")) (assoc :keep-up? (flag params "keep_up"))
+    (some? (flag params "dry_run")) (assoc :dry-run? (flag params "dry_run"))
+    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))
+    (param params "variants") (assoc :variants (param params "variants"))
+    (some? (flag params "skip_fails")) (assoc :skip-fails? (flag params "skip_fails"))))
+
+(def test-params
+  "The params `test-opts` reads; `command-params` \"test\" must equal it
+   (addon_test checks), so the API never refuses what `test` reads."
+  #{"suites" "projects" "run" "keep_up" "dry_run" "wait" "variants" "skip_fails"})
 
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
@@ -377,6 +408,7 @@
         "why" (r/map-ok (why/why! ctx {:test (some-> (param params "test") str)
                                        :run (some-> (param params "run") str)})
                         #(dissoc % :why/markdown))
+        "test" (suites/test! ctx (test-opts params))
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
@@ -439,13 +471,14 @@
                      "A WAVE claim (claim ttl_minutes=.. note=.., up to 8 h, owner may be a coordinator) holds until it ends or is released, even when its owner parks or leaves the swarm. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
+                     "SUITES: test suites=X,Y projects=A,B runs the suite x project matrix on one union stack and answers per-cell verdicts from exit code and JUnit/TAP; a failed matrix stays up for inspection. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
                               "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
-                              "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
+                              "wait" {:type "boolean" :description "[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
@@ -461,7 +494,13 @@
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
                               "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>"}
+                              "suites" {:type "string" :description "[test] suite ids under :compose/suites, X,Y (default all)"}
+                              "projects" {:type "string" :description "[test] projects under test, A,B (default every project a selected suite applies to)"}
+                              "keep_up" {:type "boolean" :description "[test] keep the stack up even when every cell passed (a failed matrix always stays up)"}
+                              "dry_run" {:type "boolean" :description "[test] answer the matrix, the stack plan and every runner spec; start nothing"}
+                              "variants" {:type "string" :description "[test] only these env variants of the suites that declare :suite/variants, a,b (default every variant); each selected suite with variants must declare every named one, else refused; a suite without variants runs once. The variant env reaches the suite RUNNER only, never the stack's consumers (no restart or re-env per variant)"}
+                              "skip_fails" {:type "boolean" :description "[test] a skipped case fails its cell (the case stays skipped in the report); default each suite's :suite/skip-fails?, else false"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}
