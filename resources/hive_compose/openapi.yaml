@@ -3535,6 +3535,9 @@ components:
         run-default-service-mem-mb:
           type: integer
           minimum: 1
+        reaper-max-gap-minutes:
+          type: integer
+          minimum: 1
       required:
       - projects
       - profiles
