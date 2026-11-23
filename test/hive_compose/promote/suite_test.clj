@@ -507,13 +507,13 @@
                                     {:exit 137 :report (r/err :report/none {})})]
         s (suite/matrix-summary results)]
     (is (= :error (:status s)))
-    (is (= 1 (:exit s)))
+    (is (= 2 (:exit s)) "could not run wins over failed")
     (is (= {:cells 3 :passed 1 :failed 1 :error 1} (select-keys s [:cells :passed :failed :error])))
     (is (= {:passed 3 :failed 1 :error 0 :skipped 1} (:cases s)))
     (is (= {"api" {:error 1} "smoke" {:failed 1 :passed 1}} (:by-suite s)))
     (is (= {"shop" {:error 1 :passed 1} "web" {:failed 1}} (:by-project s)))
-    (is (= [{:suite/id "api" :project "shop" :status :error :exit 137 :cases []}
-            {:suite/id "smoke" :project "web" :status :failed :exit 1 :cases ["smoke/t.1"]}]
+    (is (= [{:suite/id "api" :project "shop" :status :error :exit 137 :reason :runner/died :cases []}
+            {:suite/id "smoke" :project "web" :status :failed :exit 1 :reason :cases/failed :cases ["smoke/t.1"]}]
            (:failures s)))
     (is (= 15 (:duration-ms s))))
   (is (= {:status :passed :exit 0 :cells 0 :passed 0 :failed 0 :error 0}
@@ -535,3 +535,83 @@
            (= (:cells s) (+ (:passed s) (:failed s) (:error s)) (count results))
            (= (= 0 (:exit s)) (every? #(= :passed (:status %)) results))
            (= (count (:failures s)) (+ (:failed s) (:error s)))))))
+
+;; ---------------------------------------------------------------------------
+;; (f) laws of the verdict (PR #60 review M1, F1, F2)
+
+(defspec exit-code-precedence 300
+  (prop/for-all [results gen-results]
+    (let [{:keys [exit]} (suite/matrix-summary results)
+          sts (set (map :status results))]
+      (= exit (cond (sts :error) 2 (sts :failed) 1 :else 0)))))
+
+(def gen-policy
+  (gen/let [rr gen/boolean sf gen/boolean] {:report-required? rr :skip-fails? sf}))
+
+(defspec skip-fails-never-changes-a-case-status 300
+  (prop/for-all [exit gen-exit rep gen-report-res policy gen-policy]
+    (let [with (suite/cell-result "r01" cell {:exit exit :report rep :policy policy})
+          without (suite/cell-result "r01" cell {:exit exit :report rep :policy (assoc policy :skip-fails? false)})
+          statuses #(mapv :case/status (get-in % [:report :report/cases]))]
+      (and (= (statuses with) (statuses without) (mapv :case/status (get-in rep [:ok :report/cases])))
+           ;; it only ever turns a pass into a fail, and only for a skipped case
+           (or (= (:status with) (:status without))
+               (and (= :passed (:status without)) (= :failed (:status with))
+                    (some #{:skipped} (statuses with))))))))
+
+(defspec a-required-report-is-never-a-silent-pass 300
+  (prop/for-all [exit gen-exit rep gen-report-res]
+    (let [{:keys [status]} (suite/cell-result "r01" cell {:exit exit :report rep :policy {:report-required? true}})
+          cases (get-in rep [:ok :report/cases])]
+      (if (empty? cases) (= :error status) (contains? #{:passed :failed} status)))))
+
+(deftest report-required-follows-what-the-suite-declares
+  (is (false? (suite/report-required? {:suite/id "a" :suite/command "t"})))
+  (is (true? (suite/report-required? {:suite/id "a" :suite/command "t" :suite/report-format :junit})))
+  (is (true? (suite/report-required? {:suite/id "a" :suite/command "t" :suite/reports-dir "out"})))
+  (is (false? (suite/report-required? {:suite/id "a" :suite/command "t" :suite/reports-dir "out"
+                                       :suite/report-required? false})))
+  (is (= {:report-required? false :skip-fails? true} (suite/verdict-policy {:suite/skip-fails? true} nil)))
+  (is (= {:report-required? false :skip-fails? false} (suite/verdict-policy {:suite/skip-fails? true} false))
+      "the call wins over the suite"))
+
+(def variant-suites
+  {"e2e" {:suite/id "e2e" :suite/command "t" :suite/projects ["shop" "web"]
+          :suite/env {"A" "1"}
+          :suite/variants {"off" {"FLAG" "false"} "on" {"FLAG" "true" "A" "2"}}}
+   "smoke" {:suite/id "smoke" :suite/command "t" :suite/projects ["web"]}})
+
+(deftest variants-expand-the-matrix
+  (is (nil? (schema/explain schema/Suite (get variant-suites "e2e"))))
+  (is (= [{:suite/id "e2e" :project "shop" :variant "off"} {:suite/id "e2e" :project "web" :variant "off"}
+          {:suite/id "e2e" :project "shop" :variant "on"} {:suite/id "e2e" :project "web" :variant "on"}
+          {:suite/id "smoke" :project "web"}]
+         (:ok (suite/expand-matrix variant-suites projects {}))))
+  (is (= [{:suite/id "e2e" :project "web" :variant "on"} {:suite/id "smoke" :project "web"}]
+         (:ok (suite/expand-matrix variant-suites projects {:projects "web" :variants "on"})))
+      "a variants filter leaves a suite without variants alone")
+  (is (= ["x"] (:variants (suite/expand-matrix variant-suites projects {:variants "on,x"}))))
+  (let [spec (:ok (suite/runner-spec (ctx :suites variant-suites) {:suite/id "e2e" :project "web" :variant "on"}))]
+    (is (nil? (m/explain suite/RunnerSpec spec)))
+    (is (= "e2e@on/web" (:test-id spec)))
+    (is (= {"A" "2" "FLAG" "true" "HIVE_VARIANT" "on" "HIVE_SUITE_ID" "e2e"}
+           (select-keys (:env spec) ["A" "FLAG" "HIVE_VARIANT" "HIVE_SUITE_ID"])))
+    (is (= "/var/hc/runs/r01/e2e@on/web/reports" (:reports-dir spec)))
+    (is (= "e2e@on/web/" (get-in spec [:env "HIVE_TEST_ID_PREFIX"]))))
+  (is (= :compose/unknown-names
+         (:error (suite/runner-spec (ctx :suites variant-suites) {:suite/id "e2e" :project "web" :variant "nope"})))))
+
+(defspec variant-cells-are-distinct-ids 200
+  (prop/for-all [vnames (gen/set (gen/elements ["a" "b" "off" "on" "x.1" "y-2"]) {:min-elements 1})
+                 ps (gen/set (gen/elements ["shop" "web" "billing"]) {:min-elements 1})]
+    (let [s {"e2e" {:suite/id "e2e" :suite/command "t" :suite/projects (vec ps)
+                    :suite/variants (zipmap vnames (repeat {"V" "1"}))}
+             "e2e@a" {:suite/id "e2e@a" :suite/command "t" :suite/projects (vec ps)}}
+          cells (:ok (suite/expand-matrix (dissoc s "e2e@a") projects {}))
+          ids (map suite/test-id cells)
+          rs (map #(suite/cell-result "r01" % {:exit 0 :report (r/err :report/none {})}) cells)]
+      (and (= (count cells) (* (count vnames) (count ps)))
+           (apply distinct? ids)
+           (apply distinct? (map (juxt :suite/id :project) rs))
+           (apply distinct? (map #(suite/run-dir "/s" "r01" %) cells))
+           (apply distinct? (map #(suite/container-name "r01" (suite/cell-key %) (:project %)) cells))))))

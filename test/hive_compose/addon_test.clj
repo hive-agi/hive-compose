@@ -33,6 +33,16 @@
     (is (= :new (:lifecycle @(:state a))))
     (is (nil? (:scheduler @(:state a))))))
 
+(deftest test-params-are-exactly-what-test-reads
+  (testing "PR #60 review M2: command-params \"test\" (what the API and Req_test accept) equals what test-opts reads"
+    (is (= sut/test-params (get sut/command-params "test")))
+    ;; every declared param, each with a value: a param test-opts reads shows
+    ;; up in the opts, one it ignores does not
+    (let [props (keys (get-in (sut/tool nil) [:inputSchema :properties]))
+          read-by (fn [p] (seq (#'sut/test-opts {p (if (#{"keep_up" "dry_run" "wait" "skip_fails"} p) true "x")})))]
+      (is (= sut/test-params (set (filter read-by props))))))
+  (is (contains? (get sut/command-params "test") "wait") "wait=false is no longer refused"))
+
 (deftest lifecycle-is-idempotent-and-stops-the-reaper
   (let [dir (temp-dir)
         a (sut/make-addon (config dir (stub/engine {})))]

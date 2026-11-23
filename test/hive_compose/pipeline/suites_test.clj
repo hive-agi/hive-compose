@@ -101,7 +101,7 @@
         {:keys [run status exit summary stack-kept? hint]} (:ok res)]
     (is (r/ok? res))
     (is (= [:failed 1] [status exit]))
-    (is (= [{:suite/id "smoke" :project "shop" :status :failed :exit 1 :cases ["smoke/case-3"]}]
+    (is (= [{:suite/id "smoke" :project "shop" :status :failed :exit 1 :reason :cases/failed :cases ["smoke/case-3"]}]
            (:failures summary))
         "smoke resolves a secret and the stub answers no :scrub: case ids are redacted to their position")
     (is (true? stack-kept?))
@@ -117,9 +117,90 @@
     (is (= :compose/secret-unresolved (get-in cell [:runner-error :error])))
     (is (= :report/none (get-in cell [:report-error :error])))))
 
-(deftest no-report-and-exit-zero-passes
-  (let [res (suites/test! (ctx {"load" {:exit 0}}) {:suites "load"})]
-    (is (= :passed (get-in res [:ok :status])))))
+(deftest no-report-and-exit-zero-passes-only-when-no-report-is-declared
+  (testing "a suite that declares nothing about reports: exit 0 is the verdict"
+    (let [res (suites/test! (ctx {"load" {:exit 0}}) {:suites "load"})]
+      (is (= [:passed 0] [(get-in res [:ok :status]) (get-in res [:ok :exit])]))))
+  (testing "M1: a suite that declares its report format and leaves none could not run: :error, exit 2"
+    (let [c (assoc-in (ctx {"load" {:exit 0}}) [:settings :compose/suites "load" :suite/report-format] :junit)
+          res (suites/test! c {:suites "load"})
+          cell (first (get-in res [:ok :cells]))]
+      (is (= [:error 2] [(get-in res [:ok :status]) (get-in res [:ok :exit])]))
+      (is (= :report/none (:reason cell)))
+      (is (true? (get-in res [:ok :stack-kept?])) "kept for inspection")))
+  (testing "a report with zero cases is :report/empty"
+    (let [c (assoc-in (ctx {"load" {:exit 0 :raw "<testsuite name=\"load\"/>"}})
+                      [:settings :compose/suites "load" :suite/report-format] :junit)
+          cell (first (get-in (suites/test! c {:suites "load"}) [:ok :cells]))]
+      (is (= [:error :report/empty] [(:status cell) (:reason cell)]))))
+  (testing ":suite/report-required? false opts out"
+    (let [c (-> (ctx {"load" {:exit 0}})
+                (assoc-in [:settings :compose/suites "load" :suite/report-format] :junit)
+                (assoc-in [:settings :compose/suites "load" :suite/report-required?] false))]
+      (is (= :passed (get-in (suites/test! c {:suites "load"}) [:ok :status]))))))
+
+(deftest the-exit-code-tells-failed-from-could-not-run
+  (is (= 1 (get-in (suites/test! (ctx {"load" {:exit 1 :passed 0 :failed 1}}) {:suites "load"}) [:ok :exit])))
+  (is (= 2 (get-in (suites/test! (ctx {"load" {:error :compose/secret-unresolved}}) {:suites "load"}) [:ok :exit])))
+  (testing "2 wins over 1"
+    (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 0 :failed 1} "load" {:error :compose/runner-failed}}) {})]
+      (is (= [:error 2] [(get-in res [:ok :status]) (get-in res [:ok :exit])])))))
+
+(deftest skip-fails-fails-a-cell-with-a-skipped-case
+  (let [raw (str "<testsuite name=\"load\"><testcase classname=\"c\" name=\"ok\"/>"
+                 "<testcase classname=\"c\" name=\"later\"><skipped/></testcase></testsuite>")]
+    (testing "default: a skipped case does not fail the cell"
+      (is (= :passed (get-in (suites/test! (ctx {"load" {:exit 0 :raw raw}}) {:suites "load"}) [:ok :status]))))
+    (testing "skip_fails on the call"
+      (let [res (suites/test! (ctx {"load" {:exit 0 :raw raw}}) {:suites "load" :skip-fails? true})
+            cell (first (get-in res [:ok :cells]))]
+        (is (= [:failed 1] [(get-in res [:ok :status]) (get-in res [:ok :exit])]))
+        (is (= :skipped-as-failure (:reason cell)))
+        (is (= #{:passed :skipped} (set (map :case/status (get-in cell [:report :report/cases]))))
+            "the case stays :skipped in the report")))
+    (testing ":suite/skip-fails? on the suite; the call may turn it off"
+      (let [c (assoc-in (ctx {"load" {:exit 0 :raw raw}}) [:settings :compose/suites "load" :suite/skip-fails?] true)]
+        (is (= :failed (get-in (suites/test! c {:suites "load"}) [:ok :status])))
+        (is (= :passed (get-in (suites/test! c {:suites "load" :skip-fails? false}) [:ok :status])))))))
+
+(deftest variants-are-cells-of-their-own-on-one-stack
+  (let [c (-> (ctx)
+              (assoc-in [:settings :compose/suites "load" :suite/env] {"MODE" "x" "SISF_SYNC_REVERSE" "unset"})
+              (assoc-in [:settings :compose/suites "load" :suite/variants]
+                        {"reverse-off" {"SISF_SYNC_REVERSE" "false"} "reverse-on" {"SISF_SYNC_REVERSE" "true"}}))
+        res (suites/test! c {:suites "load"})
+        runs (sr/suite-runs (:suite-runner c))
+        cells (get-in res [:ok :cells])]
+    (is (= :passed (get-in res [:ok :status])) (pr-str res))
+    (is (= ["load@reverse-off/shop" "load@reverse-on/shop"] (mapv :test-id runs)) "run one after the other")
+    (is (= [["false" "x" "reverse-off"] ["true" "x" "reverse-on"]]
+           (mapv (juxt #(get-in % [:env "SISF_SYNC_REVERSE"]) #(get-in % [:env "MODE"]) #(get-in % [:env "HIVE_VARIANT"])) runs))
+        "the variant env goes over the suite's own, on the runner")
+    (is (= ["load@reverse-off" "load@reverse-on"] (mapv :suite/id cells)) "the history and why key on <suite>@<variant>")
+    (is (= ["reverse-off" "reverse-on"] (mapv :variant cells)))
+    (is (= 1 (count (filter #(= "pg" (second %)) (ups c)))) "one stack for both")
+    (testing "variants=a narrows; an unknown variant is named"
+      (let [c2 (assoc c :suite-runner (sr/suite-runner {}))]
+        (is (= ["load@reverse-on/shop"]
+               (mapv :test-id (do (suites/test! c2 {:suites "load" :variants "reverse-on"})
+                                  (sr/suite-runs (:suite-runner c2))))))
+        (is (= ["nope"] (:variants (suites/test! c2 {:suites "load" :variants "nope"}))))))))
+
+(deftest the-answer-lists-every-case-and-why-a-cell-could-not-run
+  (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 2 :failed 1} "load" {:error :compose/secret-unresolved}}) {})
+        by (into {} (map (juxt :test-id identity)) (get-in res [:ok :cells]))
+        smoke (get by "smoke/shop")
+        load (get by "load/shop")]
+    (is (= 3 (count (get-in smoke [:report :report/cases]))) "passed cases too, not only failed ones")
+    (is (every? #(and (:case/id %) (:case/status %) (contains? % :case/time-s)) (get-in smoke [:report :report/cases])))
+    (is (= :error (:status load)))
+    (is (= :compose/secret-unresolved (:reason load)))
+    (testing "an OOM-killed cell names its service"
+      (let [c (-> (ctx {"load" {:peak-mem (* 512 1024 1024)}})
+                  (assoc-in [:settings :compose/suites "load" :suite/resources] {:mem "256m"}))
+            cell (first (get-in (suites/test! c {:suites "load"}) [:ok :cells]))]
+        (is (= :error (:status cell)) (pr-str cell))
+        (is (= "load/shop" (:service cell)))))))
 
 (deftest keep-up-keeps-a-passing-stack
   (let [c (ctx)
@@ -254,7 +335,8 @@
             res (suites/test! c {:suites "load"})
             cell (first (get-in res [:ok :cells]))
             stale (io/file (.getParent (io/file (:reports-dir cell))) "stale-reports" "declared" "old.xml")]
-        (is (= :passed (get-in res [:ok :status])) (pr-str res))
+        (is (= [:error :report/none] [(get-in res [:ok :status]) (:reason cell)])
+            "M1: the suite declares a reports dir and this attempt wrote none: could not run, never a silent pass")
         (is (not (.exists old)))
         (is (.isFile stale) "moved, never deleted")
         (is (.isFile pom) "nothing outside the declared dir is touched")
@@ -466,7 +548,8 @@
         rep (:report (first (get-in res [:ok :cells])))]
     (is (= 50 (get-in rep [:report/totals :passed])))
     (is (= 1 (count (:report/failed-cases rep))))
-    (is (nil? (:report/cases rep)))
+    (is (= 51 (count (:report/cases rep))) "every case by id, status and time")
+    (is (every? #(= #{:case/id :case/status :case/time-s} (set (keys %))) (:report/cases rep)) "no texts in the case list")
     (is (< (count (:case/output (first (:report/failed-cases rep)))) 2100))
     (is (= 5000 (count (:case/output (first (filter #(= "bad" (:case/name %))
                                                     (get-in (first @(:recorded c)) [:report :report/cases]))))))
@@ -541,5 +624,6 @@
       (and (r/ok? res)
            (= 3 (count cells) (count @(:recorded c)))
            (= all-pass? (= :passed status) (zero? exit))
+           (= exit ({:passed 0 :failed 1 :error 2} status))
            (= (not all-pass?) stack-kept? (boolean (seq (:stacks @(:state c)))))
            (every? #(= (:test-id %) (str (:suite/id %) "/" (:project %))) cells)))))

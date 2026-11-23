@@ -233,7 +233,7 @@
    "stack-status" "stack runs with their instances' and consumers' containers now. stack; run"
    "plan" "what stack-up would start, share or find running (terraform-plan style). stack; run"
    "why" "explain a failed test: its case, the deepest error span carrying a message (trace store, :compose/tempo-url), the span path from the root, container logs of its run in its time window and the stack plan; written to <state>/runs/<run>/why/<case>.md+.edn. test (case id or suite/project/case); run (default the newest run holding it)"
-   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need (or the live run named by run), each suite's runner (a container on the projects' view networks, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir; a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true)"))
+   "test" "run the suite x project matrix (:compose/suites): one stack for the union of what the cells need (or the live run named by run), each suite's runner (a container on the projects' view networks, or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir; a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant> with its env, default all); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something could not run (a suite that declares reports and leaves none or no case is could-not-run unless :suite/report-required? false). Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known, :service"))
 
 (def commands
   (vec (keys command-help)))
@@ -291,7 +291,14 @@
     (param params "run") (assoc :run (str (param params "run")))
     (some? (flag params "keep_up")) (assoc :keep-up? (flag params "keep_up"))
     (some? (flag params "dry_run")) (assoc :dry-run? (flag params "dry_run"))
-    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
+    (some? (flag params "wait")) (assoc :wait? (flag params "wait"))
+    (param params "variants") (assoc :variants (param params "variants"))
+    (some? (flag params "skip_fails")) (assoc :skip-fails? (flag params "skip_fails"))))
+
+(def test-params
+  "The params `test-opts` reads; `command-params` \"test\" must equal it
+   (addon_test checks), so the API never refuses what `test` reads."
+  #{"suites" "projects" "run" "keep_up" "dry_run" "wait" "variants" "skip_fails"})
 
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
@@ -426,7 +433,7 @@
                               "target" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] services or native profiles: name, project/name, or a,b"}
                               "profile" {:type "string" :description "[up|switch|down|stop|restart|touch|ps|logs] preset or active section id"}
                               "no_deps" {:type "boolean" :description "[up|switch] start only the named services, not their depends_on (which must already run)"}
-                              "wait" {:type "boolean" :description "[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)"}
+                              "wait" {:type "boolean" :description "[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test: default true)"}
                               "recreate" {:type "boolean" :description "[restart] recreate the containers (up --force-recreate --no-deps) instead of restarting them in place"}
                               "allow_orphans" {:type "boolean" :description "[up|switch|restart] go ahead although processes a dead docker daemon left running still hold the section's volumes or ports (refused by default, naming them)"}
                               "allow_shared" {:type "boolean" :description "[up|switch|restart] recreate a service another live section holds (refused by default, naming the holder section and its agents)"}
@@ -446,6 +453,8 @@
                               "projects" {:type "string" :description "[test] projects under test, A,B (default every project a selected suite applies to)"}
                               "keep_up" {:type "boolean" :description "[test] keep the stack up even when every cell passed (a failed matrix always stays up)"}
                               "dry_run" {:type "boolean" :description "[test] answer the matrix, the stack plan and every runner spec; start nothing"}
+                              "variants" {:type "string" :description "[test] only these env variants of the suites that declare :suite/variants, a,b (default every variant); a suite without variants is unaffected"}
+                              "skip_fails" {:type "boolean" :description "[test] a skipped case fails its cell (the case stays skipped in the report); default each suite's :suite/skip-fails?, else false"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}

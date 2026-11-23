@@ -404,11 +404,14 @@
 
 (defn stack-up!
   "Result<{:run :stack :instances [..] :consumers [..] :networks [..]}>: run
-   stack `stack` (`opts` {:stack id :run id? :wait? (default true)}). The run
-   is recorded before anything starts, so a failure midway answers an error
-   carrying `:run` that stack-down! releases. Holds the stack lock
-   throughout; a run id already recorded answers :compose/run-exists."
-  [ctx {stack-id :stack run-id :run wait? :wait? extra :extra :or {wait? true}}]
+   stack `stack` (`opts` {:stack id :run id? :wait? (default true) :claim
+   {agent {:seen ms? :note s?}}?}). The run is recorded before anything
+   starts, so a failure midway answers an error carrying `:run` that
+   stack-down! releases. With `:claim` the run is recorded already claimed by
+   those agents, in the same swap that records it (hc-8 test! holds its run
+   from its first instant). Holds the stack lock throughout; a run id already
+   recorded answers :compose/run-exists."
+  [ctx {stack-id :stack run-id :run wait? :wait? extra :extra claim :claim :or {wait? true}}]
   (serialized ctx
     (r/let-ok [engine (stack-engine ctx)
                rid (pick-run-id ctx stack-id run-id)
@@ -420,9 +423,13 @@
                ;; the stack lock, so no other up is admitted against the same room
                _ (admit ctx stack-id budget (running-instances ctx sp running))
                t (r/ok (now ctx))
-               _ (claim-run! ctx rid {:stack/id stack-id :run rid :started-at t :last-touch t
-                                      :plan sp :budget budget :networks (:stack/networks sp)
-                                      :consumers {} :status :partial}
+               _ (claim-run! ctx rid (cond-> {:stack/id stack-id :run rid :started-at t :last-touch t
+                                              :plan sp :budget budget :networks (:stack/networks sp)
+                                              :consumers {} :status :partial}
+                                       ;; claimed from the moment it is recorded: no
+                                       ;; window in which the run is up and unclaimed
+                                       (seq claim) (assoc :claims (into {} (for [[a c] claim]
+                                                                             [a (merge {:since t :seen t} c)]))))
                              running (probed-footprints sp) (section-held ctx))]
       (let [consumers (vec (filter run/container-consumer? (keys (:stack/consumers sp))))
             res (r/let-ok [nets (all-ok #(port/-network-create! engine % (stack/labels rid stack-id))
@@ -710,6 +717,23 @@
             (if (and stop? (empty? left))
               (r/map-ok (stack-down! ctx {:run rid}) #(assoc % :run rid :claims {}))
               (r/ok {:run rid :claims (or left {})})))))))
+
+(defn end-claim!
+  "{:others [agent] :down Result?}: `agent` ends its hold on run `rid` in ONE
+   step under the stack lock: its claim is dropped and the run touched (a kept
+   run gets a full idle TTL from now), then the claims left are re-read, and
+   with `down?` and none left the run is taken down (stack-down!, reentrant).
+   No claim can land between the check and the down. A run already gone
+   answers {:others []} and is left alone. hc-8 test! ends every matrix
+   through it."
+  [ctx rid agent {:keys [down?]}]
+  (serialized ctx
+    (if-not (contains? (stacks ctx) rid)
+      {:others []}
+      (do (record! ctx rid (fn [e] (-> e (update :claims dissoc agent) (assoc :last-touch (now ctx)))))
+          (let [others (vec (sort (keys (get-in (stacks ctx) [rid :claims]))))]
+            (cond-> {:others others}
+              (and down? (empty? others)) (assoc :down (stack-down! ctx {:run rid}))))))))
 
 (defn- ttls [settings]
   {:ttl-ms (* 60000 (or (:compose/default-ttl-minutes settings) 60))

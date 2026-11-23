@@ -1308,7 +1308,11 @@ paths:
         a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection
         when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default
         test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait
-        (default true)'
+        (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant> with its env, default
+        all); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something
+        could not run (a suite that declares reports and leaves none or no case is could-not-run unless :suite/report-required?
+        false). Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known,
+        :service'
       tags:
       - stacks
       x-hive-call-op: test
@@ -3305,6 +3309,25 @@ components:
                       jvm?:
                         type: boolean
                     additionalProperties: false
+                report-required?:
+                  type: boolean
+                skip-fails?:
+                  type: boolean
+                variants:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      anyOf:
+                      - type: string
+                      - type: object
+                        properties:
+                          pass:
+                            type: string
+                            minLength: 1
+                        required:
+                        - pass
+                        additionalProperties: false
                 description:
                   type: string
               required:
@@ -3563,6 +3586,25 @@ components:
                 jvm?:
                   type: boolean
               additionalProperties: false
+          report-required?:
+            type: boolean
+          skip-fails?:
+            type: boolean
+          variants:
+            type: object
+            additionalProperties:
+              type: object
+              additionalProperties:
+                anyOf:
+                - type: string
+                - type: object
+                  properties:
+                    pass:
+                      type: string
+                      minLength: 1
+                  required:
+                  - pass
+                  additionalProperties: false
           description:
             type: string
         required:
@@ -3675,12 +3717,20 @@ components:
         tail:
           type: integer
           description: '[logs] lines per service (default 100)'
+        variants:
+          type: string
+          description: '[test] only these env variants of the suites that declare :suite/variants, a,b (default
+            every variant); a suite without variants is unaffected'
         toxic:
           type: object
           description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
         agent:
           type: string
           description: '[claim|release] the agent claiming; defaults to the caller''s agent_id'
+        skip_fails:
+          type: boolean
+          description: '[test] a skipped case fails its cell (the case stays skipped in the report); default each
+            suite''s :suite/skip-fails?, else false'
         project:
           type: string
           description: '[touch] with no target: only the sections of this project; [nrepl] only this project''s
@@ -3710,7 +3760,8 @@ components:
           description: '[flaky] how many ranked cases (default 20)'
         wait:
           type: boolean
-          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
+          description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:
+            default true)'
         keep_up:
           type: boolean
           description: '[test] keep the stack up even when every cell passed (a failed matrix always stays up)'
@@ -3949,6 +4000,7 @@ components:
       - compose/unsafe-reports-dir
       - compose/unsupported-media-type
       - compose/volume-removal-refused
+      - report/empty
       - report/malformed
       - report/none
       - report/unclearable
@@ -5005,8 +5057,11 @@ components:
     TestResult:
       type: object
       additionalProperties: true
-      description: 'pipeline.suites/test!: run, stack, status, exit, summary, one cell per suite x project (report
-        cut to totals and failed cases), stack-kept?, summary-file'
+      description: 'pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed,
+        1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id
+        <suite>@<variant>, variant), each with status, reason when it did not pass (error: could not run, e.g. report/none,
+        report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status
+        case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file'
       x-source: hand
     Req_help:
       type: object
@@ -5057,7 +5112,8 @@ components:
             or a,b'
         wait:
           type: boolean
-          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
+          description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:
+            default true)'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
@@ -5095,7 +5151,8 @@ components:
             or a,b'
         wait:
           type: boolean
-          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
+          description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:
+            default true)'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
@@ -5378,7 +5435,8 @@ components:
           description: '[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks'
         wait:
           type: boolean
-          description: '[up|switch|stack-up] wait until the started services are healthy (stack-up: default true)'
+          description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:
+            default true)'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
@@ -5450,9 +5508,21 @@ components:
           type: string
           description: '[stack-up|stack-down|stack-status|plan|faults|why|test] the stack run id, ^[a-z0-9]{3,40}$
             (stack-up default <stack><6 hex>, test default test<6 hex>); claim/release a run with target=stack:<run>'
+        skip_fails:
+          type: boolean
+          description: '[test] a skipped case fails its cell (the case stays skipped in the report); default each
+            suite''s :suite/skip-fails?, else false'
         suites:
           type: string
           description: '[test] suite ids under :compose/suites, X,Y (default all)'
+        variants:
+          type: string
+          description: '[test] only these env variants of the suites that declare :suite/variants, a,b (default
+            every variant); a suite without variants is unaffected'
+        wait:
+          type: boolean
+          description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:
+            default true)'
       additionalProperties: false
       x-source: generated
       x-params-from: hive-compose.addon/command-params (the API refuses any other key)
