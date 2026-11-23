@@ -101,13 +101,19 @@
    those, any other suite against every project. The projects filter narrows
    that further. A suite that declares `:suite/variants` gives one cell per
    variant (`:variant` its name), each a cell of its own; the variants filter
-   narrows those, and leaves a suite without variants alone.
+   narrows those, and leaves a suite without variants alone (it runs once).
+
+   No selected suite ever vanishes: with a variants filter, every selected
+   suite that declares variants must declare EVERY requested one, else the
+   call is refused naming the missing ones per suite.
 
    Errors: :compose/unknown-names when a filter or a selected suite's
-   `:suite/projects` names a suite or project that does not exist, or the
-   variants filter names a variant no selected suite declares. Every such
-   name is listed under :suites, :projects, :suite-projects or :variants. The
-   error is :compose/empty-matrix when the filters leave no cell."
+   `:suite/projects` names a suite or project that does not exist, or a
+   requested variant is missing from a selected suite that declares variants
+   (:variants {suite [missing]}), or no selected suite declares variants at
+   all (:variants {\"*\" [requested]}). Every such name is listed under
+   :suites, :projects, :suite-projects or :variants. The error is
+   :compose/empty-matrix when the filters leave no cell."
   [suites projects filters]
   (let [suite-filter (parse-names (:suites filters))
         project-filter (parse-names (:projects filters))
@@ -120,11 +126,28 @@
                                          (let [bad (unknown projects (get-in suites [id :suite/projects]))]
                                            (when (seq bad) [id bad]))))
                                  (remove (set bad-suites) suite-ids))
+        ;; every selected suite that declares variants must keep at least one
+        ;; under the filter: no selected suite ever vanishes from the matrix.
+        ;; {suite [requested variant it does not declare]}
+        bad-variants (when variant-filter
+                       (into (sorted-map)
+                             (keep (fn [id]
+                                     (let [vs (get-in suites [id :suite/variants])
+                                           missing (vec (remove #(contains? vs %) variant-filter))]
+                                       (when (and (seq vs) (seq missing))
+                                         [id missing]))))
+                             (remove (set bad-suites) suite-ids)))
+        ;; a requested variant no selected suite declares at all
         declared (into #{} (mapcat #(keys (get-in suites [% :suite/variants]))) suite-ids)
-        bad-variants (unknown declared variant-filter)]
+        undeclared (unknown declared variant-filter)
+        bad-variants (cond-> bad-variants
+                       (and (seq undeclared) (empty? bad-variants))
+                       (assoc "*" undeclared))]
     (if (or (seq bad-suites) (seq bad-projects) (seq bad-suite-projects) (seq bad-variants))
       (r/err :compose/unknown-names
-             (cond-> {:message (unknown-message bad-suites bad-projects bad-suite-projects bad-variants)}
+             (cond-> {:message (unknown-message bad-suites bad-projects bad-suite-projects
+                                                (for [[s vs] bad-variants]
+                                                  (str (if (= "*" s) "any selected suite" s) " -> " (str/join "," vs))))}
                (seq bad-suites) (assoc :suites bad-suites)
                (seq bad-projects) (assoc :projects bad-projects)
                (seq bad-suite-projects) (assoc :suite-projects bad-suite-projects)
@@ -285,11 +308,12 @@
   "True when `s` is one safe path segment: `hive-compose.boundary.runs/PathPart`
    (letters, digits, `_` `.` `-`, starting with a letter or digit, never only
    dots). Suite and project ids name directories under the run dir and the
-   container name, so anything else (`..`, `a/../b`, `/abs`, `a:b`) is refused.
-   `@` is allowed past the first char: a variant cell's key is `<suite>@<variant>`."
+   container name, so anything else (`..`, `a/../b`, `/abs`, `a:b`, `a@b`) is
+   refused. A variant cell's `<suite>@<variant>` key is built from two such
+   parts, never parsed from one."
   [s]
   (boolean (and (string? s)
-                (re-matches #"[A-Za-z0-9][A-Za-z0-9_.@-]*" s)
+                (re-matches #"[A-Za-z0-9][A-Za-z0-9_.-]*" s)
                 (not (re-matches #"\.+" s)))))
 
 (defn- relative-inside?
@@ -362,7 +386,8 @@
       (nil? suite)
       (r/err :compose/unknown-names {:suites [sid] :message (str "unknown suite: " sid)})
 
-      (and (:variant cell) (not (contains? (:suite/variants suite) (:variant cell))))
+      (and (:variant cell) (or (not (path-part? (:variant cell)))
+                               (not (contains? (:suite/variants suite) (:variant cell)))))
       (r/err :compose/unknown-names {:variants [(:variant cell)]
                                      :message (str "suite " sid " declares no variant " (pr-str (:variant cell)))})
 
@@ -486,14 +511,16 @@
 
 (defn report-required?
   "Whether a cell of `suite` must leave a report to pass: when it says so with
-   `:suite/report-required?`, else when it declares where or how it reports
-   (`:suite/reports-dir` or `:suite/report-format`). `:suite/report-required?
-   false` opts a declaring suite out (its exit code is then the verdict when
-   no report is found)."
+   `:suite/report-required?`, else when it is a container suite
+   (`:suite/image`: it always has its reports mount) or declares where or how
+   it reports (`:suite/reports-dir` or `:suite/report-format`). Only an
+   explicit `:suite/report-required? false` opts out (its exit code is then
+   the verdict when no report is found)."
   [suite]
   (if (contains? suite :suite/report-required?)
     (boolean (:suite/report-required? suite))
-    (boolean (or (:suite/reports-dir suite) (:suite/report-format suite)))))
+    ;; a container suite always has its reports mount: it must report too
+    (boolean (or (:suite/image suite) (:suite/reports-dir suite) (:suite/report-format suite)))))
 
 (defn verdict-policy
   "The cell-verdict policy of `suite` for a call whose `skip-fails?` is given
@@ -509,29 +536,48 @@
 
 (defn cell-verdict
   "{:status :passed|:failed|:error :reason kw?} of a cell that ended with
-   `exit` (nil: killed or timed out) and `report` (nil: none was read), under
-   `policy` ({:report-required? :skip-fails?}, both default false).
-   - No report: :error :report/none when the suite requires one, else :error
-     when the exit is non-zero or missing (the runner died before it
-     reported), else :passed (the exit code is the verdict).
-   - A report with no case when the suite requires one: :error :report/empty.
-   - Failed or errored cases, a bail-out, or a non-zero or missing exit:
-     :failed.
-   - A skipped case under :skip-fails?: :failed :skipped-as-failure. The
-     case itself stays :skipped in the report; only the verdict changes.
+   `exit` (nil: killed or timed out) and `report` (a Result<Report> as the
+   reader answers it, a bare Report, or nil for none), under `policy`
+   ({:report-required? :skip-fails? :timed-out? :oom?}, all default false).
+
+   The law: :passed ONLY when the runner ran to a clean exit 0, was neither
+   killed nor timed out, its report (when one is required) parsed completely
+   and holds at least one case, and no case failed. A test saying no is
+   :failed; anything that could not run, or whose report cannot be trusted,
+   is :error (exit 2).
+   - A report error other than :report/none (malformed, truncated,
+     unreadable, uncollectable): :error with the report category as reason,
+     whatever the exit code and whatever :report-required? says.
+   - No report: :error (reason :report/none) when one is required, :error
+     (reason :runner/oom or :runner/timeout) when it was killed, else the
+     exit code is the verdict (0 :passed, else :error: it died before it
+     reported).
+   - A required report with no case: :error (reason :report/empty).
+   - Failed or errored cases: :failed (reason :cases/failed).
+   - Killed (OOM, timeout) with no failed case: :error (reason as above).
+   - A bail-out, or a non-zero or missing exit: :failed.
+   - A skipped case under :skip-fails?: :failed :skipped-as-failure (the
+     case itself stays :skipped in the report).
    - Anything else: :passed."
   ([exit report] (cell-verdict exit report nil))
-  ([exit report {:keys [report-required? skip-fails?]}]
-   (let [clean? (and (number? exit) (zero? exit))]
+  ([exit report {:keys [report-required? skip-fails? timed-out? oom?]}]
+   (let [clean? (and (number? exit) (zero? exit))
+         [rep rerr] (cond (r/ok? report) [(:ok report) nil]
+                          (r/err? report) [nil (:error report)]
+                          :else [report nil])
+         killed (cond oom? :runner/oom timed-out? :runner/timeout)]
      (cond
-       (nil? report) (cond report-required? {:status :error :reason :report/none}
-                           clean? {:status :passed}
-                           :else {:status :error :reason (if (nil? exit) :runner/no-exit :runner/died)})
-       (and report-required? (empty? (:report/cases report))) {:status :error :reason :report/empty}
-       (pos? (failures report)) {:status :failed :reason :cases/failed}
-       (:report/bail-out report) {:status :failed :reason :report/bail-out}
+       (and rerr (not= :report/none rerr)) {:status :error :reason rerr}
+       (nil? rep) (cond report-required? {:status :error :reason :report/none}
+                        killed {:status :error :reason killed}
+                        clean? {:status :passed}
+                        :else {:status :error :reason (if (nil? exit) :runner/no-exit :runner/died)})
+       (and report-required? (empty? (:report/cases rep))) {:status :error :reason :report/empty}
+       (pos? (failures rep)) {:status :failed :reason :cases/failed}
+       killed {:status :error :reason killed}
+       (:report/bail-out rep) {:status :failed :reason :report/bail-out}
        (not clean?) {:status :failed :reason (if (nil? exit) :runner/no-exit :runner/exit)}
-       (and skip-fails? (pos? (skipped-count report))) {:status :failed :reason :skipped-as-failure}
+       (and skip-fails? (pos? (skipped-count rep))) {:status :failed :reason :skipped-as-failure}
        :else {:status :passed}))))
 
 (defn cell-status
@@ -553,9 +599,11 @@
    pass (`cell-verdict`). `:oom` is the runner's OOM finding (hc-16b
    `hive-compose.promote.oom`), kept as is: `why` prints its line and the
    flake history classes the run :oom."
-  [run cell {:keys [exit report started-at finished-at oom policy]}]
+  [run cell {:keys [exit report started-at finished-at oom policy timed-out?]}]
   (let [rep (when (r/ok? report) (:ok report))
-        {:keys [status reason]} (cell-verdict exit rep policy)]
+        {:keys [status reason]} (cell-verdict exit report (cond-> (or policy {})
+                                                            (map? oom) (assoc :oom? true)
+                                                            timed-out? (assoc :timed-out? true)))]
     (cond-> {:run/id run
              :suite/id (cell-key cell)
              :project (:project cell)
@@ -581,6 +629,7 @@
            :report report}
     (:started-at answer) (assoc :started-at (:started-at answer))
     (:finished-at answer) (assoc :finished-at (:finished-at answer))
+    (:timed-out? answer) (assoc :timed-out? true)
     (map? (:oom answer)) (assoc :oom (:oom answer))))
 
 ;; ---------------------------------------------------------------------------

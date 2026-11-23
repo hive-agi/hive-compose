@@ -87,8 +87,6 @@
    :report/malformed 502
    :report/unreadable 502
    :report/none 502
-   ;; a suite that must report left a report with no case (hc-8 cell :reason)
-   :report/empty 502
    :report/unclearable 502
    :report/uncollectable 502
    ;; compose test (hc-8)

@@ -491,6 +491,7 @@
           failing? (and ok? (pos? (+ (:failed t) (:error t))))
           dirty? (not= 0 exit)]
       (cond
+        (and (not ok?) (not= :report/none (:error rep))) (= :error status)
         (and (not ok?) dirty?) (= :error status)
         (or failing? dirty?) (= :failed status)
         :else (= :passed status)))))
@@ -559,6 +560,83 @@
                (and (= :passed (:status without)) (= :failed (:status with))
                     (some #{:skipped} (statuses with))))))))
 
+(def gen-report-outcome
+  "Every outcome the report reader answers: a complete parse (any cases, maybe
+   none), no report at all, or a report that exists but cannot be trusted."
+  (gen/one-of [(gen/fmap #(r/ok (report %)) (gen/vector gen-status 0 6))
+               (gen/return (r/err :report/none {:dir "/x"}))
+               (gen/fmap #(r/err % {:reason :x})
+                         (gen/elements [:report/malformed :report/unreadable :report/uncollectable
+                                        :report/unclearable]))]))
+
+(defspec passed-only-when-it-ran-parsed-and-nothing-failed 500
+  (prop/for-all [exit gen-exit rep gen-report-outcome policy gen-policy
+                 killed (gen/elements [nil :oom :timeout])]
+    (let [v (suite/cell-verdict exit rep (cond-> policy
+                                           (= :oom killed) (assoc :oom? true)
+                                           (= :timeout killed) (assoc :timed-out? true)))
+          cases (get-in rep [:ok :report/cases])
+          parsed? (r/ok? rep)]
+      (and
+       ;; MAJOR-1: any report-reading outcome other than a complete parse or
+       ;; plain absence is never :passed, and is could-not-run
+       (if (and (r/err? rep) (not= :report/none (:error rep)))
+         (= {:status :error :reason (:error rep)} v)
+         true)
+       ;; the law: :passed implies it ran clean, was not killed, nothing failed,
+       ;; and a required report parsed with at least one case
+       (if (= :passed (:status v))
+         (and (= 0 exit) (nil? killed)
+              (if (:report-required? policy) (and parsed? (seq cases)) true)
+              (not-any? #{:failed :error} (map :case/status cases))
+              (or (not (:skip-fails? policy)) (not-any? #{:skipped} (map :case/status cases))))
+         true)
+       (contains? #{:passed :failed :error} (:status v))))))
+
+(deftest r2-1-a-truncated-report-with-exit-0-could-not-run
+  (let [res (suite/cell-result "r01" cell {:exit 0 :report (r/err :report/malformed {:reason :xml/unparseable})})]
+    (is (= [:error :report/malformed] [(:status res) (:reason res)]))
+    (is (= 2 (:exit (suite/matrix-summary [res]))))))
+
+(deftest r2-2-a-container-suite-must-report-by-default
+  (is (true? (suite/report-required? {:suite/id "s" :suite/image "x/smoke:1"})))
+  (is (false? (suite/report-required? {:suite/id "s" :suite/image "x/smoke:1" :suite/report-required? false})))
+  (is (= [:error :report/none]
+         ((juxt :status :reason)
+          (suite/cell-result "r01" cell {:exit 0 :report (r/err :report/none {})
+                                         :policy (suite/verdict-policy {:suite/image "x/smoke:1"} nil)})))))
+
+(deftest a-killed-runner-could-not-run
+  (is (= {:status :error :reason :runner/timeout}
+         (suite/cell-verdict nil (r/ok (report [:passed])) {:timed-out? true})))
+  (is (= {:status :error :reason :runner/oom}
+         (suite/cell-verdict 137 (r/ok (report [:passed])) {:oom? true})))
+  (is (= :failed (:status (suite/cell-verdict 137 (r/ok (report [:failed])) {:oom? true})))
+      "a test that said no before the kill is still a failure"))
+
+(deftest r2-3-a-selected-suite-never-vanishes-under-a-variants-filter
+  (let [ss {"a" {:suite/id "a" :suite/command "t" :suite/projects ["shop"] :suite/variants {"on" {} "off" {}}}
+            "b" {:suite/id "b" :suite/command "t" :suite/projects ["shop"] :suite/variants {"off" {}}}
+            "c" {:suite/id "c" :suite/command "t" :suite/projects ["shop"]}}
+        res (suite/expand-matrix ss projects {:suites "a,b" :variants "on"})]
+    (is (= :compose/unknown-names (:error res)))
+    (is (= {"b" ["on"]} (:variants res)))
+    (is (= [{:suite/id "a" :project "shop" :variant "on"} {:suite/id "c" :project "shop"}]
+           (:ok (suite/expand-matrix ss projects {:suites "a,c" :variants "on"})))
+        "a suite without variants runs once")
+    (is (= {"*" ["x"]} (:variants (suite/expand-matrix ss projects {:suites "c" :variants "x"}))))))
+
+(defspec every-requested-suite-is-a-cell-or-the-call-is-refused 300
+  (prop/for-all [decl (gen/vector (gen/set (gen/elements ["on" "off" "x"])) 1 4)
+                 req (gen/set (gen/elements ["on" "off" "x" "y"]))]
+    (let [ids (mapv #(str "s" %) (range (count decl)))
+          ss (into {} (map (fn [id vs] [id (cond-> {:suite/id id :suite/command "t" :suite/projects ["shop"]}
+                                              (seq vs) (assoc :suite/variants (zipmap vs (repeat {}))))])
+                           ids decl))
+          res (suite/expand-matrix ss projects {:suites ids :variants (seq req)})]
+      (or (r/err? res)
+          (= (set ids) (set (map :suite/id (:ok res))))))))
+
 (defspec a-required-report-is-never-a-silent-pass 300
   (prop/for-all [exit gen-exit rep gen-report-res]
     (let [{:keys [status]} (suite/cell-result "r01" cell {:exit exit :report rep :policy {:report-required? true}})
@@ -590,7 +668,7 @@
   (is (= [{:suite/id "e2e" :project "web" :variant "on"} {:suite/id "smoke" :project "web"}]
          (:ok (suite/expand-matrix variant-suites projects {:projects "web" :variants "on"})))
       "a variants filter leaves a suite without variants alone")
-  (is (= ["x"] (:variants (suite/expand-matrix variant-suites projects {:variants "on,x"}))))
+  (is (= {"e2e" ["x"]} (:variants (suite/expand-matrix variant-suites projects {:variants "on,x"}))))
   (let [spec (:ok (suite/runner-spec (ctx :suites variant-suites) {:suite/id "e2e" :project "web" :variant "on"}))]
     (is (nil? (m/explain suite/RunnerSpec spec)))
     (is (= "e2e@on/web" (:test-id spec)))

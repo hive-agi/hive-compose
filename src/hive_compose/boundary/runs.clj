@@ -56,9 +56,14 @@
   [:re #"^[a-z0-9]{3,40}\z"])
 
 (def PathPart
-  "A suite or project directory name: one path segment, never . or ..; a
-   variant cell's suite dir is `<suite>@<variant>`."
-  [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.@-]*\z"] [:fn #(not (re-matches #"\.+" %))]])
+  "A suite or project directory name: one path segment, never . or .."
+  [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.-]*\z"] [:fn #(not (re-matches #"\.+" %))]])
+
+(def CellKey
+  "A cell's suite dir: a PathPart suite id, or `<suite>@<variant>` for a
+   variant cell (hc-8 promote.suite/cell-key)."
+  [:and [:re #"^[A-Za-z0-9][A-Za-z0-9_.-]*(@[A-Za-z0-9][A-Za-z0-9_.-]*)?\z"]
+   [:fn #(not (re-matches #"\.+" %))]])
 
 (def OomFinding
   "An OOM kill of the cell's runner (hc-16b `hive-compose.promote.oom`):
@@ -78,7 +83,7 @@
    OOM-killed."
   [:map
    [:run/id RunDir]
-   [:suite/id PathPart]
+   [:suite/id CellKey]
    [:project PathPart]
    [:status [:enum :passed :failed :error]]
    [:exit {:optional true} [:maybe :int]]

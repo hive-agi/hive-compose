@@ -1308,11 +1308,15 @@ paths:
         a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection
         when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default
         test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait
-        (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant> with its env, default
-        all); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something
-        could not run (a suite that declares reports and leaves none or no case is could-not-run unless :suite/report-required?
-        false). Every case is listed with id, status and time; a could-not-run cell carries :reason and, when known,
-        :service'
+        (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every
+        selected suite that declares variants must declare each named one, else the call is refused; a suite without
+        variants runs once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT
+        restarted or re-env''d per variant, so a variant that toggles a service''s own flag tests nothing (follow-up
+        20261123122851-6e29b6f7); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test
+        failed, 2 something could not run. A cell passes only when its runner exited 0 and its report parsed: an
+        unparsable report is could-not-run; a container suite, or one that declares :suite/reports-dir or :suite/report-format,
+        must leave a report with at least one case unless :suite/report-required? false. Every case is listed with
+        id, status and time; a could-not-run cell carries :reason and, when known, :service'
       tags:
       - stacks
       x-hive-call-op: test
@@ -3720,7 +3724,9 @@ components:
         variants:
           type: string
           description: '[test] only these env variants of the suites that declare :suite/variants, a,b (default
-            every variant); a suite without variants is unaffected'
+            every variant); each selected suite with variants must declare every named one, else refused; a suite
+            without variants runs once. The variant env reaches the suite RUNNER only, never the stack''s consumers
+            (no restart or re-env per variant)'
         toxic:
           type: object
           description: '[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer'
@@ -4000,7 +4006,6 @@ components:
       - compose/unsafe-reports-dir
       - compose/unsupported-media-type
       - compose/volume-removal-refused
-      - report/empty
       - report/malformed
       - report/none
       - report/unclearable
@@ -5059,7 +5064,9 @@ components:
       additionalProperties: true
       description: 'pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed,
         1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id
-        <suite>@<variant>, variant), each with status, reason when it did not pass (error: could not run, e.g. report/none,
+        <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers
+        are NOT restarted or re-env''d per variant; a suite without variants under a variants filter ran once and
+        carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none,
         report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status
         case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file'
       x-source: hand
@@ -5518,7 +5525,9 @@ components:
         variants:
           type: string
           description: '[test] only these env variants of the suites that declare :suite/variants, a,b (default
-            every variant); a suite without variants is unaffected'
+            every variant); each selected suite with variants must declare every named one, else refused; a suite
+            without variants runs once. The variant env reaches the suite RUNNER only, never the stack''s consumers
+            (no restart or re-env per variant)'
         wait:
           type: boolean
           description: '[up|switch|stack-up|test] wait until the started services are healthy (stack-up and test:

@@ -382,6 +382,7 @@
                                            :oom (:oom ok)
                                            :started-at (or (:started-at ok) t0)
                                            :finished-at (or (:finished-at ok) ((:now ctx)))
+                                           :timed-out? (boolean (:timed-out? ok))
                                            :policy (:verdict-policy spec)})
                 tail (when-not redact? (:output ok))
                 result (cond-> (assoc result :test-id (:test-id spec) :trace-id (:trace-id spec)
@@ -480,7 +481,7 @@
    passed, every data phase answered ok, `keep-up?` is not set and no other
    claim holds it; a reused run is never taken down. `:exit` is
    promote.suite/matrix-exit: 0 passed, 1 failed, 2 could not run."
-  [ctx {:keys [run stack-id reuse? keep-up? skip-fails?]} results phases]
+  [ctx {:keys [run stack-id reuse? keep-up? skip-fails? variants?]} results phases]
   (let [summary (suite/matrix-summary results)
         phase-errors (vec (for [p phases :when (r/err? (:result p))]
                             {:phase (:phase p) :after-suite (:after-suite p)
@@ -493,7 +494,11 @@
         answer (cond-> {:run run :stack stack-id :reused? (boolean reuse?)
                         :status status :exit (suite/matrix-exit status)
                         :summary (dissoc summary :status :exit)
-                        :cells (mapv answer-cell results)
+                        :cells (mapv #(cond-> (answer-cell %)
+                                        ;; a variants filter leaves a suite without variants alone
+                                        (and variants? (nil? (:variant %)))
+                                        (assoc :variant-note "the suite declares no variants: it ran once, unfiltered"))
+                                     results)
                         :stack-kept? kept?}
                  (some? skip-fails?) (assoc :skip-fails? skip-fails?)
                  (seq phases) (assoc :data-phases (mapv #(-> % (dissoc :result) (assoc :ok? (r/ok? (:result %)))) phases))
@@ -633,7 +638,8 @@
                 ctx (assoc ctx ::agent agent)
                 ctx' (assoc ctx' ::agent agent)
                 info {:run run :stack-id stack-id :reuse? reuse? :keep-up? keep-up?
-                      :skip-fails? (:skip-fails? opts)}]
+                      :skip-fails? (:skip-fails? opts)
+                      :variants? (some? (suite/parse-names (:variants opts)))}]
             (reset! known {:run run :stack stack-id :agent agent})
             (cond
               dry-run?

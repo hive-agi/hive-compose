@@ -184,7 +184,35 @@
         (is (= ["load@reverse-on/shop"]
                (mapv :test-id (do (suites/test! c2 {:suites "load" :variants "reverse-on"})
                                   (sr/suite-runs (:suite-runner c2))))))
-        (is (= ["nope"] (:variants (suites/test! c2 {:suites "load" :variants "nope"}))))))))
+        (is (= {"load" ["nope"]} (:variants (suites/test! c2 {:suites "load" :variants "nope"}))))))
+    (testing "R2-3: a selected suite with variants but not the named one refuses the call, nothing runs"
+      (let [c3 (-> c
+                   (assoc :suite-runner (sr/suite-runner {}))
+                   (assoc-in [:settings :compose/suites "smoke" :suite/variants] {"only-off" {}}))
+            res (suites/test! c3 {:suites "load,smoke" :variants "reverse-on"})]
+        (is (= {"smoke" ["reverse-on"]} (:variants res)) (pr-str res))
+        (is (empty? (sr/suite-runs (:suite-runner c3))))))
+    (testing "a suite without variants under a variants filter runs once and says so"
+      (let [c4 (assoc c :suite-runner (sr/suite-runner {}))
+            res (suites/test! c4 {:suites "load,smoke" :projects "shop" :variants "reverse-on"})
+            smoke (first (filter #(= "smoke" (:suite/id %)) (get-in res [:ok :cells])))]
+        (is (= ["load@reverse-on/shop" "smoke/shop"] (sort (map :test-id (sr/suite-runs (:suite-runner c4))))))
+        (is (string? (:variant-note smoke)))))))
+
+(deftest r2-1-r2-2-no-false-green-from-the-report
+  (testing "R2-1: a truncated JUnit with exit 0 could not run (exit 2)"
+    (let [res (suites/test! (ctx {"load" {:exit 0 :raw "<testsuite name=\"load\"><testcase classname=\"c\" name=\"a\">"}})
+                            {:suites "load"})]
+      (is (= [:error 2] [(get-in res [:ok :status]) (get-in res [:ok :exit])]))
+      (is (= :report/malformed (get-in res [:ok :cells 0 :reason])))))
+  (testing "R2-2: a container suite that writes no report could not run (exit 2)"
+    (let [c (assoc-in (ctx {"smoke/shop" {:exit 0}}) [:settings :compose/suites "smoke" :suite/env] {})
+          res (suites/test! c {:suites "smoke" :projects "shop"})]
+      (is (= [:error 2 :report/none] [(get-in res [:ok :status]) (get-in res [:ok :exit]) (get-in res [:ok :cells 0 :reason])]))
+      (is (= :passed (get-in (suites/test! (assoc-in c [:settings :compose/suites "smoke" :suite/report-required?] false)
+                                           {:suites "smoke" :projects "shop"})
+                             [:ok :status]))
+          "only an explicit false opts out"))))
 
 (deftest the-answer-lists-every-case-and-why-a-cell-could-not-run
   (let [res (suites/test! (ctx {"smoke/shop" {:exit 1 :passed 2 :failed 1} "load" {:error :compose/secret-unresolved}}) {})
