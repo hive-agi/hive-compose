@@ -74,5 +74,8 @@
       (assoc :stacks (merge3 (:stacks base) (:stacks mine) (:stacks theirs) merge-entry))
       ;; preexistence marks by service: an addition from either side lands, a
       ;; reconciled removal (a run saw the service gone) sticks
+      ;; isolated runs (FUN-D), merged like stack runs
+      (some :runs [base mine theirs])
+      (assoc :runs (merge3 (:runs base) (:runs mine) (:runs theirs) (fn [_ m t] (if (:ended-at t) t m))))
       (some :preexisting [base mine theirs])
       (assoc :preexisting (merge-marks (:preexisting base) (:preexisting mine) (:preexisting theirs))))))

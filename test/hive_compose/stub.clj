@@ -64,13 +64,15 @@
 
 (defrecord StubEngine [world]
   port/IComposeEngine
-  (-version [_] (or (fault world :version) (r/ok "stub")))
+  (-version [_] (or (fault world :version) (r/ok (get @world :version "stub-2.29.0"))))
   (-closure [_ p]
     (record! world [:closure (:profile/id p)])
     (or (fault world :closure)
         (if-let [c (get-in @world [:closures (:profile/id p)])]
           (r/ok (vec (sort c)))
-          (let [model (get-in @world [:projects (profile/project p)])
+          ;; an isolated run's project is a copy of its base project's model
+          (let [model (or (get-in @world [:projects (profile/project p)])
+                          (get-in @world [:projects (:profile/base-project p)]))
                 targets (or (seq (:profile/services p)) (enabled model (:profile/compose-profiles p)))]
             (if-let [missing (first (remove model targets))]
               (r/err :compose/command-failed {:exit 1 :stderr (str "no such service: " missing)})
@@ -91,7 +93,10 @@
     (record! world [:up (profile/project p) (vec services)])
     (swap! world assoc :last-up-no-deps? (boolean (:profile/no-deps? p)))
     (or (fault world :up)
+        (when-let [stderr (get @world :up-stderr)]
+          (r/err :compose/command-failed {:exit 1 :stderr stderr}))
         (do (swap! world update-in [:running (profile/project p)] (fnil into #{}) services)
+            (when (:profile/run p) ((resolve 'hive-compose.stub/create-run-volumes!) (->StubEngine world) p))
             (r/ok {:out ""}))))
   (-stop! [_ p services]
     (record! world [:stop (profile/project p) (vec services)])
@@ -396,3 +401,71 @@
   "[[:exec project service argv env] ...] recorded so far."
   [e]
   (filterv #(= :exec (first %)) (calls e)))
+
+;; ---------------------------------------------------------------------------
+;; IIsolatedRuns. World keys: :models {base-project model} (the merged model
+;; `config --format json` answers, string keys), :images {tag id},
+;; :volumes {name {:labels {k v} :in-use? bool}}, :bindings {compose-project
+;; {svc {port host}}}, :image-of {compose-project {svc id}}. `-up!` of an
+;; isolated profile creates the run's compose-derived volumes. Every call is
+;; recorded: [:model project override], [:remove-volumes names].
+
+(defn model! [e base model] (swap! (:world e) assoc-in [:models base] model))
+(defn images! [e m] (swap! (:world e) update :images merge m))
+(defn volumes! [e m] (swap! (:world e) update :volumes merge m))
+(defn volumes [e] (:volumes @(:world e) {}))
+(defn bindings! [e cp m] (swap! (:world e) assoc-in [:bindings cp] m))
+
+(extend-type StubEngine
+  port/IIsolatedRuns
+  (-model [{:keys [world]} p]
+    (record! world [:model (profile/project p) (:profile/override p)])
+    (or (fault world :model)
+        (let [base (or (:profile/base-project p) (profile/project p))]
+          (if-let [m (get-in @world [:models base])]
+            ;; as compose: a volume named <base>_<key> is the one compose
+            ;; derives, so under another -p it is named after that project
+            (r/ok (-> m
+                      (assoc "name" (profile/project p))
+                      (update "volumes" #(into {} (for [[k v] %]
+                                                    [k (cond-> v (= (get v "name") (str base "_" k))
+                                                         (assoc "name" (str (profile/project p) "_" k)))])))))
+            (r/err :compose/command-failed {:exit 1 :stderr "no configuration file provided: not found\n"})))))
+  (-image-ids [{:keys [world]} images]
+    (r/ok (into (sorted-map) (keep (fn [i] (when-let [id (get-in @world [:images i])] [i id]))) images)))
+  (-run-facts [{:keys [world]} p]
+    (let [cp (profile/project p)]
+      (r/ok {:ports (get-in @world [:bindings cp] {})
+             :images (into (sorted-map) (for [s (get-in @world [:running cp])]
+                                          [s (get-in @world [:image-of cp s] (str "sha256:" s))]))})))
+  (-run-volumes [{:keys [world]} cp]
+    (r/ok (vec (sort-by :name (for [[n v] (:volumes @world)
+                                    :when (= cp (get-in v [:labels "com.docker.compose.project"]))]
+                                {:name n :labels (:labels v)})))))
+  (-remove-volumes! [{:keys [world]} names]
+    (record! world [:remove-volumes (vec names)])
+    (r/ok (reduce (fn [acc n]
+                    (cond
+                      (get-in @world [:volumes n :in-use?]) (update acc :kept conj {:name n :reason :in-use})
+                      (get-in @world [:volumes n]) (do (swap! world update :volumes dissoc n)
+                                                       (update acc :removed conj n))
+                      :else (update acc :kept conj {:name n :reason :failed})))
+                  {:removed [] :kept []}
+                  names))))
+
+(defn create-run-volumes!
+  "What compose does on `up` of isolated profile `p`: create the run's own
+   compose-derived volumes `<project>_<key>` of the model's non-external
+   volumes without an explicit name, labelled with the run's project."
+  [e p]
+  (let [cp (profile/project p)
+        base (:profile/base-project p)
+        model (get-in @(:world e) [:models base])]
+    (doseq [[k v] (get model "volumes")
+            :when (not (get v "external"))
+            ;; borrowed through the override (declared external there)
+            :when (not (some-> (:profile/override p) slurp
+                               (clojure.string/includes? (str "\"" k "\":\n    \"external\": true"))))
+            :when (or (nil? (get v "name")) (= (get v "name") (str base "_" k)))]
+      (swap! (:world e) assoc-in [:volumes (str cp "_" k)]
+             {:labels {"com.docker.compose.project" cp "com.docker.compose.volume" k}}))))

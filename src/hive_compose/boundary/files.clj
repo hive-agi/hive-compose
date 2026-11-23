@@ -42,6 +42,26 @@
                                           StandardCopyOption/ATOMIC_MOVE]))
       path)))
 
+(defn write-text!
+  "Result<path>: `text` written to `path` through a sibling temp file and an
+   atomic move, its directory created (the generated override of an
+   isolated run)."
+  [path text]
+  (r/try-effect* :compose/override-unwritable
+    (let [f (io/file path)
+          tmp (io/file (str path ".tmp"))]
+      (io/make-parents f)
+      (spit tmp text)
+      (Files/move (.toPath tmp) (.toPath f)
+                  (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING
+                                          StandardCopyOption/ATOMIC_MOVE]))
+      path)))
+
+(defn first-existing
+  "The first of `names` that exists as a file under `dir`, nil when none."
+  [dir names]
+  (first (filter #(.isFile (io/file dir %)) names)))
+
 (defn read-lock
   "Result<Lock-or-nil> from the stack lockfile at `path`
    (hive-compose.promote.stack/lock-path); nil when there is none."
@@ -61,7 +81,8 @@
   [st]
   (cond-> {:active (or (:active st) {}) :current (:current st)}
     (contains? st :stacks) (assoc :stacks (or (:stacks st) {}))
-    (contains? st :preexisting) (assoc :preexisting (or (:preexisting st) {}))))
+    (contains? st :preexisting) (assoc :preexisting (or (:preexisting st) {}))
+    (contains? st :runs) (assoc :runs (or (:runs st) {}))))
 
 (defn sync-state!
   "Merge the live state with the file at `path` and write the merge.

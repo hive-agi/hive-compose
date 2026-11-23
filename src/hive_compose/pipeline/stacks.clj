@@ -190,7 +190,7 @@
 ;; ---------------------------------------------------------------------------
 ;; resource caps (hc-16a)
 
-(defn- mem-available
+(defn mem-available
   "MemAvailable in bytes from the context's IHostMemory, nil when there is
    none or it cannot be read (admission then checks the budgets alone)."
   [ctx]

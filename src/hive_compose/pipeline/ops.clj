@@ -18,6 +18,8 @@
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
             [hive-compose.promote.config :as config]
+            [hive-compose.promote.env :as env]
+            [hive-compose.promote.isolated :as isolated]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
@@ -52,7 +54,9 @@
                  (when-let [snap (:profile (active-entry ctx id))]
                    (let [[pid section?] (str/split id #"/" 2)
                          proj (get-in ctx [:settings :compose/projects pid])]
-                     (if (and section? proj)
+                     ;; an isolated run's section keeps its run's project and
+                     ;; override: re-basing would point it at the shared project
+                     (if (and section? proj (not (:profile/run snap)))
                        (target/rebase-section nil proj snap)
                        snap))))]
     (r/ok p)
@@ -149,6 +153,7 @@
         rows (for [[id a] (sort-by key (:active @(:state ctx)))
                    :let [pid (first (str/split id #"/" 2))]
                    :when (and (:profile a) (str/includes? id "/") (not (configured ctx id))
+                              (not (get-in a [:profile :profile/run]))
                               (contains? old-projects pid)
                               (not= (get old-projects pid) (get new-projects pid)))]
                (if-let [proj (get new-projects pid)]
@@ -746,6 +751,7 @@
                          :idle-action (profile/idle-action settings p)
                          :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  (:profile/run p) (merge (isolated/section-row p (env/rendered (:profile/env p))))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)

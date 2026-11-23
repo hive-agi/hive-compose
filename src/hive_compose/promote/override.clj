@@ -28,14 +28,14 @@
 ;; ---------------------------------------------------------------------------
 ;; tags and versions
 
-(defrecord Tagged [tag value])
-
 (defn tagged
-  "A YAML value carrying compose merge tag `tag` (\"!reset\", \"!override\")."
+  "A YAML value carrying compose merge tag `tag` (\"!reset\", \"!override\"):
+   {:tag t :value v}, plain data so a document persists as EDN. A compose
+   map has string keys, so no compose value is mistaken for one."
   [tag v]
-  (->Tagged tag v))
+  {:tag tag :value v})
 
-(defn tagged? [v] (instance? Tagged v))
+(defn tagged? [v] (and (map? v) (= #{:tag :value} (set (keys v)))))
 
 (def reset-null (tagged "!reset" nil))
 (def reset-list (tagged "!reset" []))
@@ -71,18 +71,40 @@
           (and (string? v) (re-matches #"\d+" v)) (let [n (parse-long v)] (when (pos? n) n))
           :else nil)))
 
+(defn port-key
+  "How a container port is named in port maps: \"5432\" for tcp, \"53/udp\"
+   for any other protocol."
+  [target protocol]
+  (if (or (nil? protocol) (= "tcp" protocol)) (str target) (str target "/" protocol)))
+
 (defn published
-  "{service {\"<target>/<protocol>\" host-port}}: the fixed host ports the
-   model publishes."
+  "{service {port-key host-port}}: the fixed host ports the model publishes."
   [model]
   (into (sorted-map)
         (for [[svc sm] (services model)
               :let [ps (into (sorted-map)
                              (keep (fn [p] (when-let [h (host-port p)]
-                                             [(str (get p "target") "/" (get p "protocol" "tcp")) h])))
+                                             [(port-key (get p "target") (get p "protocol")) h])))
                              (get sm "ports"))]
               :when (seq ps)]
           [svc ps])))
+
+(defn planned-ports
+  "{service {port-key host-port}} a copy publishes under PortPolicy
+   `policy`, known before `up`; nil for :ephemeral (docker picks)."
+  [model policy]
+  (let [pub (published model)]
+    (cond
+      (= :ephemeral policy) nil
+      (or (nil? policy) (= :strip policy)) {}
+      (= :keep policy) pub
+      (:offset policy) (into (sorted-map) (for [[s m] pub]
+                                            [s (into (sorted-map) (for [[k h] m] [k (+ h (:offset policy))]))]))
+      (:publish policy) (into (sorted-map) (for [[s m] (:publish policy)
+                                                 :let [m (into (sorted-map) (for [[c h] m :when (pos? h)] [(str c) h]))]
+                                                 :when (seq m)]
+                                             [s m]))
+      :else {})))
 
 (defn named-containers
   "Sorted services of `model` that set a container_name."
@@ -214,6 +236,19 @@
                   :hint "an external volume is never renamed nor recreated by hive-compose; drop it from the fresh volumes"})
           (r/ok (into (sorted-map) (map (fn [k] [k {"name" (fresh-name project k run)}])) ks)))))))
 
+(defn- shared-volumes
+  "Result<{key {\"external\" true \"name\" <base>_<key>}}>: the volumes `ks`
+   a copy borrows from shared project `base` (build caches), never created
+   nor removed by the copy. A key the model does not declare is refused."
+  [model ks base]
+  (cond
+    (empty? ks) (r/ok {})
+    (nil? base) (invalid {:hint "shared volumes need :override/images-from (the shared project)"})
+    :else
+    (if-let [unknown (seq (remove #(contains? (get model "volumes" {}) %) ks))]
+      (invalid {:volumes (vec (sort unknown)) :hint "run shared volumes names volumes the model does not declare"})
+      (r/ok (into (sorted-map) (for [k (distinct ks)] [k {"external" true "name" (str base "_" k)}]))))))
+
 (defn override-doc
   "Result<doc>: the override document of OverrideSpec `spec` over compose
    model `model`, {} when it changes nothing. It names only services and
@@ -224,17 +259,21 @@
     (r/let-ok [names (name-resets model (:override/names spec))
                ports (ports-entries model (get spec :override/ports :strip))
                vols (volume-renames model (:override/fresh-volumes spec) (:override/run spec))]
-      (let [images (when-let [p (:override/images-from spec)]
+      (let [pinned (:override/images spec)
+            images (when-let [p (:override/images-from spec)]
                      (into (sorted-map)
-                           (map (fn [s] [s {"build" reset-null "image" (pinned-image p s) "pull_policy" "never"}]))
+                           (map (fn [s] [s {"build" reset-null "image" (get pinned s (pinned-image p s))
+                                            "pull_policy" "never"}]))
                            (build-only model)))
             svcs (merge-with merge
                              (into (sorted-map) (map (fn [s] [s {"container_name" reset-null}])) names)
                              (into (sorted-map) (map (fn [[s v]] [s {"ports" v}])) ports)
                              images)]
-        (r/ok (cond-> {}
-                (seq svcs) (assoc "services" (into (sorted-map) svcs))
-                (seq vols) (assoc "volumes" vols)))))))
+        (r/let-ok [shared (shared-volumes model (:override/shared-volumes spec) (:override/images-from spec))]
+          (let [vols (merge vols shared)]
+            (r/ok (cond-> {}
+                    (seq svcs) (assoc "services" (into (sorted-map) svcs))
+                    (seq vols) (assoc "volumes" (into (sorted-map) vols))))))))))
 
 (defn describe
   "One line per service and volume override document `doc` changes, for
@@ -259,8 +298,10 @@
 (defn spec-of
   "OverrideSpec of options as a call or a preset gives them (:run :names
    :ports :fresh-volumes :images-from), absent ones left out."
-  [{:keys [run names ports fresh-volumes images-from]}]
+  [{:keys [run names ports fresh-volumes images-from images shared-volumes]}]
   (cond-> {}
+    (seq images) (assoc :override/images (into (sorted-map) images))
+    (seq shared-volumes) (assoc :override/shared-volumes (vec shared-volumes))
     run (assoc :override/run run)
     (some? names) (assoc :override/names names)
     (some? ports) (assoc :override/ports ports)

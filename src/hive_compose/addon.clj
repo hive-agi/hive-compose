@@ -23,6 +23,9 @@
             [hive-compose.boundary.history :as history]
             [hive-compose.pipeline.faults :as faults]
             [hive-compose.pipeline.flaky :as flaky]
+            [hive-compose.pipeline.isolated :as isolated]
+            [hive-compose.promote.isolated :as iso-model]
+            [hive-compose.promote.target :as target]
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.pipeline.why :as why]
@@ -118,7 +121,7 @@
    state file (`files/sync-state!`) and `:sync!` does the same from the reaper,
    so an instance sharing the file through a hot remount loses nothing."
   [cfg settings persisted]
-  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting]))
+  (let [st (merge {:active {} :current nil} (select-keys persisted [:active :current :stacks :preexisting :runs]))
         state (atom st)
         base (atom st)
         sync! #(files/sync-state! (:compose/state-file settings) base state)]
@@ -167,6 +170,10 @@
               observed (swarm/observe! ctx)
               reaped (ops/reap! ctx)
               _ (swarm/announce-reaped! ctx (:reaped reaped))
+              ;; an isolated run whose last section was just reaped ends, and
+              ;; its own volumes go with it (Pedro, 2026-11-23)
+              runs-ended (isolated/after-reap! ctx (:reaped reaped))
+              reaped (cond-> reaped (seq runs-ended) (assoc :runs-ended runs-ended))
               stack-runs (:reaped (stacks/reap! ctx))
               pass (cond-> (assoc reaped :observed observed)
                      (seq adopted) (assoc :adopted adopted)
@@ -269,6 +276,27 @@
     (param params "run") (assoc :run (str (param params "run")))
     (some? (flag params "wait")) (assoc :wait? (flag params "wait"))))
 
+(defn- isolated-opts
+  "Result<{:run :ports :shared-volumes}> when the call asks for an isolated
+   run (isolated=true, or run=<id> on up/switch), else nil."
+  [params]
+  (let [run (some-> (param params "run") str)
+        iso? (flag params "isolated")
+        shared (param params "shared_volumes")]
+    (when (or iso? run)
+      (cond
+        (and shared (not (sequential? shared)))
+        (r/err :compose/invalid-param {:param "shared_volumes" :hint "a list of volume keys"})
+        :else
+        (let [ports (iso-model/port-policy (param params "ports"))]
+          (if (and ports (schema/explain schema/PortPolicy ports))
+            (r/err :compose/invalid-param {:param "ports" :problems (schema/explain schema/PortPolicy ports)
+                                           :hint "\"strip\" | \"ephemeral\" | \"keep\" | {\"offset\": n} | {\"publish\": {svc {port host}}}"})
+            (r/ok (cond-> {}
+                    run (assoc :run run)
+                    ports (assoc :ports ports)
+                    shared (assoc :shared-volumes (mapv str shared))))))))))
+
 (defn- announced
   "`res` of an up or switch, with the swarm told about the section's shared
    nREPLs (:announced, when a notice went out)."
@@ -299,8 +327,16 @@
    tool (`tool`) and the control API (`hive-compose.api`)."
   [a command params]
   (let [ctx (:ctx @(:state a))
-        id (some-> (param params "profile") str)
-        tgt (some-> (param params "target") str)
+        run-param (some-> (param params "run") str)
+        ;; an isolated run's section: profile=X run=R or target=T run=R
+        ;; address the active entry <id>@R (up/switch resolve it themselves)
+        in-run? (and run-param (not (#{"up" "switch" "stack-up" "stack-down" "stack-status" "plan" "faults" "why"} command)))
+        id (some-> (param params "profile") str (cond-> in-run? (iso-model/section-id run-param)))
+        tgt (when-not (and in-run? (param params "target"))
+              (some-> (param params "target") str))
+        id (or id (when (and in-run? (param params "target"))
+                    (let [{:keys [project names]} (target/parse (str (param params "target")))]
+                      (when project (iso-model/section-id (target/section-id project names) run-param)))))
         opts (call-options params)
         allow-orphans? (flag params orphans/override-param)
         allow-shared? (flag params ownership/override-param)
@@ -320,12 +356,20 @@
                                                   :errors (:errors @(:state a))})
       :else
       (case command
-        "status" (r/ok (cond-> (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+        "status" (r/ok (cond-> (merge (assoc (ops/status ctx) :last-pass (:last-pass @(:state a)))
+                                      (let [s (isolated/status ctx)] (when (seq (:runs s)) s)))
                          (:api @(:state a)) (assoc :api (:api @(:state a)))))
         "targets" (ops/targets ctx)
         "programs" (ops/programs ctx)
-        "up" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p)))))
-        "switch" (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p)))))
+        "up" (if-let [iopts (isolated-opts params)]
+               (r/bind iopts (fn [io] (with-opts (fn [p] (if (flag params "dry_run")
+                                                            (isolated/plan ctx p io)
+                                                            (orphans/guarded ctx p allow-orphans?
+                                                                             #(isolated/up! ctx p io)))))))
+               (announced ctx (with-opts (fn [p] (guard p :up false #(ops/up-profile! ctx p))))))
+        "switch" (if (isolated-opts params)
+                   (r/err :compose/invalid-param {:param "run" :hint "an isolated run has no current section: use up run=<id>"})
+                   (announced ctx (with-opts (fn [p] (guard p :up false #(ops/switch-profile! ctx p))))))
         "claim" (if-let [run (stacks/claim-run tgt)]
                   (stacks/claim! ctx run (agent-param params) {:note (some-> (param params "note") str)})
                   (on-subject #(swarm/claim! ctx % (agent-param params)
@@ -346,7 +390,9 @@
         "who" (swarm/who ctx)
         "nrepl" (swarm/nrepl ctx {:path (some-> (param params "path") str)
                                   :project (some-> (param params "project") str)})
-        "down" (on-subject #(ops/down-profile! ctx % :down))
+        "down" (if (and run-param (nil? id))
+                 (isolated/down-run! ctx run-param (boolean (flag params "volumes")))
+                 (on-subject #(ops/down-profile! ctx % :down)))
         "stop" (on-subject #(ops/down-profile! ctx % :stop))
         "restart" (with-opts (fn [p] (let [recreate? (flag params "recreate")]
                                        (guard p :restart recreate?
@@ -394,6 +440,15 @@
                      "and stops it when nobody does: after its TTL, or the shorter orphan TTL once its last claim ended. "
                      "STACKS: stack-up stack=<id> runs a stack of capability consumers (shared deps once, opt-outs private, "
                      "each consumer on its own view network, health-gated); stack-down, stack-status, plan; claim target=stack:<run>. "
+                     "ISOLATED RUNS: up isolated=true (or run=<id> to join one) starts a section as a private copy "
+                     "of its compose project (-p <project>-<run>, override: no container_name, host ports per ports=, "
+                     "images of the shared project pinned by id, fresh volumes); several sections of one run share one "
+                     "project. Every compose call of a run gets HIVE_RUN, HIVE_RUN_PROJECT, HIVE_PORT_OFFSET and "
+                     "HIVE_PORT_<SERVICE>_<PORT> (none of the latter under ports=ephemeral: unknown before up); a call env "
+                     "naming one is refused. status answers runs with ports, images, config-digest and volumes. "
+                     "down run=<id> ends a run keeping its volumes; volumes=true (or the reaper, reaping an unclaimed run) "
+                     "removes only the volumes that run created. :profile/run-shared-volumes borrows volumes of the shared "
+                     "project: BUILD CACHES ONLY, never a volume holding state. up dry_run=true answers the memory admission. "
                      "command=help lists every command with its params.")
    :inputSchema {:type "object"
                  :properties {"command" {:type "string" :enum commands}
@@ -415,7 +470,12 @@
                               "tail" {:type "integer" :description "[logs] lines per service (default 100)"}
                               "stack" {:type "string" :description "[stack-up|stack-down|stack-status|plan] stack id under :compose/stacks"}
                               "test" {:type "string" :description "[why] the failed test: a case id (orders.place_boom_order) or <suite>/<project>/<case>"}
-                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>"}
+                              "run" {:type "string" :description "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"}
+                              "isolated" {:type "boolean" :description "[up] start the section in a new isolated run (a private copy of its compose project under -p <project>-<run>: no container_name, host ports per `ports`, fresh volumes of its own, the shared project's images pinned by id, never built); the answer names the run id"}
+                              "ports" {:type ["string" "object"] :description "[up] host ports of an isolated run, fixed at its first up: \"strip\" (default, none), \"ephemeral\" (127.0.0.1, docker picks; no HIVE_PORT_<SVC>_<PORT> vars then), \"keep\", {\"offset\": n} (each published port p as p+n), {\"publish\": {svc {port host}}}. status answers the host port per service and container port"}
+                              "shared_volumes" {:type "array" :description "[up] narrow the preset's :profile/run-shared-volumes: volumes an isolated run borrows from the shared project. BUILD CACHES ONLY (Go build/module cache, Maven repository), never a volume holding state; never removed with the run"}
+                              "volumes" {:type "boolean" :description "[down] with run=<id> alone: also remove the volumes the isolated run created (default false: kept, listed as stale-run-volumes). The only volume removal hive-compose does; the reaper does it too when it reaps an isolated run"}
+                              "dry_run" {:type "boolean" :description "[up] with isolated/run: plan only, no side effect: the override, ports, pinned images and the memory admission (need-mb, free-mb, verdict, and on refusal which sections would have to stop)"}
                               "op" {:type "string" :enum ["add" "remove" "reset" "list"] :description "[faults] what to do (default list)"}
                               "proxy" {:type "string" :description "[faults] proxy name <consumer>.<capability>"}
                               "toxic" {:type "object" :description "[faults] {type, attributes, stream, toxicity, name}: type latency|timeout|bandwidth|reset_peer|slow_close|limit_data|slicer"}}

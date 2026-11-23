@@ -95,7 +95,10 @@
 
 (deftest model-reads
   (is (= ["firebird-test" "postgres"] (ov/named-containers model)))
-  (is (= {"firebird-test" {"3050/tcp" 3051} "postgres" {"5432/tcp" 5434}} (ov/published model)))
+  (is (= {"firebird-test" {"3050" 3051} "postgres" {"5432" 5434}} (ov/published model)))
+  (is (= {"firebird-test" {"3050" 4051} "postgres" {"5432" 6434}} (ov/planned-ports model {:offset 1000})))
+  (is (nil? (ov/planned-ports model :ephemeral)))
+  (is (= {} (ov/planned-ports model :strip)))
   (is (= ["ledger"] (ov/explicit-volumes model)) "dc_<key> is compose's own name; external is not explicit")
   (is (= ["web"] (ov/build-only model))))
 

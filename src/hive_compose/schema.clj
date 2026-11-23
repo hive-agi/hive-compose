@@ -10,7 +10,7 @@
 
 (def ProfileId
   "A preset name, or a section id `<project>/<target>[+<target>..]`."
-  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.+/-]*$"])
+  [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.+/@-]*$"])
 
 (def IdleAction
   "What the reaper does to an idle profile. :stop keeps containers, :down removes
@@ -82,7 +82,19 @@
    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
    [:profile/idle-action {:optional true} IdleAction]
    [:profile/activity {:optional true} Activity]
-   [:profile/description {:optional true} :string]])
+   [:profile/description {:optional true} :string]
+   ;; an isolated run of the section (FUN-D): the run id, the shared compose
+   ;; project it copies, and the generated override appended as the last -f
+   [:profile/run {:optional true} [:re #"^[a-z0-9]{3,40}\z"]]
+   [:profile/base-project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+   [:profile/override {:optional true} [:string {:min 1}]]
+   ;; G8: top-level volumes of the shared project an isolated run of this
+   ;; preset BORROWS instead of creating its own (declared external, named
+   ;; <shared-project>_<key>, never removed with the run). BUILD CACHES ONLY
+   ;; (Go build/module cache, Maven repository), NEVER a volume that holds
+   ;; state: hive-compose cannot tell a cache from state, so two runs sharing
+   ;; a state volume would not be isolated. Opt-in; a call may only narrow it.
+   [:profile/run-shared-volumes {:optional true} [:vector [:string {:min 1}]]]])
 
 (def Claim
   "An agent's declaration that it works on a section: since when, when it was
@@ -646,7 +658,9 @@
     [:override/names {:optional true} [:or [:enum :all :none] [:vector [:string {:min 1}]]]]
     [:override/ports {:optional true} PortPolicy]
     [:override/fresh-volumes {:optional true} [:or [:= :all] [:vector [:string {:min 1}]]]]
-    [:override/images-from {:optional true} ComposeProjectName]]
+    [:override/images-from {:optional true} ComposeProjectName]
+    [:override/images {:optional true} [:map-of [:string {:min 1}] [:string {:min 1}]]]
+    [:override/shared-volumes {:optional true} [:vector [:string {:min 1}]]]]
    [:fn {:error/message "fresh volumes need :override/run"}
     (fn [s] (let [f (:override/fresh-volumes s)]
               (or (nil? f) (and (coll? f) (empty? f)) (contains? s :override/run))))]])

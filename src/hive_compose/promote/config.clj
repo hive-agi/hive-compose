@@ -170,6 +170,9 @@
   (let [p (cond-> p
             (:profile/id p) (update :profile/id name)
             (:profile/dir p) (update :profile/dir #(expand-home home %))
+            ;; an absolute or ~ file may live outside the dir; a relative one
+            ;; keeps resolving against it (compose's --project-directory)
+            (sequential? (:profile/files p)) (update :profile/files #(mapv (partial expand-home home) %))
             (contains? p :profile/activity) (update :profile/activity activity-set))]
     (cond-> p
       (:profile/programs p) (update :profile/programs #(normalize-programs home (:profile/dir p) %)))))
@@ -181,6 +184,7 @@
   (let [p (cond-> p
             (:project/id p) (update :project/id name)
             (:project/dir p) (update :project/dir #(expand-home home %))
+            (sequential? (:project/files p)) (update :project/files #(mapv (partial expand-home home) %))
             (contains? p :project/activity) (update :project/activity activity-set)
             (map? (:project/provides p)) (update :project/provides normalize-provides)
             (map? (:project/needs p)) (update :project/needs normalize-needs))]

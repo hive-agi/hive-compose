@@ -3794,6 +3794,7 @@ components:
       - compose/bundle-unwritable
       - compose/command-failed
       - compose/consumer-name-collision
+      - compose/could-not-run
       - compose/data-exec-unsupported
       - compose/data-runner-unsupported
       - compose/data-step-failed
@@ -3835,6 +3836,7 @@ components:
       - compose/invalid-trace-id
       - compose/invalid-version
       - compose/invalid-wiring
+      - compose/isolated-unsupported
       - compose/lock-unreadable
       - compose/lock-unwritable
       - compose/log-unwritable
@@ -4978,6 +4980,22 @@ components:
     Req_up:
       type: object
       properties:
+        dry_run:
+          type: "boolean"
+          description: "[up] with isolated/run: plan only (override, ports, images, memory admission)"
+        shared_volumes:
+          type: "array"
+          items: {"type": "string"}
+          description: "[up] narrow the preset's :profile/run-shared-volumes (build caches only, never state)"
+        ports:
+          type: ["string", "object"]
+          description: "[up] host ports of an isolated run: \"strip\" | \"ephemeral\" | \"keep\" | {\"offset\": n} | {\"publish\": {svc {port host}}}"
+        isolated:
+          type: "boolean"
+          description: "[up] start the section in a new isolated run"
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         allow_orphans:
           type: boolean
           description: '[up|switch|restart] go ahead although processes a dead docker daemon left running still
@@ -5054,6 +5072,12 @@ components:
     Req_down:
       type: object
       properties:
+        volumes:
+          type: "boolean"
+          description: "[down] with run=<id> alone: also remove the volumes the isolated run created"
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5072,6 +5096,9 @@ components:
     Req_stop:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5090,6 +5117,9 @@ components:
     Req_restart:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         allow_orphans:
           type: boolean
           description: '[up|switch|restart] go ahead although processes a dead docker daemon left running still
@@ -5126,6 +5156,9 @@ components:
     Req_touch:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5143,6 +5176,9 @@ components:
     Req_ps:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5161,6 +5197,9 @@ components:
     Req_logs:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         profile:
           type: string
           description: '[up|switch|down|stop|restart|touch|ps|logs] preset or active section id'
@@ -5182,6 +5221,9 @@ components:
     Req_claim:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         agent:
           type: string
           description: '[claim|release] the agent claiming; defaults to the caller''s agent_id'
@@ -5210,6 +5252,9 @@ components:
     Req_release:
       type: object
       properties:
+        run:
+          type: "string"
+          description: "[stack-up|stack-down|stack-status|plan|faults|why] the stack run id, ^[a-z0-9]{3,40}$ (stack-up default <stack><6 hex>); claim/release a run with target=stack:<run>. [up|down|stop|restart|touch|ps|logs|claim|release] an ISOLATED run: up joins (or starts) run <id> as compose project <project>-<run>; the others address the section <id>@<run>; down run=<id> alone takes the whole run down"
         agent:
           type: string
           description: '[claim|release] the agent claiming; defaults to the caller''s agent_id'

@@ -121,6 +121,9 @@
    :compose/no-container 502
    :compose/instance-unhealthy 502
    :compose/stack-down-incomplete 502
+   ;; an isolated run could not come up (image missing or changed, port in
+   ;; use, unhealthy, config invalid): never a test verdict
+   :compose/could-not-run 502
    :compose/toxiproxy-failed 502
    :compose/runner-failed 502
    :compose/unparseable 502
@@ -137,6 +140,7 @@
    :compose/no-compose-file 503
    :compose/program-needs-command 503
    :compose/stacks-unsupported 503
+   :compose/isolated-unsupported 503
    :compose/data-exec-unsupported 503
    :compose/data-runner-unsupported 503
    :compose/no-trace-query 503
