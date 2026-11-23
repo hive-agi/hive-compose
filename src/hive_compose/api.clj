@@ -309,20 +309,87 @@
     "object" (map? v)
     true))
 
+(def host-params
+  "Keys the MCP host (hive-mcp, bb-mcp) stamps on a call whatever the tool
+   declares, so every command accepts them: the caller's agent id, its
+   directory, hive-mcp's async switch and MCP request metadata. Any key that
+   starts with `_` is transport-injected too (bb-mcp `_caller_id`,
+   `_caller_cwd`, `_caller_credential`), see `host-param?`. `command` names
+   the command on the MCP wire. The one place these are listed."
+  #{"command" "agent_id" "directory" "async" "async-timeout-ms" "_meta"})
+
+(defn host-param?
+  "Whether param name `k` (string or keyword) is one the host adds."
+  [k]
+  (let [n (if (keyword? k) (name k) (str k))]
+    (or (contains? host-params n) (str/starts-with? n "_"))))
+
+(defn- distance
+  "Levenshtein edit distance of strings `a` and `b`."
+  [^String a ^String b]
+  (let [n (count b)]
+    (peek (reduce (fn [prev ca]
+                    (reduce (fn [row j]
+                              (conj row (min (inc (peek row))
+                                             (inc (nth prev (inc j)))
+                                             (+ (nth prev j) (if (= ca (.charAt b (int j))) 0 1)))))
+                            [(inc (first prev))]
+                            (range n)))
+                  (vec (range (inc n)))
+                  a))))
+
+(defn nearest
+  "The param of `valid` that `given` most likely meant, nil when none is
+   close: a prefix either way (suite -> suites, project -> projects), else
+   the smallest edit distance of at most 2 (runn -> run)."
+  [given valid]
+  (let [g (str/lower-case given)]
+    (or (first (sort-by (juxt count identity)
+                        (filter #(or (str/starts-with? % g) (str/starts-with? g %)) valid)))
+        (first (sort-by (juxt #(distance g %) identity)
+                        (filter #(<= (distance g %) 2) valid))))))
+
+(defn unknown-params
+  "Result<params>: `params` when every key (string or keyword) is a param of
+   `command` (`known`, a set of names from addon/command-params) or one the
+   host adds (`host-param?`), else :compose/invalid-param with :unknown
+   [names], :valid [the command's params], :did-you-mean {given nearest}, and
+   :param (the first unknown) and :known (= :valid) as before. Nothing runs
+   on a refusal: a key the command does not read is never dropped, since a
+   misspelt selection (suite for suites) widens a call to everything."
+  [command known params]
+  (let [unknown (vec (sort (for [k (keys params)
+                                 :let [n (if (keyword? k) (name k) (str k))]
+                                 :when (not (or (contains? known n) (host-param? n)))]
+                             n)))]
+    (if (empty? unknown)
+      (r/ok params)
+      (let [valid (vec (sort known))
+            dym (into (sorted-map) (keep (fn [u] (when-let [v (nearest u valid)] [u v]))) unknown)]
+        (r/err :compose/invalid-param
+               (cond-> {:command command :param (first unknown) :unknown unknown :valid valid :known valid
+                        :hint (str "not a param of " command ": " (str/join ", " unknown)
+                                   (when (seq dym)
+                                     (str " (did you mean "
+                                          (str/join ", " (for [[g v] dym] (str v " for " g))) "?)"))
+                                   "; nothing ran")}
+                 (seq dym) (assoc :did-you-mean dym)))))))
+
 (defn check-params
   "Result<params>: `params` when every key is one `command` reads (`known`,
-   addon/command-params) and every one the tool declares (`declared`, the
-   tool's inputSchema properties, string names to {:type ..}) has that JSON
-   type, else an invalid-param naming the first that is not. An unknown key
-   is refused rather than dropped: a typo (runn for run) on stack-down would
-   otherwise take down every run of the stack. A nil `known` (no table)
-   checks types only."
-  ([declared params] (check-params declared nil params))
-  ([declared known params]
-   (let [ks (sort (keys params))]
-     (if-let [k (when known (first (remove known ks)))]
-       (r/err :compose/invalid-param {:param k :known (vec (sort known))
-                                      :hint (str "not a param of this command")})
+   addon/command-params; see `unknown-params`) and every one the tool
+   declares (`declared`, the tool's inputSchema properties, string names to
+   {:type ..}) has that JSON type, else an invalid-param naming the first
+   that is not. An unknown key is refused rather than dropped: a typo (runn
+   for run) on stack-down would otherwise take down every run of the stack.
+   A nil `known` (no table) checks types only."
+  ([declared params] (check-params declared nil params nil))
+  ([declared known params] (check-params declared known params nil))
+  ([declared known params command]
+   (let [ks (sort (keys params))
+         unknown (when known (unknown-params command known params))]
+     (if (and unknown (r/err? unknown))
+       unknown
        (if-let [[k t] (first (for [k ks
                                    :let [v (get params k) t (get-in declared [k :type])]
                                    :when (and t (some? v) (not (type-ok? t v)))]
@@ -406,7 +473,7 @@
       :else
       (respond (r/let-ok [_ (known-op deps seg)
                           params (parse-params body)
-                          params (check-params (:declared deps) (some-> (:params deps) (get seg)) params)]
+                          params (check-params (:declared deps) (some-> (:params deps) (get seg)) params seg)]
                  (call deps seg params))))))
 
 (defn route

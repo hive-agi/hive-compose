@@ -585,6 +585,23 @@
                         (when (seq warns) (str "\n" (str/join "\n" warns)))
                         (when (not= :ok admission) (str "\nREFUSED: " (:message admission))))}))))
 
+(defn start-count
+  "Result<n>: how many containers stack-up! of `opts` {:stack :run :extra}
+   would start now: every service of an instance not running yet (`plan`'s
+   :to-start) plus every service each container consumer runs, less what it
+   provides as an instance (as up-consumer! counts them). Reads only."
+  [ctx {stack-id :stack rid :run extra :extra}]
+  (r/let-ok [engine (stack-engine ctx)
+             p (plan ctx {:stack stack-id :run rid :extra extra})
+             {sp :plan} (resolve-plan ctx stack-id (or rid (run/run-id stack-id "000000")) extra)
+             cs (all-ok (fn [c]
+                          (r/map-ok (consumer-services engine (project-of ctx (run/consumer-project-id c)) c)
+                                    (fn [all] (run/without-provided all (map #(get-in sp [:stack/instances %])
+                                                                             (get-in sp [:stack/consumers c :consumer/provider-of]))))))
+                        (filter run/container-consumer? (keys (:stack/consumers sp))))]
+    (r/ok (+ (reduce + (map (comp count :to-start) (get-in p [:diff :instances])))
+             (reduce + (map count cs))))))
+
 ;; ---------------------------------------------------------------------------
 ;; claims and the reaper
 

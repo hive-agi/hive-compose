@@ -1314,18 +1314,21 @@ paths:
       description: 'run the suite x project matrix (:compose/suites): one stack for the union of what the cells
         need (or the live run named by run), each suite''s runner (a container on the projects'' view networks,
         or a host command) with HIVE_RUN_ID, TRACEPARENT and BAGGAGE test.id, JUnit/TAP read from its reports dir;
-        a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed, kept up for inspection
-        when one failed (the reaper TTL still applies). suites=X,Y and projects=A,B (default all); run (default
-        test<6 hex>); keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait
-        (default true); variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every
-        selected suite that declares variants must declare each named one, else the call is refused; a suite without
-        variants runs once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT
-        restarted or re-env''d per variant, so a variant that toggles a service''s own flag tests nothing (follow-up
-        20261123122851-6e29b6f7); skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test
-        failed, 2 something could not run. A cell passes only when its runner exited 0 and its report parsed: an
-        unparsable report is could-not-run; a container suite, or one that declares :suite/reports-dir or :suite/report-format,
-        must leave a report with at least one case unless :suite/report-required? false. Every case is listed with
-        id, status and time; a could-not-run cell carries :reason and, when known, :service'
+        a summary is written to <state>/runs/<run>/summary.edn; down when every cell passed or when no cell ran
+        at all (an error before the first cell), kept up for inspection when one failed (the reaper TTL still applies);
+        a reused run is never taken down. The answer starts with plan {projects, suites, cells, services (containers
+        the stack starts)}. suites=X,Y and/or projects=A,B; with neither (and no run=<live run>) the call is refused,
+        naming what it would run, unless all=true (every suite against every project); run (default test<6 hex>);
+        keep_up (keep a passing stack up); dry_run (plan and runner specs only, nothing starts); wait (default true);
+        variants=a,b (the :suite/variants to run, each a cell <suite>@<variant>, default all; every selected suite
+        that declares variants must declare each named one, else the call is refused; a suite without variants runs
+        once). The variant env is set on the suite RUNNER only: the stack and its consumers are NOT restarted or
+        re-env''d per variant, so a variant that toggles a service''s own flag tests nothing (follow-up 20261123122851-6e29b6f7);
+        skip_fails (a skipped case fails its cell). exit 0 every cell passed, 1 a test failed, 2 something could
+        not run. A cell passes only when its runner exited 0 and its report parsed: an unparsable report is could-not-run;
+        a container suite, or one that declares :suite/reports-dir or :suite/report-format, must leave a report
+        with at least one case unless :suite/report-required? false. Every case is listed with id, status and time;
+        a could-not-run cell carries :reason and, when known, :service'
       tags:
       - stacks
       x-hive-call-op: test
@@ -3891,6 +3894,11 @@ components:
           description: '[claim] make it a WAVE claim: live for this many minutes (at most :compose/claim-max-ttl-minutes,
             default 480) whether or not the owner (an agent or a coordinator, agent=coordinator:..) stays in the
             swarm; claim again to move its end, release to end it now'
+        all:
+          type: boolean
+          description: '[test] run the whole matrix (every suite against every project its suites apply to) when
+            neither suites nor projects is given; without it such a call is refused, naming what it would run (dry_run
+            plans it anyway)'
         projects:
           type: string
           description: '[test] projects under test, A,B (default every project a selected suite applies to)'
@@ -3924,11 +3932,13 @@ components:
           description: stamped by the MCP host on every call; claim/release fall back to it when agent is absent
             (addon/agent-param)
       additionalProperties: true
-      description: The MCP `compose` tool params minus `command` (the op is the path segment / hive_call op). Booleans
+      description: 'The MCP `compose` tool params minus `command` (the op is the path segment / hive_call op). Booleans
         also accept the strings "true"/"false" on the MCP side (addon/flag); HTTP clients should send booleans.
-        Over MCP unknown keys are ignored; each Req_<command> schema below is closed (additionalProperties false)
-        so a client learns of a typo, while the server still ignores what it does not read. A declared param of
-        the wrong JSON type is answered 400 compose/invalid-param.
+        Over MCP and HTTP alike a key the command does not take refuses the call before anything runs: 400 compose/invalid-param
+        with unknown [names], valid [the command''s params] and did-you-mean {given: nearest} (hive-compose.api/unknown-params).
+        Keys the MCP host adds are always accepted (hive-compose.api/host-params: agent_id, directory, async, async-timeout-ms,
+        _meta, any _-prefixed key). Each Req_<command> schema below is closed (additionalProperties false). A declared
+        param of the wrong JSON type is answered 400 compose/invalid-param.'
       x-source: generated
       x-from: hive-compose.addon/tool :inputSchema @ origin/staging
     Ok:
@@ -5320,13 +5330,14 @@ components:
     TestResult:
       type: object
       additionalProperties: true
-      description: 'pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed,
-        1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id
-        <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers
-        are NOT restarted or re-env''d per variant; a suite without variants under a variants filter ran once and
-        carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none,
-        report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status
-        case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file'
+      description: 'pipeline.suites/test!: plan {projects, suites, cells, services: containers the stack starts}
+        first, run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something
+        could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant;
+        the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env''d
+        per variant; a suite without variants under a variants filter ran once and carries variant-note), each with
+        status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category)
+        and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed
+        cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file'
       x-source: hand
     Req_help:
       type: object
@@ -5780,6 +5791,11 @@ components:
     Req_test:
       type: object
       properties:
+        all:
+          type: boolean
+          description: '[test] run the whole matrix (every suite against every project its suites apply to) when
+            neither suites nor projects is given; without it such a call is refused, naming what it would run (dry_run
+            plans it anyway)'
         dry_run:
           type: boolean
           description: '[test] answer the matrix, the stack plan and every runner spec; start nothing'
@@ -5882,7 +5898,9 @@ components:
       x-source: hand
   responses:
     BadRequest:
-      description: compose/missing-param, compose/invalid-param (also a body that is not a JSON object)
+      description: 'compose/missing-param (also `test` with neither suites nor projects and no all=true: would-run
+        names the matrix), compose/invalid-param (a param the command does not take: unknown, valid, did-you-mean;
+        a wrong JSON type; a body that is not a JSON object)'
       content:
         application/json:
           schema:
