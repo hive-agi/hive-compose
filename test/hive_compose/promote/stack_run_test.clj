@@ -4,6 +4,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [hive-compose.promote.stack-run :as run]
+            [hive-compose.promote.swarm]
             [hive-compose.schema :as schema]
             [malli.core :as m]))
 
@@ -93,7 +94,18 @@
     (is (= [] (run/idle-runs {"c" {:last-touch 0 :claims {"a" {:seen 80}}}} 100 ttls)))
     (is (= ["c"] (run/idle-runs {"c" {:last-touch 0 :claims {"a" {:seen 10}}}} 100 ttls)) "an expired claim")
     (is (= ["o"] (run/idle-runs {"o" {:last-touch 85 :orphaned-at 85}} 100 ttls)))
-    (is (= [] (run/idle-runs {"n" {:last-touch 0 :idle-action :none}} 100 ttls)))))
+    (is (= [] (run/idle-runs {"n" {:last-touch 0 :idle-action :none}} 100 ttls)))
+    (testing "a wave claim holds the run until its :until, renewed or not"
+      (is (= [] (run/idle-runs {"w" {:last-touch 0 :claims {"coordinator:f07f8867" {:seen 0 :until 101}}}} 100 ttls)))
+      (is (= ["w"] (run/idle-runs {"w" {:last-touch 0 :claims {"coordinator:f07f8867" {:seen 99 :until 100}}}} 100 ttls))
+          "past :until it ends, however recently it was seen"))))
+
+(defspec stack-runs-and-sections-share-one-liveness-law 300
+  (prop/for-all [seen gen/nat until (gen/one-of [(gen/return nil) gen/nat])
+                 now gen/nat ttl gen/s-pos-int]
+    (let [c (cond-> {:since 0 :seen seen} until (assoc :until until))]
+      (= (run/claim-live? c now ttl)
+         (hive-compose.promote.swarm/claim-live? "any" c nil now ttl)))))
 
 (deftest specs
   (let [settings {:compose/projects {"kafka" {:project/dir "/w/kafka" :project/files ["c.yml"] :project/env {"V" "1"}}

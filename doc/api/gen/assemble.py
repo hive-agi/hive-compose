@@ -122,12 +122,12 @@ components["TouchResult"] = {"oneOf": [obj({"profile": S, "last-touch": I}, ["pr
                                        obj({"touched": arr(S), "last-touch": I}, ["touched", "last-touch"])], "x-source": "hand"}
 components["PsResult"] = obj({"profile": S, "project": S, "needs": arr(S), "running": arr(S)}, ["profile", "project", "needs", "running"])
 components["LogsResult"] = obj({"out": S}, ["out"])
-components["UsageReason"] = obj({"claim": S, "agent": S, "port": I, "peers": I, "service": S, "cpu": N,
+components["UsageReason"] = obj({"claim": S, "wave?": B, "until": I, "agent": S, "port": I, "peers": I, "service": S, "cpu": N,
     "source": {"enum": ["nrepl", "published", "cpu"]}}, desc="promote.swarm/usage reason: {claim} | {agent} | {port peers source} | {service cpu source}")
 components["StatusRow"] = obj({"id": S, "project": S, "active?": B, "section?": B, "ttl-minutes": I,
     "idle-action": ref("IdleAction"), "activity": arr(S), "description": S, "config-ok?": B, "config-project": S,
     "services": arr(S), "idle-seconds": I, "reap-in-seconds": I, "reap-blocked?": B,
-    "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I})},
+    "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I, "wave?": B, "until": I, "expires-in-seconds": I})},
     "orphaned?": B, "usage": ref("Usage"), "in-use-via": arr(S), "programs": arr(ref("ProgramRow"))},
     ["id", "project", "active?", "ttl-minutes", "idle-action", "activity"])
 components["ReaperPass"] = {"oneOf": [
@@ -136,7 +136,7 @@ components["ReaperPass"] = {"oneOf": [
     obj({"skipped": {"enum": ["not-initialized", "busy"]}}, ["skipped"]),
     obj({"error": S, "at": I}, ["error"])], "x-source": "hand", "description": "addon/tick!"}
 components["ObserveReport"] = obj({"swarm": {"enum": ["ok", "absent", "off"]}, "agents": I, "in-use": arr(S),
-    "expired": arr(obj({"section": S, "agent": S, "reason": {"enum": ["gone", "stale"]}})), "orphaned": arr(S),
+    "expired": arr(obj({"section": S, "agent": S, "reason": {"enum": ["gone", "stale", "expired"]}})), "orphaned": arr(S),
     "notified": arr(obj({"agent": S, "section": S, "channel": {"enum": ["direct", "broadcast"]}}))},
     desc="pipeline.swarm/observe!")
 components["StatusResult"] = obj({"ok?": B,
@@ -151,11 +151,17 @@ components["Route"] = obj({"dir": S, "id": S, "project": S, "compose-project": S
     "nrepl-ready?": B, "sections": arr(S), "pid": I, "external?": B, "kind": S, "advice": S, "path": S},
     ["dir", "id", "project", "compose-project", "nrepl-port", "running?", "nrepl-ready?", "sections"], desc="pipeline.swarm/route + advice")
 components["ClaimResult"] = obj({"profile": S, "agent": S, "claims": arr(S), "claim-ttl-minutes": I, "renew": S,
-    "nrepl": arr(ref("Route")), "started": ref("UpResult")}, ["profile", "agent", "claims", "claim-ttl-minutes", "renew", "nrepl"])
+    "claim": obj({"note": S, "since": I, "seen": I, "wave?": B, "until": I, "expires-in-seconds": I}),
+    "nrepl": arr(ref("Route")), "started": ref("UpResult"),
+    "renewed": obj({"profile": S, "services": arr(S)}, desc="the section was active: nothing was started, recreated or restarted"),
+    "adopted": obj({"profile": S, "services": arr(S), "programs": arr(ref("ProgramReport")),
+                    "programs-not-started": arr(ref("ProgramReport"))},
+                   desc="the section was not tracked but all its services ran: taken without an up; its host programs started (host only), those that could not named under programs-not-started"),
+    "wave-ended": {"type": "string", "description": "the caller's wave claim had passed its until: this renewal without ttl_minutes holds it as a plain claim"}}, ["profile", "agent", "claims", "claim-ttl-minutes", "renew", "nrepl"])
 components["ReleaseResult"] = obj({"profile": S, "agent": S, "claims": arr(S), "orphaned?": B, "reap-in-seconds": I,
     "note": S, "stopped": ref("DownResult")}, ["profile", "agent", "claims"])
 components["WhoResult"] = obj({"sections": arr(obj({"id": S, "project": S,
-        "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I})},
+        "claims": {"type": "object", "additionalProperties": obj({"note": S, "since": I, "seen": I, "wave?": B, "until": I, "expires-in-seconds": I})},
         "in-use?": B, "used-by": arr(ref("UsageReason")), "in-use-via": arr(S), "activity": arr(S),
         "idle-seconds": I, "reap-in-seconds": I, "orphaned?": B, "exempt?": B})),
     "agents": arr(obj({"id": S, "status": S, "cwd": S, "sections": arr(S)}, extra=True)),

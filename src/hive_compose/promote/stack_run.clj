@@ -25,6 +25,7 @@
             [hive-compose.promote.otel :as otel]
             [hive-compose.promote.resources :as res]
             [hive-compose.promote.stack :as stack]
+            [hive-compose.promote.swarm :as sw]
             [hive-compose.schema :as schema]))
 
 ;; SPDX-License-Identifier: MIT
@@ -278,9 +279,11 @@
   (and (not (:instance/share? ip)) (empty? (:kept step))))
 
 (defn claim-live?
-  "True when `claim` was renewed within `claim-ttl-ms` of `now`."
+  "True while `claim` holds at `now`: the one law sections use
+   (`promote.swarm/claim-end`), with no swarm roster asked. A wave claim holds
+   until its :until, any other while renewed within `claim-ttl-ms`."
   [claim now claim-ttl-ms]
-  (< (- now (:seen claim 0)) claim-ttl-ms))
+  (sw/claim-live? nil claim nil now claim-ttl-ms))
 
 (defn idle-runs
   "Runs of `stacks` ({run entry}) the reaper takes down at `now`: no live

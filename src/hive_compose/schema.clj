@@ -97,14 +97,18 @@
    [:profile/run-shared-volumes {:optional true} [:vector [:string {:min 1}]]]])
 
 (def Claim
-  "An agent's declaration that it works on a section: since when, when it was
-   last renewed, what for, and whether the agent was in the swarm when it
-   claimed (then the claim ends with the agent)."
+  "An agent's declaration that it works on a section (or holds a stack run):
+   since when, when it was last renewed, what for, and whether the agent was
+   in the swarm when it claimed (then the claim ends with the agent). A WAVE
+   claim carries `:until` (epoch ms): it holds until then whether or not its
+   owner (an agent or a coordinator) is in the swarm, and ends at once on
+   release. A stored claim without `:until` is a plain claim, as before."
   [:map
    [:since :int]
    [:seen :int]
    [:note {:optional true} :string]
-   [:swarm? {:optional true} :boolean]])
+   [:swarm? {:optional true} :boolean]
+   [:until {:optional true} :int]])
 
 (def Usage
   "What the last reaper pass saw using a section. A reason is {:claim agent},
@@ -571,6 +575,7 @@
    [:compose/activity Activity]
    [:compose/cpu-busy-percent {:optional true} [:and number? [:>= 0]]]
    [:compose/claim-ttl-minutes [:int {:min 1}]]
+   [:compose/claim-max-ttl-minutes {:optional true} [:int {:min 1 :max 10080}]]
    [:compose/orphan-ttl-minutes [:int {:min 1}]]
    [:compose/program-grace-ms {:optional true} [:int {:min 0}]]
    [:compose/history-file {:optional true} [:string {:min 1}]]
