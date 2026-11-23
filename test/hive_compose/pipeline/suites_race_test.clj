@@ -103,6 +103,28 @@
     (is (= ["ling-9"] (get-in res [:ok :claimed-by])))
     (is (= #{"ling-9"} (set (keys (get-in @state [:stacks "ci002" :claims])))) "only its own claim dropped")))
 
+(deftest a-wave-claim-keeps-the-stack-up-after-the-matrix
+  (let [state (atom {:active {} :current nil})
+        clock (atom 5000)
+        c (-> (base-ctx state)
+              (assoc :now #(deref clock))
+              (assoc-in [:settings :compose/claim-ttl-minutes] 1))
+        ;; while the matrix runs its cell, a coordinator takes a WAVE claim on the run
+        wave (atom nil)
+        c (assoc c :record-run! (fn [cx run]
+                                  (reset! wave (stacks/claim! cx (:run/id run) "coordinator:w" {:note "release gate" :ttl-minutes 120}))
+                                  (r/ok {})))
+        res (suites/test! c {:suites "load" :run "wv001"})]
+    (is (r/ok? @wave) (pr-str @wave))
+    (is (= :passed (get-in res [:ok :status])) (pr-str res))
+    (is (true? (get-in res [:ok :stack-kept?])) "a passing matrix leaves a wave-claimed run up")
+    (is (= ["coordinator:w"] (get-in res [:ok :claimed-by])))
+    (is (= #{"coordinator:w"} (set (keys (get-in @state [:stacks "wv001" :claims])))) "only the matrix's plain claim is gone")
+    (testing "the wave claim holds the run against the reaper long past the plain claim TTL"
+      (swap! clock + (* 90 60000))
+      (is (empty? (:reaped (stacks/reap! c))))
+      (is (contains? (:stacks @state) "wv001")))))
+
 (deftest end-claim-is-one-step-under-the-lock
   (let [state (atom {:active {} :current nil})
         c (assoc (base-ctx state) :now (constantly 5000) :settings stack-settings)
