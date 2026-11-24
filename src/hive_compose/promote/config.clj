@@ -53,7 +53,9 @@
    {capability Provide} and :project/needs {capability Need} (see schema)."
   (:require [clojure.string :as str]
             [hive-compose.schema :as schema]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [hive-compose.promote.capability :as capability]
+            [malli.core :as m]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -303,3 +305,160 @@
       (assoc :profiles (keyed-diff (:compose/profiles old) (:compose/profiles new)))
       (seq changed) (assoc :settings changed)
       (seq pinned) (assoc :restart-required pinned))))
+
+;; ---------------------------------------------------------------------------
+;; preflight: a configured project whose directory or compose file is gone
+
+(def compose-default-files
+  "The files compose reads when given no -f, in its own order."
+  ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
+
+(def Exists
+  "The existence port: what a path is. It answers :present, :missing or
+   :unknown (it could not tell, e.g. permission denied); true and false read as
+   :present and :missing, so a set of paths is a fake. A port that throws reads
+   as :unknown. The addon injects the real filesystem
+   (`hive-compose.boundary.files/path-state`); tests pass a set or a fn."
+  [:=> [:cat :string] :any])
+
+(def ProjectMissing
+  "Why a configured project cannot be brought up, decided before docker runs.
+   `:missing` :dir names the project dir in `:paths`; :compose-file names the
+   configured files that are gone, or the dir and `:looked-for` (compose's
+   default names) when it configures none."
+  [:map
+   [:reason [:= :compose/project-missing]]
+   [:project :string]
+   [:missing [:enum :dir :compose-file]]
+   [:paths [:vector :string]]
+   [:looked-for {:optional true} [:vector :string]]])
+
+(def ProjectUnreadable
+  "The preflight could not tell whether a project's dir or compose file exists
+   (the probe threw or was denied): `:unreadable` names which, `:paths` the
+   paths. Not a refusal: `up` may still work, docker answers then."
+  [:map
+   [:reason [:= :compose/project-unreadable]]
+   [:project :string]
+   [:unreadable [:enum :dir :compose-file]]
+   [:paths [:vector :string]]
+   [:looked-for {:optional true} [:vector :string]]])
+
+(def ProjectProblem [:or ProjectMissing ProjectUnreadable])
+
+(defn path-state
+  "What `exists?` says of `path`: :present, :missing or :unknown. Total: a
+   throw, or an answer that is none of these, never escapes; a throw is
+   :unknown, truthy :present, falsy :missing."
+  [exists? path]
+  (try
+    (let [v (exists? path)]
+      (cond (#{:present :missing :unknown} v) v
+            v :present
+            :else :missing))
+    (catch Exception _ :unknown)))
+
+(m/=> path-state [:=> [:cat Exists :string] [:enum :present :missing :unknown]])
+
+(defn compose-file-expected?
+  "True when project `p` must have a compose file. The one place that says a
+   project needs none: `:project/compose? false` declares a project without
+   containers by design."
+  [p]
+  (not (false? (:project/compose? p))))
+
+(m/=> compose-file-expected? [:=> [:cat :map] :boolean])
+
+(defn project-preflight
+  "ProjectMissing for project `p` when its dir, or the compose file it runs
+   with, is missing by `exists?`; ProjectUnreadable when the probe cannot tell
+   (and nothing it could tell is missing); nil when all are present. Pure over
+   the probe and total: a project without a string dir is a missing dir, and a
+   throwing probe is unreadable, never a throw."
+  [exists? p]
+  (let [dir (:project/dir p)
+        id (str (:project/id p))
+        problem (fn [state what paths]
+                  (if (= :missing state)
+                    {:reason :compose/project-missing :project id :missing what :paths (vec paths)}
+                    {:reason :compose/project-unreadable :project id :unreadable what :paths (vec paths)}))
+        dir-state (if (string? dir) (path-state exists? dir) :missing)]
+    (cond
+      (not= :present dir-state) (problem dir-state :dir [(str dir)])
+      (not (compose-file-expected? p)) nil
+      (seq (:project/files p))
+      (let [states (group-by #(path-state exists? %) (map #(under nil dir %) (:project/files p)))]
+        (cond (seq (:missing states)) (problem :missing :compose-file (:missing states))
+              (seq (:unknown states)) (problem :unknown :compose-file (:unknown states))))
+      :else
+      (let [states (set (map #(path-state exists? (under nil dir %)) compose-default-files))]
+        (when-not (:present states)
+          (assoc (problem (if (:unknown states) :unknown :missing) :compose-file [dir])
+                 :looked-for compose-default-files))))))
+
+(m/=> project-preflight [:=> [:cat Exists :map] [:maybe ProjectProblem]])
+
+(defn projects-preflight
+  "{project-id ProjectProblem} of every project in `projects` ({id Project})
+   that `project-preflight` marks, sorted by id; empty when all are present."
+  [exists? projects]
+  (into (sorted-map)
+        (keep (fn [[id p]] (when-let [m (project-preflight exists? p)] [id m])))
+        projects))
+
+(m/=> projects-preflight [:=> [:cat Exists [:maybe [:map-of :string :map]]]
+                          [:map-of :string ProjectProblem]])
+
+(defn mark-projects
+  "The `projects` rows with each configured entry of a missing or unreadable
+   project carrying its ProjectProblem as `:problem`, and a row (status
+   \"missing\" or \"unreadable\") for such a configured project docker knows
+   nothing of. A present project's rows are unchanged."
+  [rows projects exists?]
+  (let [problems (projects-preflight exists? projects)
+        mark (fn [c] (if-let [m (get problems (:id c))] (assoc c :problem m) c))
+        rows (mapv (fn [row] (cond-> row (seq (:configured row)) (update :configured #(mapv mark %)))) rows)
+        listed (set (keep :id (mapcat :configured rows)))
+        absent (for [[id m] problems :when (not (listed id))]
+                 {:name (capability/compose-project-name (get projects id))
+                  :status (if (= :compose/project-missing (:reason m)) "missing" "unreadable")
+                  :managed? false :label-files []
+                  :configured [{:id id :problem m}]})]
+    (into rows absent)))
+
+(m/=> mark-projects [:=> [:cat [:sequential :map] [:maybe [:map-of :string :map]] Exists]
+                     [:vector :map]])
+
+(defn stack-projects
+  "Sorted ids of the configured projects stack `stack-id` of `settings`
+   brings up: its consumers' projects and, when its needs resolve, every
+   provider. Empty for an unknown stack."
+  [settings stack-id]
+  (let [projects (:compose/projects settings)
+        stack (get-in settings [:compose/stacks stack-id])
+        res (when (map? stack) (capability/resolve-stack projects stack))
+        providers (when (r/ok? res) (keep :instance/provider (vals (:resolution/instances (:ok res)))))
+        consumers (keep #(when (string? %) (capability/consumer-project projects %)) (:stack/consumers stack))]
+    (vec (sort (filter #(contains? projects %) (distinct (concat consumers providers)))))))
+
+(m/=> stack-projects [:=> [:cat :map :any] [:vector :string]])
+
+(defn mark-plan
+  "Result `res` of `plan` for stack `stack-id` with the ProjectMissing of every
+   project the stack brings up under `:problems`, on the plan (its `:text`
+   saying so) or on the error. `res` unchanged when none is missing."
+  [res settings stack-id exists?]
+  (let [projects (:compose/projects settings)
+        problems (vec (keep #(project-preflight exists? (get projects %))
+                            (stack-projects settings stack-id)))
+        line (fn [{:keys [project missing unreadable paths]}]
+               (str (if missing "MISSING" "UNREADABLE") ": project " project " "
+                    (name (or missing unreadable)) " " (str/join ", " paths)))]
+    (cond
+      (empty? problems) res
+      (r/ok? res) (update res :ok #(cond-> (assoc % :problems problems)
+                                     (string? (:text %))
+                                     (update :text str "\n" (str/join "\n" (map line problems)))))
+      :else (assoc res :problems problems))))
+
+(m/=> mark-plan [:=> [:cat :map :map :any Exists] :map])

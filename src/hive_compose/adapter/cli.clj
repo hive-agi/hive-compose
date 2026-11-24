@@ -15,7 +15,8 @@
             [hive-compose.promote.env :as env]
             [hive-compose.promote.profile :as profile]
             [hive-dsl.result :as r]
-            [hive-system.shell.core :as shell]))
+            [hive-system.shell.core :as shell]
+            [hive-compose.promote.config :as config]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -665,8 +666,9 @@
   (run exec nil argv timeout-ms nil identity))
 
 (def compose-default-files
-  "The files compose reads when given no -f, in its own order."
-  ["compose.yaml" "compose.yml" "docker-compose.yaml" "docker-compose.yml"])
+  "The files compose reads when given no -f, in its own order (one list, in
+   `hive-compose.promote.config`, which the read-path preflight shares)."
+  config/compose-default-files)
 
 (defn default-file
   "The first of `compose-default-files` for which `exists?` is true, in

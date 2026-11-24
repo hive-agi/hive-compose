@@ -20,6 +20,20 @@
   [path]
   (read-edn path :compose/profiles-unreadable nil))
 
+(defn path-state
+  "The filesystem's answer for `path` (the preflight's existence port,
+   `hive-compose.promote.config/Exists`): :present, :missing, or :unknown
+   when it cannot tell (permission denied, an IO or security error). Never
+   throws."
+  [path]
+  (try
+    (let [p (.toPath (io/file path))
+          no-opts (make-array java.nio.file.LinkOption 0)]
+      (cond (Files/exists p no-opts) :present
+            (Files/notExists p no-opts) :missing
+            :else :unknown))
+    (catch Exception _ :unknown)))
+
 (defn load-state
   "Result<{:active .. :current ..}> from the state file at `path`."
   [path]
