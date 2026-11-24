@@ -148,6 +148,8 @@
      :history (or (:compose/history cfg)
                   (history/file-history (:compose/history-file settings)))
      :settings settings
+     ;; the existence port projects/plan preflight configured projects with
+     :exists? (or (:compose/exists? cfg) #(.exists (java.io.File. ^String %)))
      :state state
      :faults (atom {})
      :toxiproxy (:compose/toxiproxy cfg)
@@ -404,7 +406,8 @@
         "stack-up" (stacks/stack-up! ctx (stack-opts params))
         "stack-down" (stacks/stack-down! ctx (stack-opts params))
         "stack-status" (stacks/stack-status ctx (stack-opts params))
-        "plan" (stacks/plan ctx (stack-opts params))
+        "plan" (let [o (stack-opts params)]
+                 (config/mark-plan (stacks/plan ctx o) (:settings ctx) (:stack o) (:exists? ctx)))
         "why" (r/map-ok (why/why! ctx {:test (some-> (param params "test") str)
                                        :run (some-> (param params "run") str)})
                         #(dissoc % :why/markdown))
@@ -433,7 +436,8 @@
         "logs" (on-subject #(ops/logs-profile ctx % (or (some-> (param params "tail") long) 100)))
         "reap" (r/ok (tick! a))
         "adopt" (r/ok {:adopted (ops/adopt! ctx)})
-        "projects" (ops/projects ctx)
+        "projects" (r/map-ok (ops/projects ctx)
+                             #(config/mark-projects % (get-in ctx [:settings :compose/projects]) (:exists? ctx)))
         "flaky" (flaky/flaky ctx
                              {:suite (some-> (param params "suite") str)
                               :project (some-> (param params "project") str)}

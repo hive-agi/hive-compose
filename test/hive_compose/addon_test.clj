@@ -121,6 +121,29 @@
       (is (:error? (call a {"command" "stack-up" "stack" "nope"})))
       (finally (addon/shutdown! a)))))
 
+(deftest projects-and-plan-name-a-configured-project-that-is-gone
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"shop" {"api" {}}})
+        cfg (assoc (config dir engine)
+                   :compose/projects {"gone" {:project/id "gone" :project/dir "/w/gone"}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"}}
+                   :compose/stacks {"s" {:stack/id "s" :stack/consumers ["gone" "shop"]}}
+                   ;; the injected existence port: /w/gone is not there
+                   :compose/exists? #{"/w/shop" "/w/shop/compose.yaml"})
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (let [res (call a {"command" "projects"})
+            gone (first (filter #(= "gone" (:name %)) (:body res)))]
+        (is (not (:error? res)) (pr-str res))
+        (is (= "missing" (:status gone)))
+        ;; JSON writes a keyword by its name, as the error envelopes do
+        (is (= {:reason "project-missing" :project "gone" :missing "dir" :paths ["/w/gone"]}
+               (get-in gone [:configured 0 :problem]))))
+      (let [plan (:body (call a {"command" "plan" "stack" "s"}))]
+        (is (= ["gone"] (map :project (:problems plan))) (pr-str plan)))
+      (finally (addon/shutdown! a)))))
+
 (deftest test-command-runs-the-suite-matrix
   (let [dir (temp-dir)
         engine (stub/engine {} {} {"pg" {"db" {}} "shop" {"api" {}}})
