@@ -351,17 +351,24 @@
     (is (r/err? (br/read-reports nil)))))
 
 (deftest foreign-xml-beside-reports
-  (let [dir (doto (java.io.File/createTempFile "hc8-reports" "") (.delete) (.mkdirs))]
+  (let [dir (doto (java.io.File/createTempFile "hc8-reports" "") (.delete) (.mkdirs))
+        foreign (str (io/file dir "failsafe-summary.xml"))]
     (try
       (spit (io/file dir "TEST-a.xml") (fixture "surefire.xml"))
       (spit (io/file dir "failsafe-summary.xml") "<failsafe-summary result=\"255\"><completed>4</completed></failsafe-summary>")
-      (testing ":auto skips XML that is not JUnit and says so"
+      (testing ":auto skips XML that is not JUnit and says what it skipped and why"
         (let [rep (:ok (br/read-reports dir))]
           (is (report/valid-report? rep))
           (is (= 4 (count (:report/cases rep))))
-          (is (= [(str (io/file dir "failsafe-summary.xml"))] (:report/skipped-files rep)))))
+          (is (= [{:file foreign :reason :junit/unknown-root}] (:report/skipped-files rep)))))
       (testing "a declared :junit fails fast on it"
         (is (= :junit/unknown-root (:reason (br/read-reports dir :junit)))))
+      (testing "a directory whose every file is skipped still says which and why"
+        (.delete (io/file dir "TEST-a.xml"))
+        (let [res (br/read-reports dir)]
+          (is (= :report/none (:error res)))
+          (is (= [{:file foreign :reason :junit/unknown-root}] (:skipped-files res)))
+          (is (string? (:hint res)))))
       (finally (run! #(.delete ^java.io.File %) (reverse (file-seq dir)))))))
 
 (deftest declared-format

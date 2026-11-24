@@ -52,6 +52,23 @@
 
 (def claim-prefix "stack:")
 
+(def default-claim-ttl-minutes
+  "Length a claim holds when the settings name no :compose/claim-ttl-minutes:
+   the default `hive-compose.promote.config/defaults` carries, read from
+   there, never a second literal to drift from it."
+  (:compose/claim-ttl-minutes config/defaults))
+
+(defn claim-ttl-ms
+  "The claim TTL `settings` decide, in milliseconds: :compose/claim-ttl-minutes,
+   else `default-claim-ttl-minutes`. ONE reading, shared by claim!,
+   claim-exclusive!, the reaper's idle test and what stack-status shows, so
+   none of them can disagree about when a claim is live."
+  [settings]
+  (* 60000 (or (:compose/claim-ttl-minutes settings) default-claim-ttl-minutes)))
+
+(m/=> claim-ttl-ms [:=> [:cat :map] :int])
+
+
 (defn- persist! [{:keys [state save!]}]
   (when save! (save! (select-keys @state [:active :current :stacks :preexisting]))))
 
@@ -634,8 +651,8 @@
   [ctx rid agent {:keys [note seen prefix]}]
   (serialized ctx
     (let [t (now ctx)
-          ;; the claim TTL as `ttls` (below) reads it
-          ttl (* 60000 (or (:compose/claim-ttl-minutes (:settings ctx)) 30))
+          ;; the one claim TTL the settings decide, as the reaper reads it
+          ttl (claim-ttl-ms (:settings ctx))
           verdict (atom nil)]
       (swap! (:state ctx)
              (fn [st]
@@ -756,7 +773,7 @@
 (defn- ttls [settings]
   {:ttl-ms (* 60000 (or (:compose/default-ttl-minutes settings) 60))
    :orphan-ttl-ms (* 60000 (or (:compose/orphan-ttl-minutes settings) (:compose/default-ttl-minutes settings) 60))
-   :claim-ttl-ms (* 60000 (or (:compose/claim-ttl-minutes settings) (:compose/claim-ttl-minutes config/defaults)))})
+   :claim-ttl-ms (claim-ttl-ms settings)})
 
 (defn- down-row [ctx rid extra]
   (let [x (try (stack-down! ctx {:run rid})

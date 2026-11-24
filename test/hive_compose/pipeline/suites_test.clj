@@ -343,6 +343,23 @@
       (is (= :report/none (get-in cell [:report-error :error])))
       (is (= :passed (:status cell)) "exit 0 with no report is the verdict"))))
 
+(deftest a-run-whose-every-report-file-was-skipped-says-which-and-why
+  (let [c (ctx {"smoke/shop" {:exit 0 :raw "<failsafe-summary result=\"255\"><completed>4</completed></failsafe-summary>"}})
+        res (suites/test! c {:suites "smoke" :projects "shop"})
+        cell (first (get-in res [:ok :cells]))
+        file (str (io/file (:reports-dir cell) "junit.xml"))]
+    (is (r/ok? res) (pr-str res))
+    (testing "the caller of `test` gets the report error, not no report at all"
+      (is (= :report/none (get-in cell [:report-error :error])))
+      (is (nil? (:report cell))))
+    (testing "with each skipped file and the keyword reason it was skipped"
+      (is (= [{:file file :reason :junit/unknown-root}] (get-in cell [:report-error :skipped-files])))
+      (is (string? (get-in cell [:report-error :hint]))))
+    (testing "a required report that skipped every file cannot run: the cell errors, the matrix too"
+      (is (= :error (:status cell)))
+      (is (= :report/none (:reason cell)) "never a silent pass")
+      (is (= 2 (get-in res [:ok :exit]))))))
+
 (defn- with-declared-dir
   "`c` whose load suite runs in `root` and declares `reports` under it."
   [c root reports]

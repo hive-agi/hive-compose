@@ -46,6 +46,13 @@
    [:error nat-int?]
    [:skipped nat-int?]])
 
+(def SkippedFile
+  "A report file left out of a run, and why: `:reason` is a keyword, the one
+   its read answered (a foreign :junit/unknown-root today), never a sentence."
+  [:map
+   [:file :string]
+   [:reason :keyword]])
+
 (def Report
   "Kept local: hive-compose.schema belongs to the stack value objects."
   [:map
@@ -53,7 +60,7 @@
    [:report/cases [:vector Case]]
    [:report/totals Totals]
    [:report/bail-out {:optional true} :string]
-   [:report/skipped-files {:optional true} [:vector :string]]])
+   [:report/skipped-files {:optional true} [:vector SkippedFile]]])
 
 (def valid-report? (m/validator Report))
 

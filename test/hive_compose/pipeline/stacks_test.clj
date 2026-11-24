@@ -11,6 +11,7 @@
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
             [hive-compose.stub :as stub]
             [hive-dsl.result :as r]))
 
@@ -297,6 +298,29 @@
     (swap! (:clock c) + (* 2 minute))
     (is (= [{:run run :ok? true}] (:reaped (stacks/reap! c))) "orphan TTL")
     (is (empty? (:stacks @(:state c))))))
+
+(deftest the-claim-ttl-is-what-the-settings-say
+  (testing "one named default, read from the config defaults and not a second literal"
+    (is (= (:compose/claim-ttl-minutes config/defaults) stacks/default-claim-ttl-minutes))
+    (is (= (* 30 minute) (stacks/claim-ttl-ms {})) "today's value stays the default when the key is absent")
+    (is (= (* 30 minute) (stacks/claim-ttl-ms {:compose/claim-ttl-minutes nil})))
+    (is (= (* 7 minute) (stacks/claim-ttl-ms {:compose/claim-ttl-minutes 7}))))
+  (let [lanes (fn [claim-ttl-minutes]
+                (let [c (ctx)
+                      c (cond-> c claim-ttl-minutes
+                          (update :settings assoc :compose/claim-ttl-minutes claim-ttl-minutes))
+                      run (get-in (stacks/stack-up! c {:stack "shop"}) [:ok :run])]
+                  [c run (fn [agent] (stacks/claim-exclusive! c run agent {:note "lane" :prefix "stack:"}))]))]
+    (testing "a 1 minute TTL the settings decide lapses; the second lane takes the run over"
+      (let [[c _ take] (lanes 1)]
+        (is (r/ok? (take "stack:ling-1")))
+        (swap! (:clock c) + (* 2 minute))
+        (is (r/ok? (take "stack:ling-2")))))
+    (testing "with no key the 30 minute default keeps the first claim live"
+      (let [[c _ take] (lanes nil)]
+        (is (r/ok? (take "stack:ling-1")))
+        (swap! (:clock c) + (* 2 minute))
+        (is (= :compose/run-busy (:error (take "stack:ling-2"))))))))
 
 (deftest a-wave-claim-holds-a-stack-run-for-hours-and-release-ends-it
   (let [c (ctx)

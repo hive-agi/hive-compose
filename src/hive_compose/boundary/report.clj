@@ -136,24 +136,31 @@
    :auto). With `since-ms`, files last modified before it (less
    `mtime-slack-ms`) are left out: the leftovers of an earlier run in a
    directory hive-compose does not own. A file that cannot be read fails the
-   whole, except that :auto skips XML whose root is not JUnit (listed under
-   :report/skipped-files); a directory holding no report is `:report/none`."
+   whole, except that :auto skips XML whose root is not JUnit: each skip is
+   {:file path :reason keyword}, the keyword its read answered, so a caller
+   can say why the file was left out rather than only that it was. A
+   directory holding no report is `:report/none`, its :skipped-files the same
+   {:file :reason} rows, so a run that skipped every file still knows why."
   ([dir] (read-reports dir :auto))
   ([dir format] (read-reports dir format nil))
   ([dir format since-ms]
    (r/let-ok [files (r/try-effect* :report/unreadable
-                      (vec (filter #(or (nil? since-ms)
-                                        (>= (.lastModified (io/file %)) (- since-ms mtime-slack-ms)))
-                                   (report-files dir))))]
+                     (vec (filter #(or (nil? since-ms)
+                                       (>= (.lastModified (io/file %)) (- since-ms mtime-slack-ms)))
+                                  (report-files dir))))]
      (loop [files files acc [] skipped []]
        (if-let [f (first files)]
          (let [res (read-report f format)]
            (cond
              (r/ok? res) (recur (rest files) (conj acc (:ok res)) skipped)
-             (and (= :auto format) (foreign-xml? res)) (recur (rest files) acc (conj skipped (str f)))
+             (and (= :auto format) (foreign-xml? res))
+             (recur (rest files) acc (conj skipped {:file (str f) :reason (:reason res)}))
              :else res))
          (if (empty? acc)
-           (r/err :report/none {:dir (str dir) :skipped-files skipped})
+           (r/err :report/none {:dir (str dir) :skipped-files skipped
+                                :hint (if (seq skipped)
+                                        "every report file was skipped; each :reason says why"
+                                        "no .xml or .tap report file in the directory")})
            (r/ok (cond-> (report/merge-reports acc)
                    (seq skipped) (assoc :report/skipped-files skipped)))))))))
 
