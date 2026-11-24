@@ -156,6 +156,7 @@
    :compose/no-history 503
    :compose/no-compose-file 503
    :compose/program-needs-command 503
+   :compose/nothing-to-run 503
    :compose/stacks-unsupported 503
    :compose/data-exec-unsupported 503
    :compose/data-runner-unsupported 503
