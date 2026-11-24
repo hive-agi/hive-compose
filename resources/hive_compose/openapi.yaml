@@ -4050,6 +4050,7 @@ components:
       - compose/not-implemented
       - compose/not-initialized
       - compose/note-failed
+      - compose/nothing-to-run
       - compose/notice-dropped
       - compose/notice-failed
       - compose/orphan-check-failed
@@ -4066,6 +4067,7 @@ components:
       - compose/program-needs-command
       - compose/program-stop-failed
       - compose/program-unreadable
+      - compose/programs-only
       - compose/project-not-in-run
       - compose/record-threw
       - compose/release-threw
