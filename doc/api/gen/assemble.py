@@ -183,8 +183,15 @@ components["NreplResult"] = {"oneOf": [
     {"allOf": [ref("Route"), obj({"path": S}, ["path"])]},
     obj({"path": S, "route": {"type": "null"}, "advice": S}, ["path", "route", "advice"]),
     obj({"routes": arr(ref("Route"))}, ["routes"])], "x-source": "hand"}
+# promote.config/project-preflight: a configured project whose dir or compose file is gone
+# (reason project-missing, :missing) or cannot be checked (project-unreadable, :unreadable)
+components["ProjectProblem"] = obj({"reason": {"enum": ["project-missing", "project-unreadable"]}, "project": S,
+    "missing": {"enum": ["dir", "compose-file"]}, "unreadable": {"enum": ["dir", "compose-file"]},
+    "paths": arr(S), "looked-for": arr(S)}, ["reason", "project", "paths"],
+    desc="promote.config/project-preflight: why a configured project cannot be brought up (missing) or could not be checked (unreadable), decided before docker runs")
 components["ProjectsResult"] = arr(obj({"name": S, "status": S, "managed?": B, "label-files": arr(S),
-    "configured": arr(obj({"id": S, "files": arr(S)})), "stale-files": arr(S), "files-match?": B}, ["name", "managed?", "label-files"]))
+    "configured": arr(obj({"id": S, "files": arr(S), "problem": ref("ProjectProblem")})), "stale-files": arr(S), "files-match?": B}, ["name", "managed?", "label-files"],
+    desc="one row per compose project docker knows, plus a row with status missing|unreadable for a configured project whose dir or compose file is gone or could not be checked"))
 keyed = obj({"added": arr(S), "removed": arr(S), "changed": arr(S)})
 components["ReloadResult"] = obj({"source": {"enum": ["config-source", "host-config", "none"]}, "profiles": arr(S),
     "projects": arr(S), "changed": obj({"projects": keyed, "profiles": keyed, "settings": arr(S), "restart-required": arr(S)}),
@@ -213,6 +220,8 @@ components["StackUpResult"] = open_result("pipeline.stacks/stack-up!: the run, i
 components["StackDownResult"] = open_result("pipeline.stacks/stack-down!: what was taken down and what was kept")
 components["StackStatusResult"] = open_result("pipeline.stacks/stack-status: stack runs with their instances' and consumers' containers")
 components["PlanResult"] = open_result("pipeline.stacks/plan: what stack-up would start, share or find running")
+components["PlanResult"]["properties"] = {"problems": arr(ref("ProjectProblem"))}
+components["PlanResult"]["description"] += "; problems: the ProjectProblem of every project the stack brings up whose dir or compose file is missing or unreadable (absent when none)"
 components["FlakyResult"] = open_result("pipeline.flaky/flaky: test cases ranked by intermittent failure, each flaky, regression, fixed or stable")
 components["WhyResult"] = open_result("pipeline.why/why! minus :why/markdown: case, error span, span path, logs, plan, written files")
 components["TestResult"] = open_result("pipeline.suites/test!: run, stack, status (passed|failed|error), exit (0 every cell passed, 1 a test failed, 2 something could not run; 2 wins), summary, one cell per suite x project (x variant: suite/id <suite>@<variant>, variant; the variant env is set on the suite RUNNER only, the stack and its consumers are NOT restarted or re-env'd per variant; a suite without variants under a variants filter ran once and carries variant-note), each with status, reason when it did not pass (error: could not run, e.g. report/none, report/empty, a runner category) and service when known, report cut to totals, every case {case/id case/status case/time-s} and the failed cases with their texts; skip-fails?, stack-kept?, claimed-by, summary-file")

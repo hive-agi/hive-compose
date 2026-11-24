@@ -144,6 +144,22 @@
         (is (= ["gone"] (map :project (:problems plan))) (pr-str plan)))
       (finally (addon/shutdown! a)))))
 
+(deftest a-throwing-exists-port-never-breaks-projects-or-plan
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"shop" {"api" {}}})
+        a (sut/make-addon (assoc (config dir engine)
+                                 :compose/projects {"shop" {:project/id "shop" :project/dir "/w/shop"}}
+                                 :compose/stacks {"s" {:stack/id "s" :stack/consumers ["shop"]}}
+                                 :compose/exists? (fn [_] (throw (SecurityException. "denied")))))]
+    (addon/initialize! a {})
+    (try
+      (let [res (call a {"command" "projects"})]
+        (is (not (:error? res)) (pr-str res))
+        (is (= #{"project-unreadable"} (set (keep #(get-in % [:configured 0 :problem :reason]) (:body res))))))
+      (let [plan (call a {"command" "plan" "stack" "s"})]
+        (is (= ["project-unreadable"] (map :reason (:problems (:body plan)))) (pr-str plan)))
+      (finally (addon/shutdown! a)))))
+
 (deftest test-command-runs-the-suite-matrix
   (let [dir (temp-dir)
         engine (stub/engine {} {} {"pg" {"db" {}} "shop" {"api" {}}})

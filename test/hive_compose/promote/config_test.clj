@@ -144,3 +144,32 @@
     (is (= [:dir] (map :missing (:problems (config/mark-plan {:error :x} s "s" fake-fs))))
         "an error plan carries them too")
     (is (= [] (config/stack-projects s "unknown")))))
+
+(deftest a-probe-that-cannot-tell-is-unreadable-never-missing
+  (let [s (:ok (config/settings preflight-cfg nil home))
+        projects (:compose/projects s)
+        throwing (fn [_] (throw (java.io.IOException. "boom")))
+        ;; the fake port answers EACCES on /w/gone the way the real one does: :unknown
+        denied (fn [p] (cond (= p "/w/gone") :unknown (fake-fs p) :present :else :missing))]
+    (testing "a throwing probe: no exception, no :compose/project-missing"
+      (is (= :unknown (config/path-state throwing "/x")))
+      (let [problems (config/projects-preflight throwing projects)]
+        (is (= #{:compose/project-unreadable} (set (map :reason (vals problems)))))
+        (is (= {:reason :compose/project-unreadable :project "shop" :unreadable :dir :paths ["/w/shop"]}
+               (get problems "shop"))))
+      (let [rows (config/mark-projects [] projects throwing)]
+        (is (= #{"unreadable"} (set (map :status rows))))
+        (is (not-any? #(= :compose/project-missing (get-in % [:configured 0 :problem :reason])) rows)))
+      (let [res (config/mark-plan {:ok {:text "plan"}} s "s" throwing)]
+        (is (= #{:compose/project-unreadable} (set (map :reason (get-in res [:ok :problems])))))
+        (is (re-find #"UNREADABLE: project gone dir /w/gone" (get-in res [:ok :text])))))
+    (testing "a permission-denied dir reads as unknown: unreadable, with the path"
+      (is (= {:reason :compose/project-unreadable :project "gone" :unreadable :dir :paths ["/w/gone"]}
+             (config/project-preflight denied (get projects "gone"))))
+      (is (nil? (config/project-preflight denied (get projects "shop"))) "a present project unchanged"))
+    (testing "an unknown compose file next to a missing one: missing wins"
+      (is (= {:reason :compose/project-missing :project "nofile" :missing :compose-file
+              :paths ["/abs/override.yml"]}
+             (config/project-preflight
+              (fn [p] (cond (= p "/w/nofile/docker-compose.yml") :unknown (fake-fs p) :present :else :missing))
+              (get projects "nofile")))))))

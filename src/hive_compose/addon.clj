@@ -149,7 +149,7 @@
                   (history/file-history (:compose/history-file settings)))
      :settings settings
      ;; the existence port projects/plan preflight configured projects with
-     :exists? (or (:compose/exists? cfg) #(.exists (java.io.File. ^String %)))
+     :exists? (or (:compose/exists? cfg) files/path-state)
      :state state
      :faults (atom {})
      :toxiproxy (:compose/toxiproxy cfg)
