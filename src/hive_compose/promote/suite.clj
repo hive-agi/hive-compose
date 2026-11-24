@@ -586,7 +586,8 @@
   ([exit report policy] (:status (cell-verdict exit report policy))))
 
 (defn cell-result
-  "The run result of `cell` in `run`, in the shape hc-13 `record-run!` takes:
+  "One cell's outcome as the run records it (hc-13 `record-run!`), the shape
+   `why` and the flake history read:
      {:run/id :suite/id :project :variant? :exit :status :passed|:failed|:error
       :reason? :report Report?  :report-error {:error :message ..}?
       :started-at :finished-at :duration-ms  :oom Finding?}
@@ -595,10 +596,12 @@
    names the variant. `outcome` is {:exit n-or-nil :report Result<Report>
    :started-at ms :finished-at ms :oom Finding? :policy VerdictPolicy?}. A
    report error such as :report/none (nothing written) counts as no report;
-   the error is kept under :report-error. `:reason` is why the cell did not
-   pass (`cell-verdict`). `:oom` is the runner's OOM finding (hc-16b
-   `hive-compose.promote.oom`), kept as is: `why` prints its line and the
-   flake history classes the run :oom."
+   the error is kept under :report-error, with its :skipped-files and :hint
+   when it carries them, so a caller of `test` can say WHICH report files
+   were left out and why, not only that there was no report. `:reason` is why
+   the cell did not pass (`cell-verdict`). `:oom` is the runner's OOM finding
+   (hc-16b `hive-compose.promote.oom`), kept as is: `why` prints its line and
+   the flake history classes the run :oom."
   [run cell {:keys [exit report started-at finished-at oom policy timed-out?]}]
   (let [rep (when (r/ok? report) (:ok report))
         {:keys [status reason]} (cell-verdict exit report (cond-> (or policy {})
@@ -613,7 +616,8 @@
       (and reason (not= :passed status)) (assoc :reason reason)
       (:skip-fails? policy) (assoc :skip-fails? true)
       rep (assoc :report rep)
-      (r/err? report) (assoc :report-error (select-keys report [:error :message :reason :dir]))
+      (r/err? report) (assoc :report-error (select-keys report [:error :message :reason :dir
+                                                               :skipped-files :hint]))
       started-at (assoc :started-at started-at)
       finished-at (assoc :finished-at finished-at)
       (and (number? started-at) (number? finished-at))

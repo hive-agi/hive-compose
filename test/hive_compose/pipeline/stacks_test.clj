@@ -11,6 +11,7 @@
             [hive-compose.pipeline.ops :as ops]
             [hive-compose.pipeline.stacks :as stacks]
             [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
             [hive-compose.stub :as stub]
             [hive-dsl.result :as r]))
 
@@ -299,8 +300,9 @@
     (is (empty? (:stacks @(:state c))))))
 
 (deftest the-claim-ttl-is-what-the-settings-say
-  (testing "one named default when the settings name no claim TTL"
-    (is (= (* 30 minute) (stacks/claim-ttl-ms {})))
+  (testing "one named default, read from the config defaults and not a second literal"
+    (is (= (:compose/claim-ttl-minutes config/defaults) stacks/default-claim-ttl-minutes))
+    (is (= (* 30 minute) (stacks/claim-ttl-ms {})) "today's value stays the default when the key is absent")
     (is (= (* 30 minute) (stacks/claim-ttl-ms {:compose/claim-ttl-minutes nil})))
     (is (= (* 7 minute) (stacks/claim-ttl-ms {:compose/claim-ttl-minutes 7}))))
   (let [lanes (fn [claim-ttl-minutes]

@@ -54,8 +54,9 @@
 
 (def default-claim-ttl-minutes
   "Length a claim holds when the settings name no :compose/claim-ttl-minutes:
-   today's value, the same 30 the config defaults carry."
-  30)
+   the default `hive-compose.promote.config/defaults` carries, read from
+   there, never a second literal to drift from it."
+  (:compose/claim-ttl-minutes config/defaults))
 
 (defn claim-ttl-ms
   "The claim TTL `settings` decide, in milliseconds: :compose/claim-ttl-minutes,
@@ -66,6 +67,7 @@
   (* 60000 (or (:compose/claim-ttl-minutes settings) default-claim-ttl-minutes)))
 
 (m/=> claim-ttl-ms [:=> [:cat :map] :int])
+
 
 (defn- persist! [{:keys [state save!]}]
   (when save! (save! (select-keys @state [:active :current :stacks :preexisting]))))
