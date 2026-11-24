@@ -68,27 +68,35 @@
   [:set [:enum :nrepl :published :cpu]])
 
 (def Profile
-  [:map
-   [:profile/id ProfileId]
-   [:profile/dir [:string {:min 1}]]
-   [:profile/files {:optional true} [:vector [:string {:min 1}]]]
-   [:profile/project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
-   [:profile/compose-profiles {:optional true} [:vector ProfileId]]
-   [:profile/services {:optional true} [:vector [:string {:min 1}]]]
-   [:profile/programs {:optional true} [:vector Program]]
-   [:profile/env {:optional true} Env]
-   ;; the env a call gave (up/switch/restart env=), kept so a later call on the
-   ;; same section never falls back to weaker env; references stay references
-   [:profile/call-env {:optional true} Env]
-   ;; a target section that runs from another (holding) section's dir, files
-   ;; and env: its id; a reload then keeps those and rebases only the rest
-   [:profile/inputs-from {:optional true} ProfileId]
-   [:profile/wait? {:optional true} :boolean]
-   [:profile/no-deps? {:optional true} :boolean]
-   [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:profile/idle-action {:optional true} IdleAction]
-   [:profile/activity {:optional true} Activity]
-   [:profile/description {:optional true} :string]])
+  "A section or preset. `:profile/compose? false` (no compose project, only
+   host programs) together with `:profile/services` is refused: there is no
+   compose project to run those services, and up would drop them silently."
+  [:and
+   [:map
+    [:profile/id ProfileId]
+    [:profile/dir [:string {:min 1}]]
+    [:profile/files {:optional true} [:vector [:string {:min 1}]]]
+    [:profile/project {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+    [:profile/compose-profiles {:optional true} [:vector ProfileId]]
+    [:profile/services {:optional true} [:vector [:string {:min 1}]]]
+    ;; false: no compose project, only host programs (Project :project/compose?)
+    [:profile/compose? {:optional true} :boolean]
+    [:profile/programs {:optional true} [:vector Program]]
+    [:profile/env {:optional true} Env]
+    ;; the env a call gave (up/switch/restart env=), kept so a later call on the
+    ;; same section never falls back to weaker env; references stay references
+    [:profile/call-env {:optional true} Env]
+    ;; a target section that runs from another (holding) section's dir, files
+    ;; and env: its id; a reload then keeps those and rebases only the rest
+    [:profile/inputs-from {:optional true} ProfileId]
+    [:profile/wait? {:optional true} :boolean]
+    [:profile/no-deps? {:optional true} :boolean]
+    [:profile/ttl-minutes {:optional true} [:int {:min 1}]]
+    [:profile/idle-action {:optional true} IdleAction]
+    [:profile/activity {:optional true} Activity]
+    [:profile/description {:optional true} :string]]
+   [:fn {:error/message "a profile with :profile/compose? false runs no compose project, so it cannot name :profile/services"}
+    (fn [p] (not (and (false? (:profile/compose? p)) (seq (:profile/services p)))))]])
 
 (def Claim
   "An agent's declaration that it works on a section (or holds a stack run):
@@ -523,20 +531,29 @@
   "Where a compose project lives. Its YAML is the source of truth: sections are
    resolved from its services, native profiles and depends_on. `:project/programs`
    are the host programs its sections start beside their containers.
-   `:project/provides` and `:project/needs` place it in the capability graph."
-  [:map
-   [:project/id [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"]]
-   [:project/dir [:string {:min 1}]]
-   [:project/files {:optional true} [:vector [:string {:min 1}]]]
-   [:project/name {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
-   [:project/programs {:optional true} [:vector Program]]
-   [:project/env {:optional true} Env]
-   [:project/wait? {:optional true} :boolean]
-   [:project/ttl-minutes {:optional true} [:int {:min 1}]]
-   [:project/idle-action {:optional true} IdleAction]
-   [:project/activity {:optional true} Activity]
-   [:project/provides {:optional true} Provides]
-   [:project/needs {:optional true} Needs]])
+   `:project/provides` and `:project/needs` place it in the capability graph.
+   `:project/compose? false` declares a project with no compose file and no
+   services: its section starts only its programs, which then need be one or
+   more and pair with no service (`:program/with`); docker is never called."
+  [:and
+   [:map
+    [:project/id [:re #"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"]]
+    [:project/dir [:string {:min 1}]]
+    [:project/files {:optional true} [:vector [:string {:min 1}]]]
+    [:project/name {:optional true} [:re #"^[a-z0-9][a-z0-9_-]*$"]]
+    [:project/compose? {:optional true} :boolean]
+    [:project/programs {:optional true} [:vector Program]]
+    [:project/env {:optional true} Env]
+    [:project/wait? {:optional true} :boolean]
+    [:project/ttl-minutes {:optional true} [:int {:min 1}]]
+    [:project/idle-action {:optional true} IdleAction]
+    [:project/activity {:optional true} Activity]
+    [:project/provides {:optional true} Provides]
+    [:project/needs {:optional true} Needs]]
+   [:fn {:error/message "a project with :project/compose? false needs one or more :project/programs, none with :program/with"}
+    (fn [p] (or (not (false? (:project/compose? p)))
+                (and (seq (:project/programs p))
+                     (not-any? (comp seq :program/with) (:project/programs p)))))]])
 
 (def CaseStatus
   "How one test case ended in one run, as JUnit XML and TAP report it."

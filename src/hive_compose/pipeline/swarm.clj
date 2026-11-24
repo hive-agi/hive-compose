@@ -342,8 +342,8 @@
   (let [engine (:engine ctx)
         ;; what the running containers were started from, as far as a holder says
         {p :profile assumed? :assumed?} (ops/adopt-profile ctx p0)]
-    (r/let-ok [closure (port/-closure engine p)
-               running (port/-running engine p)]
+    (r/let-ok [closure (if (program/programs-only? p) (r/ok []) (port/-closure engine p))
+               running (if (program/programs-only? p) (r/ok #{}) (port/-running engine p))]
       (let [services (profile/up-services p closure)
             now ((:now ctx))]
         (if (and (seq services) (every? (set running) services))

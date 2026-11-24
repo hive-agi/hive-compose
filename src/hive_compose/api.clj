@@ -125,6 +125,7 @@
    :compose/payload-too-large 413
    :compose/unsupported-media-type 415
    :compose/not-active 409
+   :compose/programs-only 409
    :compose/not-claimed 409
    :compose/orphans-hold-resources 409
    :compose/held-by-another-section 409

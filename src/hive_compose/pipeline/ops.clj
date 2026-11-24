@@ -69,20 +69,25 @@
   "Result<[service] | nil>: what `nm` stands for in project `proj`: itself when
    it is a service, the members of the native profile when it is one, nil when
    the project defines neither. `env` is the call's own, added to the
-   project's for these compose queries too."
+   project's for these compose queries too. A project with no compose project
+   (:project/compose? false) is asked nothing: its id or one of its program
+   ids names its section, which runs no service."
   [engine proj nm env]
   (let [whole (cond-> (target/project-profile proj)
                 (seq env) (update :profile/env merge env))]
-    (r/let-ok [profiles (port/-profiles engine whole)]
-      (if (contains? profiles nm)
-        (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
-                   always (port/-listed engine whole)]
-          (r/ok (target/profile-members with always)))
-        (let [c (port/-closure engine (assoc whole :profile/services [nm]))]
-          (cond
-            (r/ok? c) (r/ok [nm])
-            (target/unknown-service? c) (r/ok nil)
-            :else c))))))
+    (if (program/programs-only? whole)
+      (r/ok (when (contains? (into #{(:project/id proj)} (map :program/id) (:project/programs proj)) nm)
+              []))
+      (r/let-ok [profiles (port/-profiles engine whole)]
+        (if (contains? profiles nm)
+          (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
+                     always (port/-listed engine whole)]
+            (r/ok (target/profile-members with always)))
+          (let [c (port/-closure engine (assoc whole :profile/services [nm]))]
+            (cond
+              (r/ok? c) (r/ok [nm])
+              (target/unknown-service? c) (r/ok nil)
+              :else c)))))))
 
 (defn- expand-names
   "Result<[service] | nil> for all `names` in `proj`; nil when one is unknown there."
@@ -470,9 +475,12 @@
     []))
 
 (defn- execute-once! [{:keys [engine]} p {:keys [action services]}]
-  (case action
-    :stop (port/-stop! engine p services)
-    :down (port/-down! engine p services)))
+  (if (program/programs-only? p)
+    ;; no compose project: docker has nothing to release, only programs stop
+    (r/ok {:out "" :skipped :no-compose})
+    (case action
+      :stop (port/-stop! engine p services)
+      :down (port/-down! engine p services))))
 
 (def ^:private no-such-service "no such service: ")
 
@@ -654,7 +662,9 @@
    pull in the optional dependencies the closure left out."
   [ctx p services needs carried pin?]
   (let [id (:profile/id p)]
-    (r/let-ok [out (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services)]
+    (r/let-ok [out (if (program/programs-only? p)
+                     (r/ok {:out ""})
+                     (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services))]
       (let [now ((:now ctx))
             {:keys [held report]} (start-programs! ctx p services carried)
             wider (seq (remove (set services) needs))]
@@ -675,9 +685,14 @@
 (defn up-profile!
   "Bring `p` up alongside whatever is active. Becomes current when nothing is.
    A depends_on entry marked `required: false` is neither built nor started;
-   it is only needed when already running."
+   it is only needed when already running. A profile with no compose project
+   (`program/up-mode` :programs-only) asks compose nothing: it goes through
+   the same bring-up with no service, so only its programs start."
   [ctx p]
-  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)
+  (r/let-ok [mode (program/up-mode p)
+             {:keys [start needs pin?]} (if (= :programs-only mode)
+                                          (r/ok {:start [] :needs [] :pin? false})
+                                          (up-plan ctx p))
              up (bring-up! ctx p (profile/up-services p start) needs
                            (live-programs ctx (profile/project p)) pin?)]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
@@ -714,7 +729,9 @@
         active (:active @(:state ctx))]
     (r/let-ok [services (if-let [a (get active id)]
                           (r/ok (:services a))
-                          (port/-closure (:engine ctx) p))]
+                          (if (program/programs-only? p)
+                            (r/ok [])
+                            (port/-closure (:engine ctx) p)))]
       (let [step (plan/down-release active id (profile/project p) services action)
             res (execute! ctx p step)
             stopped (when (r/ok? res) (stop-programs! ctx id #{}))]
@@ -754,20 +771,27 @@
   (when (active-entry ctx (:profile/id p)) (touch! ctx (:profile/id p))))
 
 (defn ps-profile
-  "Result<{:profile :needs :running}> for `p`; touches it when active."
+  "Result<{:profile :needs :running}> for `p`; touches it when active. A
+   profile with no compose project needs and runs no service."
   [ctx p]
-  (r/let-ok [needs (port/-closure (:engine ctx) p)
-             running (port/-running (:engine ctx) p)]
+  (r/let-ok [needs (if (program/programs-only? p) (r/ok []) (port/-closure (:engine ctx) p))
+             running (if (program/programs-only? p) (r/ok #{}) (port/-running (:engine ctx) p))]
     (touch-if-active! ctx p)
     (r/ok {:profile (:profile/id p) :project (profile/project p) :needs needs
            :running (vec (filter (set running) needs))})))
 
 (defn logs-profile
-  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active."
+  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active.
+   A profile with no compose project has no container log to read and asks
+   docker nothing: :compose/programs-only (its programs log under the log dir)."
   [ctx p tail]
-  (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
-    (touch-if-active! ctx p)
-    (r/ok out)))
+  (if (program/programs-only? p)
+    (r/err :compose/programs-only
+           {:profile (:profile/id p) :verb :logs
+            :hint "no compose project, so no container logs; its programs log to files under :compose/log-dir"})
+    (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
+      (touch-if-active! ctx p)
+      (r/ok out))))
 
 ;; ---------------------------------------------------------------------------
 ;; the same by preset or active id
@@ -786,6 +810,7 @@
    the addon), stopping the programs they alone hold. Answers the forgotten ids."
   [ctx]
   (let [dropped (vec (for [[id a] (:active @(:state ctx))
+                           :when (not (program/programs-only? (:profile a)))
                            :let [running (r/bind (lookup ctx id) #(port/-running (:engine ctx) %))]
                            :when (and (r/ok? running) (not-any? (:ok running) (:services a)))]
                        id))]
@@ -854,6 +879,8 @@
         now ((:now ctx))
         presets (vec (for [[id p] (sort-by key (:compose/profiles settings))
                            :when (not (active-entry ctx id))
+                           ;; no compose project: nothing runs in docker to adopt
+                           :when (not (program/programs-only? p))
                            :let [closure (port/-closure engine p)]
                            :when (r/ok? closure)
                            :let [running (port/-running engine p)]
@@ -885,7 +912,9 @@
                                                   :inputs :assumed)))
                              taken)))
                        []
-                       (sort-by key (:compose/projects settings)))
+                       ;; a project with no compose project has no stray container
+                       (remove (comp program/programs-only? target/project-profile val)
+                               (sort-by key (:compose/projects settings))))
         adopted (into presets strays)]
     (when (seq strays)
       (swap! (:state ctx) update :active
@@ -921,7 +950,9 @@
   (into (sorted-map)
         (for [[id proj] (get-in ctx [:settings :compose/projects])
               :let [whole (target/project-profile proj)
-                    res (port/-listed (:engine ctx) whole)]]
+                    res (if (program/programs-only? whole)
+                          (r/ok [])
+                          (port/-listed (:engine ctx) whole))]]
           [id (cond-> {:compose-project (profile/project whole) :ok? (r/ok? res)}
                 (r/err? res) (assoc :error (select-keys res [:error :exit :stderr])))])))
 
@@ -1007,8 +1038,9 @@
   (let [engine (:engine ctx)]
     (reduce (fn [acc [id proj]]
               (let [whole (target/project-profile proj)
-                    x (r/let-ok [services (port/-listed engine whole)
-                                 profiles (port/-profiles engine whole)]
+                    none? (program/programs-only? whole)
+                    x (r/let-ok [services (if none? (r/ok []) (port/-listed engine whole))
+                                 profiles (if none? (r/ok #{}) (port/-profiles engine whole))]
                         (r/ok {:project id :always-on services :profiles (vec (sort profiles))}))]
                 (if (r/err? x)
                   (reduced (assoc x :project id))

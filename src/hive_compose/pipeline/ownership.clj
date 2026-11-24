@@ -50,6 +50,8 @@
    restart). A plain restart recreates nothing and answers []."
   [ctx p mode recreate?]
   (if (or (and (= :restart mode) (not recreate?))
+          ;; no compose project: it recreates no container
+          (false? (:profile/compose? p))
           (not (others-hold-anything? ctx p)))
     (r/ok [])
     (r/let-ok [services (touched ctx p mode)]

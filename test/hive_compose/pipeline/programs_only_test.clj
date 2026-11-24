@@ -1,0 +1,159 @@
+(ns hive-compose.pipeline.programs-only-test
+  "A project with :project/compose? false runs only host programs: no docker
+   call on up, down, ps, status or the reconcile pass (card 20261123200751-0f950466)."
+  (:require [clojure.test :refer [deftest is testing]]
+            [hive-compose.pipeline.ops :as ops]
+            [hive-compose.port :as port]
+            [hive-compose.promote.config :as config]
+            [hive-compose.promote.program :as program]
+            [hive-compose.stub :as stub]
+            [hive-compose.stub-runner :as runner]
+            [hive-dsl.result :as r]
+            [hive-compose.stub-swarm :as stub-swarm]
+            [hive-compose.pipeline.restart :as restart]
+            [hive-compose.pipeline.swarm :as swarm]
+            [hive-compose.schema :as schema]))
+
+;; SPDX-License-Identifier: MIT
+
+(defn- counting-engine
+  "An IComposeEngine that counts every call into `calls` and refuses it: any
+   docker call a programs-only section makes shows up here."
+  [calls]
+  (let [hit (fn [m] (swap! calls conj m) (r/err :test/docker-called {:method m}))]
+    (reify port/IComposeEngine
+      (-version [_] (hit :version))
+      (-closure [_ _] (hit :closure))
+      (-listed [_ _] (hit :listed))
+      (-profiles [_ _] (hit :profiles))
+      (-running [_ _] (hit :running))
+      (-projects [_] (hit :projects))
+      (-up! [_ _ _] (hit :up))
+      (-stop! [_ _ _] (hit :stop))
+      (-down! [_ _ _] (hit :down))
+      (-restart! [_ _ _ _] (hit :restart))
+      (-logs [_ _ _ _] (hit :logs)))))
+
+(def fleet
+  {:project/id "fleet" :project/dir "/w/fleet" :project/compose? false
+   :project/programs [{:program/id "inventory" :program/dir "/w/fleet"
+                       :program/command ["bb" "inventory"]}]})
+
+(def base
+  {:compose/default-ttl-minutes 60
+   :compose/default-idle-action :stop
+   :compose/log-dir "/logs"
+   :compose/programs? true})
+
+(defn- ctx [engine projects profiles]
+  {:engine engine
+   :runner (runner/runner {})
+   :settings (assoc base :compose/projects projects :compose/profiles profiles)
+   :state (atom {:active {} :current nil})
+   :now (constantly 0)
+   :save! (fn [_] (r/ok nil))})
+
+(deftest config-accepts-programs-only-and-refuses-an-empty-project
+  (testing "programs and no compose project: valid"
+    (is (r/ok? (config/settings {:compose/projects [fleet]} nil "/h"))))
+  (testing "no compose project and no program: refused with a keyword reason"
+    (let [res (config/settings {:compose/projects [(dissoc fleet :project/programs)]} nil "/h")]
+      (is (= :compose/invalid-config (:error res)))))
+  (testing "a program paired with a service of a project that has none: refused"
+    (let [res (config/settings {:compose/projects
+                                [(assoc-in fleet [:project/programs 0 :program/with] ["web"])]}
+                               nil "/h")]
+      (is (= :compose/invalid-config (:error res)))))
+  (testing "a compose project without :project/compose? is unchanged"
+    (is (r/ok? (config/settings {:compose/projects [(dissoc fleet :project/compose? :project/programs)]}
+                                nil "/h")))))
+
+(deftest up-mode-is-total
+  (is (= (r/ok :compose) (program/up-mode {:profile/id "a" :profile/dir "/a"})))
+  (is (= (r/ok :programs-only) (program/up-mode {:profile/id "f" :profile/dir "/f" :profile/compose? false
+                                                 :profile/programs [{:program/id "x" :program/dir "/f"}]})))
+  (is (= :compose/nothing-to-run
+         (:error (program/up-mode {:profile/id "f" :profile/dir "/f" :profile/compose? false})))))
+
+(deftest a-programs-only-section-lives-with-no-docker-call
+  (let [calls (atom [])
+        c (ctx (counting-engine calls) {"fleet" fleet} {})
+        p (:ok (ops/subject c {:target "fleet"}))]
+    (is (= "fleet/fleet" (:profile/id p)))
+    (testing "up starts the program, docker is never called"
+      (let [res (ops/up-profile! c p)]
+        (is (r/ok? res))
+        (is (= [] (:services (:ok res))))
+        (is (= 1 (count (runner/starts (:runner c)))))
+        (is (= [[:start "inventory" ["bb" "inventory"] "/logs/fleet-inventory.log"]]
+               (runner/starts (:runner c))))
+        (is (contains? (get-in @(:state c) [:active "fleet/fleet" :programs]) "inventory"))))
+    (testing "status and ps read it"
+      (let [row (some #(when (= "fleet/fleet" (:id %)) %) (:profiles (ops/status c)))]
+        (is (:active? row))
+        (is (= ["inventory"] (mapv :program/id (:programs row)))))
+      (is (= {:needs [] :running []} (select-keys (:ok (ops/ps c "fleet/fleet")) [:needs :running]))))
+    (testing "the reconcile pass keeps it: it never had a service to lose"
+      (is (= [] (ops/reconcile! c)))
+      (is (empty? (runner/stops (:runner c)))))
+    (testing "down stops the program"
+      (let [res (ops/down! c "fleet/fleet" :down)]
+        (is (r/ok? res))
+        (is (= 1 (count (runner/stops (:runner c)))))
+        (is (empty? (runner/alive (:runner c))))
+        (is (empty? (:active @(:state c))))))
+    (is (= [] @calls) "no docker call at all")))
+
+(deftest a-project-with-services-and-programs-is-unchanged
+  (let [web {:program/id "web" :program/dir "/w/shop" :program/command ["npx" "watch"] :program/with ["web"]}
+        c (ctx (stub/engine {"web" ["postgres" "web"]}) {}
+               {"web" {:profile/id "web" :profile/dir "/w/shop" :profile/services ["web"]
+                       :profile/programs [web]}})
+        res (ops/up! c "web")]
+    (is (r/ok? res))
+    (is (= 1 (count (stub/ups (:engine c)))) "compose up ran")
+    (is (= 1 (count (runner/starts (:runner c)))))
+    (is (r/ok? (ops/down! c "web" :down)))
+    (is (= 1 (count (runner/stops (:runner c)))))))
+
+(deftest logs-restart-and-adopt-of-a-compose-project-are-unchanged
+  (let [e (stub/engine {"web" ["postgres" "web"]} {"shop" #{"web"}} {"shop" {"web" {}}})
+        c (ctx e {"shop" {:project/id "shop" :project/dir "/w/shop"}}
+               {"web" {:profile/id "web" :profile/dir "/w/shop" :profile/services ["web"]}})
+        p (:ok (ops/lookup c "web"))]
+    (stub/logs! e "shop" "web-1 | ready")
+    (is (r/ok? (ops/logs-profile c p 10)) "logs read compose")
+    (is (r/ok? (restart/restart-profile! c p false)))
+    (is (= 1 (count (stub/restarts e))) "restart reached compose")
+    (is (seq (ops/adopt! c)) "a running compose service is adopted")))
+
+(deftest a-programs-only-profile-naming-services-is-refused
+  (let [prog {:program/id "x" :program/dir "/f" :program/command ["bb" "x"]}
+        p {:profile/id "f" :profile/dir "/f" :profile/compose? false :profile/programs [prog]}]
+    (is (nil? (schema/explain schema/Profile p)) "programs only: valid")
+    (is (some? (schema/explain schema/Profile (assoc p :profile/services ["web"]))) "with services: refused")
+    (is (nil? (schema/explain schema/Profile (assoc p :profile/compose? true :profile/services ["web"])))
+        "a compose profile with services is unchanged")
+    (testing "config refuses the preset with :compose/invalid-config and the reason as data"
+      (let [res (config/settings {:compose/profiles [(assoc p :profile/services ["web"])]} nil "/h")]
+        (is (= :compose/invalid-config (:error res)))
+        (is (some? (:problems res)))))))
+
+(deftest logs-restart-adopt-and-claim-ask-docker-nothing-for-a-programs-only-section
+  (let [calls (atom [])
+        c (assoc (ctx (counting-engine calls) {"fleet" fleet} {})
+                 :swarm (stub-swarm/swarm [])
+                 :activity (stub-swarm/activity))
+        c (update c :settings assoc :compose/claim-ttl-minutes 30 :compose/swarm? true)
+        p (:ok (ops/subject c {:target "fleet"}))]
+    (testing "logs: no container log, a keyword reason"
+      (is (= :compose/programs-only (:error (ops/logs-profile c p 10)))))
+    (testing "restart: no service to recycle, a keyword reason"
+      (is (= :compose/programs-only (:error (restart/restart-profile! c p false))))
+      (is (= :compose/programs-only (:error (restart/restart-profile! c p true)))))
+    (testing "adopt: nothing runs in docker to take charge of"
+      (is (= [] (ops/adopt! c))))
+    (testing "claim: the section comes up through up, programs only"
+      (is (r/ok? (swarm/claim! c p "ling-1" {})))
+      (is (contains? (get-in @(:state c) [:active "fleet/fleet" :programs]) "inventory")))
+    (is (= [] @calls) "no docker call at all")))

@@ -7,7 +7,8 @@
   (:require [hive-compose.pipeline.ops :as ops]
             [hive-compose.port :as port]
             [hive-compose.promote.profile :as profile]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [hive-compose.promote.program :as program]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -21,19 +22,25 @@
    unchanged; an active `p` has its idle clock reset. The caller resolves
    `p` through `ops/effective-subject` (the holding section's inputs) and
    remembers a recreate's call env on that section (`ops/remember-call-env!`);
-   an in-place restart recreates nothing, so its env is not remembered."
+   an in-place restart recreates nothing, so its env is not remembered. A
+   profile with no compose project has no service to recycle and asks docker
+   nothing: :compose/programs-only (down and up recycle its programs)."
   [ctx p recreate?]
   (let [id (:profile/id p)]
-    (r/let-ok [services (if-let [s (seq (:profile/services p))]
-                          (r/ok (vec s))
-                          (if-let [a (active-entry ctx id)]
-                            (r/ok (vec (:services a)))
-                            (port/-closure (:engine ctx) p)))
-               out (port/-restart! (:engine ctx) p services (boolean recreate?))]
-      (when (active-entry ctx id) (ops/touch! ctx id))
-      (r/ok (cond-> {:profile id
-                     :project (profile/project p)
-                     :services services
-                     :action (if recreate? :recreate :restart)
-                     :out (:out out)}
-              (:skipped out) (assoc :note "no service to restart"))))))
+    (if (program/programs-only? p)
+      (r/err :compose/programs-only
+             {:profile id :verb :restart
+              :hint "no compose project, so no service to restart; down then up restarts its programs"})
+      (r/let-ok [services (if-let [s (seq (:profile/services p))]
+                            (r/ok (vec s))
+                            (if-let [a (active-entry ctx id)]
+                              (r/ok (vec (:services a)))
+                              (port/-closure (:engine ctx) p)))
+                 out (port/-restart! (:engine ctx) p services (boolean recreate?))]
+        (when (active-entry ctx id) (ops/touch! ctx id))
+        (r/ok (cond-> {:profile id
+                       :project (profile/project p)
+                       :services services
+                       :action (if recreate? :recreate :restart)
+                       :out (:out out)}
+                (:skipped out) (assoc :note "no service to restart")))))))
