@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="3" failures="1" errors="0" time="1.204">
+  <testsuite name="sum" errors="0" failures="1" skipped="1" timestamp="2026-11-22T17:10:03" time="0.512" tests="3">
+    <testcase classname="sum adds 1 + 2 to equal 3" name="sum adds 1 + 2 to equal 3" time="0.002">
+    </testcase>
+    <testcase classname="sum adds negatives" name="sum adds negatives" time="0.004">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: -3
+Received: -1
+    at Object.toBe (/app/sum.test.js:9:24)</failure>
+    </testcase>
+    <testcase classname="sum handles bigint" name="sum handles bigint" time="0">
+      <skipped/>
+    </testcase>
+  </testsuite>
+</testsuites>

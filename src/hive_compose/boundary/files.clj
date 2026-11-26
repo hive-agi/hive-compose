@@ -20,6 +20,20 @@
   [path]
   (read-edn path :compose/profiles-unreadable nil))
 
+(defn path-state
+  "The filesystem's answer for `path` (the preflight's existence port,
+   `hive-compose.promote.config/Exists`): :present, :missing, or :unknown
+   when it cannot tell (permission denied, an IO or security error). Never
+   throws."
+  [path]
+  (try
+    (let [p (.toPath (io/file path))
+          no-opts (make-array java.nio.file.LinkOption 0)]
+      (cond (Files/exists p no-opts) :present
+            (Files/notExists p no-opts) :missing
+            :else :unknown))
+    (catch Exception _ :unknown)))
+
 (defn load-state
   "Result<{:active .. :current ..}> from the state file at `path`."
   [path]
@@ -42,8 +56,26 @@
                                           StandardCopyOption/ATOMIC_MOVE]))
       path)))
 
-(defn- persisted [st]
-  {:active (or (:active st) {}) :current (:current st)})
+(defn read-lock
+  "Result<Lock-or-nil> from the stack lockfile at `path`
+   (hive-compose.promote.stack/lock-path); nil when there is none."
+  [path]
+  (read-edn path :compose/lock-unreadable nil))
+
+(defn write-lock!
+  "Write lockfile value `lock` (hive-compose.promote.stack/lock) to `path`
+   atomically, creating its directory. Result<path>."
+  [path lock]
+  (let [res (save-state! path lock)]
+    (if (r/err? res) (assoc res :error :compose/lock-unwritable) res)))
+
+(defn- persisted
+  "What the state file holds: the active map, the current section and, once a
+   stack ran, the stack runs (`:stacks`, absent from older files)."
+  [st]
+  (cond-> {:active (or (:active st) {}) :current (:current st)}
+    (contains? st :stacks) (assoc :stacks (or (:stacks st) {}))
+    (contains? st :preexisting) (assoc :preexisting (or (:preexisting st) {}))))
 
 (defn sync-state!
   "Merge the live state with the file at `path` and write the merge.

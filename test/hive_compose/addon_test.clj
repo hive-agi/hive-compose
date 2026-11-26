@@ -5,7 +5,8 @@
             [clojure.test :refer [deftest is testing]]
             [hive-addon.protocol :as addon]
             [hive-compose.addon :as sut]
-            [hive-compose.stub :as stub]))
+            [hive-compose.stub :as stub]
+            [hive-compose.stub-runner :as stub-runner]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -32,6 +33,16 @@
     (is (= :new (:lifecycle @(:state a))))
     (is (nil? (:scheduler @(:state a))))))
 
+(deftest test-params-are-exactly-what-test-reads
+  (testing "PR #60 review M2: command-params \"test\" (what the API and Req_test accept) equals what test-opts reads"
+    (is (= sut/test-params (get sut/command-params "test")))
+    ;; every declared param, each with a value: a param test-opts reads shows
+    ;; up in the opts, one it ignores does not
+    (let [props (keys (get-in (sut/tool nil) [:inputSchema :properties]))
+          read-by (fn [p] (seq (#'sut/test-opts {p (if (#{"keep_up" "dry_run" "wait" "skip_fails"} p) true "x")})))]
+      (is (= sut/test-params (set (filter read-by props))))))
+  (is (contains? (get sut/command-params "test") "wait") "wait=false is no longer refused"))
+
 (deftest lifecycle-is-idempotent-and-stops-the-reaper
   (let [dir (temp-dir)
         a (sut/make-addon (config dir (stub/engine {})))]
@@ -43,6 +54,137 @@
       (addon/shutdown! a)
       (is (.isShutdown ^java.util.concurrent.ExecutorService sched))
       (is (= :down (:status (addon/health a)))))))
+
+(deftest claim-through-the-tool-renews-by-preset-id-and-takes-a-wave-ttl
+  (let [dir (temp-dir)
+        engine (stub/engine {"api" ["api" "db"]})
+        a (sut/make-addon (assoc (config dir engine) :compose/swarm? false))
+        ups #(count (filter (comp #{:up :restart :recreate} first) (stub/calls engine)))]
+    (addon/initialize! a {})
+    (try
+      (let [first-claim (call a {"command" "claim" "profile" "api" "agent" "ling-1"})]
+        (is (not (:error? first-claim)) (pr-str first-claim))
+        (is (contains? (:body first-claim) :started)))
+      (let [n (ups)]
+        (doseq [params [{"command" "claim" "profile" "api" "agent" "ling-2"}
+                        {"command" "claim" "target" "api" "agent" "ling-3"}
+                        {"command" "claim" "target" "api" "agent" "coordinator:f07f8867"
+                         "note" "pv01 gate" "ttl_minutes" 240}]]
+          (let [res (call a params)]
+            (is (not (:error? res)) (pr-str params res))
+            (is (:renewed (:body res)) (pr-str params))
+            (is (not (contains? (:body res) :started)))))
+        (is (= n (ups)) "a renewal, by profile= or target=, never calls up"))
+      (let [w (get-in (call a {"command" "who"}) [:body :sections 0 :claims :coordinator:f07f8867])]
+        (is (true? (:wave? w)))
+        (is (= "pv01 gate" (:note w))))
+      (testing "over the bound: refused, naming it"
+        (let [res (call a {"command" "claim" "target" "api" "agent" "coordinator:f07f8867"
+                           "note" "x" "ttl_minutes" 481})]
+          (is (:error? res))
+          (is (= "claim-ttl-over-max" (get-in res [:body :error])))
+          (is (= 480 (get-in res [:body :max])))))
+      (testing "release by target= id"
+        (let [res (call a {"command" "release" "target" "api" "agent" "ling-3"})]
+          (is (not (:error? res)) (pr-str res))))
+      (finally (addon/shutdown! a)))))
+
+(deftest stack-commands-drive-runs-and-persist-them
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"kafka" {"kafka" {}} "shop" {"api" {}}})
+        cfg (assoc (config dir engine)
+                   :compose/projects {"kafka" {:project/id "kafka" :project/dir "/w/kafka"
+                                               :project/provides {"kafka" {:service "kafka"}}}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"
+                                              :project/needs {"kafka" {}}}}
+                   :compose/stacks {"shop" {:stack/id "shop" :stack/consumers ["shop"]}})
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (let [up (call a {"command" "stack-up" "stack" "shop" "run" "shoprun1"})]
+        (is (not (:error? up)) (pr-str up))
+        (is (= "shoprun1" (:run (:body up)))))
+      (is (contains? (:stacks (edn/read-string (slurp (io/file dir "state.edn")))) "shoprun1")
+          "persisted beside :active")
+      (is (= ["shoprun1"] (map :run (:stacks (:body (call a {"command" "stack-status"}))))))
+      (is (string? (:text (:body (call a {"command" "plan" "stack" "shop"})))))
+      (is (not (:error? (call a {"command" "claim" "target" "stack:shoprun1" "agent" "ling-1"}))))
+      (testing "a restart keeps the run"
+        (addon/shutdown! a)
+        (addon/initialize! a {})
+        (is (= ["shoprun1"] (map :run (:stacks (:body (call a {"command" "stack-status"})))))))
+      (is (not (:error? (call a {"command" "release" "target" "stack:shoprun1" "agent" "ling-1"}))))
+      (let [down (call a {"command" "stack-down" "run" "shoprun1"})]
+        (is (not (:error? down)) (pr-str down)))
+      (is (= #{} (stub/running engine "kafka")))
+      (is (empty? (:stacks (edn/read-string (slurp (io/file dir "state.edn"))))))
+      (is (:error? (call a {"command" "stack-up" "stack" "nope"})))
+      (finally (addon/shutdown! a)))))
+
+(deftest projects-and-plan-name-a-configured-project-that-is-gone
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"shop" {"api" {}}})
+        cfg (assoc (config dir engine)
+                   :compose/projects {"gone" {:project/id "gone" :project/dir "/w/gone"}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"}}
+                   :compose/stacks {"s" {:stack/id "s" :stack/consumers ["gone" "shop"]}}
+                   ;; the injected existence port: /w/gone is not there
+                   :compose/exists? #{"/w/shop" "/w/shop/compose.yaml"})
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (let [res (call a {"command" "projects"})
+            gone (first (filter #(= "gone" (:name %)) (:body res)))]
+        (is (not (:error? res)) (pr-str res))
+        (is (= "missing" (:status gone)))
+        ;; JSON writes a keyword by its name, as the error envelopes do
+        (is (= {:reason "project-missing" :project "gone" :missing "dir" :paths ["/w/gone"]}
+               (get-in gone [:configured 0 :problem]))))
+      (let [plan (:body (call a {"command" "plan" "stack" "s"}))]
+        (is (= ["gone"] (map :project (:problems plan))) (pr-str plan)))
+      (finally (addon/shutdown! a)))))
+
+(deftest a-throwing-exists-port-never-breaks-projects-or-plan
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"shop" {"api" {}}})
+        a (sut/make-addon (assoc (config dir engine)
+                                 :compose/projects {"shop" {:project/id "shop" :project/dir "/w/shop"}}
+                                 :compose/stacks {"s" {:stack/id "s" :stack/consumers ["shop"]}}
+                                 :compose/exists? (fn [_] (throw (SecurityException. "denied")))))]
+    (addon/initialize! a {})
+    (try
+      (let [res (call a {"command" "projects"})]
+        (is (not (:error? res)) (pr-str res))
+        (is (= #{"project-unreadable"} (set (keep #(get-in % [:configured 0 :problem :reason]) (:body res))))))
+      (let [plan (call a {"command" "plan" "stack" "s"})]
+        (is (= ["project-unreadable"] (map :reason (:problems (:body plan)))) (pr-str plan)))
+      (finally (addon/shutdown! a)))))
+
+(deftest test-command-runs-the-suite-matrix
+  (let [dir (temp-dir)
+        engine (stub/engine {} {} {"pg" {"db" {}} "shop" {"api" {}}})
+        runner (stub-runner/suite-runner {"smoke/shop" {:exit 1 :passed 1 :failed 1}})
+        cfg (assoc (config dir engine)
+                   :compose/suite-runner runner
+                   :compose/projects {"pg" {:project/id "pg" :project/dir "/w/pg"
+                                            :project/provides {"postgres" {:service "db"}}}
+                                      "shop" {:project/id "shop" :project/dir "/w/shop"
+                                              :project/needs {"postgres" {}}}}
+                   :compose/suites [{:suite/id "smoke" :suite/command "make e2e" :suite/projects ["shop"]}])
+        a (sut/make-addon cfg)]
+    (addon/initialize! a {})
+    (try
+      (is (contains? (:commands (:body (call a {"command" "help"}))) :test))
+      (let [dry (call a {"command" "test" "suites" "smoke" "projects" "shop" "run" "dry001" "dry_run" true})]
+        (is (not (:error? dry)) (pr-str dry))
+        (is (= ["make e2e"] (map :command (:runners (:body dry)))))
+        (is (empty? (stub-runner/suite-runs runner)) "dry_run starts nothing"))
+      (let [res (call a {"command" "test" "suites" "smoke" "run" "ci001"})]
+        (is (not (:error? res)) (pr-str res))
+        (is (= ["failed" 1 true] ((juxt :status :exit :stack-kept?) (:body res))))
+        (is (contains? (:stacks (edn/read-string (slurp (io/file dir "state.edn")))) "ci001")
+            "a failed matrix stays up, recorded"))
+      (finally (addon/shutdown! a)))))
 
 (deftest tool-drives-profiles-and-persists-state
   (let [dir (temp-dir)
@@ -80,6 +222,27 @@
     (try
       (is (= ["blog"] (:adopted (sut/tick! a))))
       (is (nil? (:adopted (sut/tick! a))) "adoption runs once")
+      (finally (addon/shutdown! a)))))
+
+(deftest flaky-ranks-runs-recorded-through-the-hook
+  (let [dir (temp-dir)
+        a (sut/make-addon (config dir (stub/engine {})))
+        record! (:compose/record-run! (addon/hooks a))]
+    (is (= :compose/not-initialized (:error (record! {:run/id "run-0" :suite/id "api"}))))
+    (addon/initialize! a {})
+    (try
+      (doseq [[i s] (map-indexed vector [:passed :failed :passed :failed])]
+        (is (= 2 (:appended (:ok (record! {:run/id (str "run" i) :suite/id "api" :project "shop"
+                                           :exit 0
+                                           :report {:report/cases [{:case/id "api/T.flap" :case/status s}]}}))))))
+      (is (.exists (io/file dir "flake-history.ednl")) "the history lives beside the state file")
+      (let [{:keys [error? body]} (call a {"command" "flaky" "suite" "api" "limit" 5})]
+        (is (not error?))
+        (is (= ["api/T.flap" "api/(run)"] (mapv :case (:cases body))))
+        (is (= "flaky" (:class (first (:cases body))))))
+      (is (= 1 (count (:cases (:body (call a {"command" "flaky" "suite" "api" "limit" 0})))))
+          "a limit below 1 still answers one case")
+      (is (= 0 (:total (:body (call a {"command" "flaky" "project" "blog"})))))
       (finally (addon/shutdown! a)))))
 
 (deftest reload-reads-the-config-declared-now

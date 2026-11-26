@@ -18,9 +18,13 @@
    released. A program that fails to start is reported, never fatal."
   (:require [hive-compose.port :as port]
             [hive-compose.promote.config :as config]
+            [hive-compose.promote.ownership :as ownership]
             [hive-compose.promote.plan :as plan]
             [hive-compose.promote.profile :as profile]
             [hive-compose.promote.program :as program]
+            [hive-compose.promote.stack :as stack]
+            [hive-compose.promote.stack-run :as stack-run]
+            [hive-compose.promote.swarm :as swarm]
             [hive-compose.promote.target :as target]
             [hive-dsl.result :as r]
             [clojure.string :as str]))
@@ -41,9 +45,22 @@
 
 (defn lookup
   "Result<Profile> for `id`: the configured preset, else the snapshot an active
-   entry (a preset or a section) ran with."
+   entry (a preset or a section) ran with. The snapshot of a section whose
+   project is still configured is re-based on the project as configured now, so
+   a release that follows a restart interpolates the files it names with the
+   variables they need. What the snapshot's env says wins over the project's.
+   A configured preset that is active keeps the env a call gave it
+   (:profile/call-env of its snapshot), so a later up, restart or reaper pass
+   never falls back to weaker env."
   [ctx id]
-  (if-let [p (or (configured ctx id) (:profile (active-entry ctx id)))]
+  (if-let [p (or (when-let [c (configured ctx id)]
+                   (target/with-call-env c (get-in (active-entry ctx id) [:profile :profile/call-env])))
+                 (when-let [snap (:profile (active-entry ctx id))]
+                   (let [[pid section?] (str/split id #"/" 2)
+                         proj (get-in ctx [:settings :compose/projects pid])]
+                     (if (and section? proj)
+                       (target/rebase-section nil proj snap)
+                       snap))))]
     (r/ok p)
     (r/err :compose/unknown-profile
            {:profile id :known (vec (sort (keys (get-in ctx [:settings :compose/profiles]))))})))
@@ -52,20 +69,25 @@
   "Result<[service] | nil>: what `nm` stands for in project `proj`: itself when
    it is a service, the members of the native profile when it is one, nil when
    the project defines neither. `env` is the call's own, added to the
-   project's for these compose queries too."
+   project's for these compose queries too. A project with no compose project
+   (:project/compose? false) is asked nothing: its id or one of its program
+   ids names its section, which runs no service."
   [engine proj nm env]
   (let [whole (cond-> (target/project-profile proj)
                 (seq env) (update :profile/env merge env))]
-    (r/let-ok [profiles (port/-profiles engine whole)]
-      (if (contains? profiles nm)
-        (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
-                   always (port/-listed engine whole)]
-          (r/ok (target/profile-members with always)))
-        (let [c (port/-closure engine (assoc whole :profile/services [nm]))]
-          (cond
-            (r/ok? c) (r/ok [nm])
-            (target/unknown-service? c) (r/ok nil)
-            :else c))))))
+    (if (program/programs-only? whole)
+      (r/ok (when (contains? (into #{(:project/id proj)} (map :program/id) (:project/programs proj)) nm)
+              []))
+      (r/let-ok [profiles (port/-profiles engine whole)]
+        (if (contains? profiles nm)
+          (r/let-ok [with (port/-listed engine (assoc whole :profile/compose-profiles [nm]))
+                     always (port/-listed engine whole)]
+            (r/ok (target/profile-members with always)))
+          (let [c (port/-closure engine (assoc whole :profile/services [nm]))]
+            (cond
+              (r/ok? c) (r/ok [nm])
+              (target/unknown-service? c) (r/ok nil)
+              :else c)))))))
 
 (defn- expand-names
   "Result<[service] | nil> for all `names` in `proj`; nil when one is unknown there."
@@ -126,6 +148,189 @@
                      fresh))
     (seq id) (lookup ctx id)
     :else (r/err :compose/missing-param {:param "profile or target"})))
+
+(defn- peeled
+  "`p` (as `lookup` answers it for `id`) with its remembered call env taken
+   off :profile/env, so a var a call forgets falls back to what `id` declares."
+  [ctx id p]
+  (target/peel-call-env p (target/declared-env (:settings ctx) id (:profile/inputs-from p))))
+
+(defn- dir-exists?
+  "Whether `dir` exists, through the engine's IDirProbe; an engine without
+   one counts every dir as present."
+  [ctx dir]
+  (let [e (:engine ctx)]
+    (if (satisfies? port/IDirProbe e) (boolean (port/-dir-exists? e dir)) true)))
+
+(defn- holder-of
+  "{:holder Profile :section id} | {:none true} | {:disagree [..]}: the active
+   section other than `self` whose compose inputs a call on `services` of
+   compose project `project` runs with (`promote.ownership/pick-holder`), its
+   remembered call env peeled off. `only` narrows to one section id."
+  [ctx self project services only]
+  (let [active (dissoc (:active @(:state ctx)) self)
+        pick (ownership/pick-holder active project services (when-not (= only self) only))
+        h (:holder pick)]
+    (cond
+      (nil? h) pick
+      ;; its checkout was removed: it says nothing about where a recreate comes from
+      (and (:profile/dir h) (not (dir-exists? ctx (:profile/dir h))))
+      {:none true :holder-skipped {:section (:section pick) :dir (:profile/dir h)
+                                   :reason "its dir no longer exists"}}
+      :else (assoc pick :holder (peeled ctx (:section pick) h)))))
+
+(defn effective-subject
+  "Result<{:profile Profile :section holder-id-or-nil :holder-skipped ..}>:
+   the subject of an engine-reaching call (up, switch, restart; claim's start)
+   with the compose inputs it must run with, through
+   `promote.target/effective-profile`:
+   - `id` (profile=): the preset or active snapshot (`lookup`), its remembered
+     call env re-applied under this call's `env`;
+   - `target`, ACTIVE: its own snapshot is its holder (the dir, files and env
+     it was created from, its remembered call env), unless its inputs are
+     only assumed (an adoption nothing explained), when the active section
+     holding its services decides as below;
+   - `target`, not active: the section resolved from the project as configured
+     now, re-addressed at the active section that holds the services it names
+     (orphaned ones too: they still run that code), whose dir, files and env
+     it then uses and whose id it records under :profile/inputs-from. A holder
+     whose dir no longer exists is skipped (:holder-skipped names it). Holders
+     that disagree are :compose/holders-disagree naming them; `id` beside a
+     target names the one to use. Held by none: the project defaults.
+   `env` is this call's env; a nil value forgets that var. :section names the
+   holder the call ran from, nil when none."
+  [ctx {:keys [target id env]}]
+  (if-not (seq target)
+    (r/let-ok [p (subject ctx {:id id})]
+      (r/ok {:profile (target/effective-profile (peeled ctx id p) {:call-env env})}))
+    (r/let-ok [p0 (subject ctx {:target target :env (target/set-values env)})]
+      (let [sid (:profile/id p0)
+            entry (active-entry ctx sid)
+            own (:profile entry)
+            services (vec (:profile/services p0))
+            self? (and own (not= :assumed (:inputs entry)) (or (nil? id) (= id sid)))]
+        (if self?
+          ;; an active section is its own holder: what it was created from
+          (r/ok {:profile (assoc (target/effective-profile (peeled ctx sid own) {:call-env env})
+                                 :profile/services services)})
+          (let [p (cond-> (peeled ctx sid p0) (seq (:profile/call-env own)) (assoc :profile/call-env (:profile/call-env own)))
+                pick (holder-of ctx sid (profile/project p) services id)
+                skipped (:holder-skipped pick)]
+            (cond
+              (:holder pick) (r/ok {:profile (assoc (target/effective-profile p {:holder (:holder pick) :call-env env})
+                                                    :profile/services services
+                                                    :profile/inputs-from (:section pick))
+                                    :section (:section pick)})
+              (:disagree pick) (r/err :compose/holders-disagree
+                                      {:target sid :services services :holders (:disagree pick)
+                                       :message (str "the active sections holding " (str/join ", " services)
+                                                     " run with different compose inputs: "
+                                                     (str/join ", " (map :section (:disagree pick))))
+                                       :hint "name the section to run from with profile=<id>"})
+              (and id (not= id sid) (not skipped)) (r/err :compose/not-a-holder
+                                                          {:profile id :services services
+                                                           :hint (str id " holds none of " (str/join ", " services))})
+              :else (r/ok (cond-> {:profile (target/effective-profile p {:call-env env})}
+                            skipped (assoc :holder-skipped skipped))))))))))
+
+(defn claim-call
+  "The `effective-subject` call of a claim on section `p` (as
+   `section-subject` resolved it from target `tgt` / profile `id`): by id when
+   `p` is active or a preset, else by the target, so a claim that starts or
+   adopts it uses the inputs an up would."
+  [ctx p tgt id]
+  (let [sid (:profile/id p)]
+    (if (or (active-entry ctx sid) (configured ctx sid))
+      {:id sid}
+      {:target tgt :id id})))
+
+(defn adopt-profile
+  "{:profile Profile :assumed? bool}: what section `p`, found running but not
+   tracked, is recorded as having been started from. The active section that
+   holds its services says (its dir, files and env, through
+   `promote.target/effective-profile`); with none, or holders that disagree,
+   nothing is known and `p` is recorded as an assumption."
+  [ctx p]
+  (let [services (vec (:profile/services p))
+        pick (when (seq services)
+               (holder-of ctx (:profile/id p) (profile/project p) services nil))]
+    (if-let [h (:holder pick)]
+      {:profile (assoc (target/effective-profile p {:holder h}) :profile/services services)
+       :assumed? false}
+      {:profile p :assumed? true})))
+
+(defn remember-call-env!
+  "Active entry `id` remembers call env `env` (a nil value forgets that var),
+   as after an up: what a recreate ran with is what the section runs with.
+   Nothing when `id` is not active or `env` is empty."
+  [ctx id env]
+  (when-let [snap (and (seq env) (:profile (active-entry ctx id)))]
+    (swap! (:state ctx) update-in [:active id :profile]
+           target/remember-call-env env (target/declared-env (:settings ctx) id (:profile/inputs-from snap)))
+    (persist! ctx)))
+
+(defn inputs-known!
+  "A recreate of active entry `id` ran with Profile `p`: when its inputs were
+   only assumed, they are now `p`'s (its services kept), no longer assumed."
+  [ctx id p]
+  (when (= :assumed (get-in @(:state ctx) [:active id :inputs]))
+    (swap! (:state ctx) update-in [:active id]
+           (fn [a] (-> a
+                       (dissoc :inputs)
+                       (assoc :profile (cond-> (assoc p :profile/id id)
+                                         (get-in a [:profile :profile/services])
+                                         (assoc :profile/services (get-in a [:profile :profile/services])))))))
+    (persist! ctx)))
+
+(defn drop-stale-call-env!
+  "After a reload from Settings `old` to the ones in `ctx`: in every active
+   entry, forget the remembered call env keys whose DECLARED value (preset
+   env, or the project env of a section) changed, since the edit is the
+   newer intent (`promote.target/stale-call-env-keys`). Answers {id [key]}
+   of what was dropped."
+  [ctx old]
+  (let [new (:settings ctx)
+        dropped (into (sorted-map)
+                      (for [[id a] (:active @(:state ctx))
+                            :let [ce (get-in a [:profile :profile/call-env])
+                                  from (get-in a [:profile :profile/inputs-from])
+                                  ks (when (seq ce)
+                                       (target/stale-call-env-keys (target/declared-env old id from)
+                                                                   (target/declared-env new id from) ce))]
+                            :when (seq ks)]
+                        [id ks]))]
+    (when (seq dropped)
+      (swap! (:state ctx) update :active
+             (fn [m] (reduce-kv (fn [m id ks]
+                                  (update-in m [id :profile] target/forget-call-env ks
+                                             (target/declared-env new id (get-in m [id :profile :profile/inputs-from]))))
+                                m dropped)))
+      (persist! ctx))
+    dropped))
+
+(defn section-subject
+  "Result<Profile> for claim and release, which name a section that usually
+   runs already: `target` is first an ACTIVE section id (flow-payment,
+   dc/api), then a preset id, and only then a target resolved as `subject`
+   does (services or native profiles). `id` (profile=) works as in
+   `subject`. So `claim target=flow-payment` finds the preset section the
+   way `claim profile=flow-payment` does, instead of asking compose for a
+   service of that name."
+  [ctx {:keys [target] :as call}]
+  (let [known? #(or (active-entry ctx %) (configured ctx %))
+        {:keys [project names]} (when (seq target) (target/parse target))
+        ;; dc/flow-payment: a preset or active id behind its compose project
+        named (when (and project (= 1 (count names)) (known? (first names)))
+                (let [id (first names)
+                      p (:ok (lookup ctx id))
+                      proj (get-in ctx [:settings :compose/projects project])]
+                  (when (and p (contains? (set (remove nil? [project (some-> proj target/project-profile profile/project)]))
+                                          (profile/project p)))
+                    id)))]
+    (cond
+      (and (seq target) (known? target)) (lookup ctx target)
+      named (lookup ctx named)
+      :else (subject ctx call))))
 
 (defn rebase-sections!
   "After the configured projects changed from `old-projects` to the ones in
@@ -249,6 +454,14 @@
             {:held {} :report []}
             (program/wanted (:profile/programs p) services))))
 
+(defn start-section-programs!
+  "{:held {program-id Running} :report [..]}: start the host programs `p`
+   pairs with `services`, reusing the live ones its project's sections hold.
+   Host only: nothing is asked of the engine. For a section taken as it runs
+   (a claim's adopt), which never goes through `bring-up!`."
+  [ctx p services]
+  (start-programs! ctx p services (live-programs ctx (profile/project p))))
+
 (defn- stop-programs!
   "Stop the programs only active entry `id` holds, those in `keep` spared.
    Answers one report row per program."
@@ -262,9 +475,12 @@
     []))
 
 (defn- execute-once! [{:keys [engine]} p {:keys [action services]}]
-  (case action
-    :stop (port/-stop! engine p services)
-    :down (port/-down! engine p services)))
+  (if (program/programs-only? p)
+    ;; no compose project: docker has nothing to release, only programs stop
+    (r/ok {:out "" :skipped :no-compose})
+    (case action
+      :stop (port/-stop! engine p services)
+      :down (port/-down! engine p services))))
 
 (def ^:private no-such-service "no such service: ")
 
@@ -278,7 +494,30 @@
       (when i
         (first (str/split-lines (str/trim (subs s (+ i (count no-such-service))))))))))
 
-(defn- execute!
+(def ^:private missing-variable-re #"required variable (\S+) is missing a value")
+
+(defn missing-variable
+  "The variable compose named in a `required variable <name> is missing a
+   value` refusal, nil for any other result."
+  [res]
+  (when (r/err? res)
+    (second (re-find missing-variable-re (str (:stderr res))))))
+
+(defn adopted-section?
+  "True when `id` names the section adopt! keeps strays of a project in."
+  [id]
+  (str/ends-with? (str id) "/adopted"))
+
+(defn- by-name? [{:keys [engine]}]
+  (satisfies? port/IContainerControl engine))
+
+(defn- execute-by-name!
+  "Run Release `step` on `p` by container name: no compose file is loaded."
+  [{:keys [engine]} p {:keys [action services]}]
+  (r/map-ok (port/-stop-containers! engine p services action)
+            #(assoc % :by :container-name)))
+
+(defn- execute-by-service!
   "Run Release `step` on `p`. A service compose no longer defines (a stale
    snapshot: an adopted section, a file edited since) is dropped and the
    step retried, so one unknown name never keeps the rest running. Answers
@@ -293,6 +532,34 @@
             (r/ok {:out "" :skipped :no-services :unknown (conj dropped svc)})
             (recur (assoc step :services left) (conj dropped svc))))
         (cond-> res (and (seq dropped) (r/ok? res)) (update :ok assoc :unknown dropped))))))
+
+(defn- execute!
+  "Run Release `step` on `p`. An adopted section is released by container
+   name when the engine can: its strays may come from a compose file its
+   project does not name, so compose would refuse them as unknown services.
+   Any other section goes through compose; when compose cannot load the
+   project's files because a variable is unset, the step falls back to
+   container names and the answer names the variable under :missing-env, so
+   one unset variable never keeps a section running pass after pass.
+   Services a live stack run's instances keep alive (`:stacks` in the state,
+   hc-6) are spared, so no section release stops a stack's shared service."
+  [ctx p step0]
+  (let [{id :profile/id :as step}
+        (stack-run/spare-stack-held
+         step0 (stack/stack-held (into {} (map (fn [[k e]] [k (:plan e)])) (:stacks @(:state ctx)))))]
+    (cond-> (if (and (adopted-section? id) (by-name? ctx))
+              (execute-by-name! ctx p step)
+              (let [res (execute-by-service! ctx p step)
+                    var (missing-variable res)]
+                (cond
+                  (nil? var) res
+                  (by-name? ctx) (r/map-ok (execute-by-name! ctx p step) #(assoc % :missing-env var))
+                  :else (assoc res :missing-env var
+                               :hint (str var " is unset: set it in the project's :project/env")))))
+      (not= (:kept step) (:kept step0))
+      (r/map-ok #(assoc % :stack-kept (into (sorted-map)
+                                            (map (fn [s] [s [[:stack]]]))
+                                            (remove (set (:services step)) (:services step0))))))))
 
 (defn- forget [st id]
   (-> st
@@ -316,7 +583,12 @@
 (defn- step-report [{:keys [result] :as step}]
   (cond-> (-> step (dissoc :result) (assoc :ok? (r/ok? result)))
     (r/err? result) (assoc :error result)
-    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))))
+    (get-in result [:ok :unknown]) (assoc :unknown (get-in result [:ok :unknown]))
+    (get-in result [:ok :by]) (assoc :by (get-in result [:ok :by]))
+    (get-in result [:ok :stack-kept]) (-> (update :kept (fnil merge (sorted-map)) (get-in result [:ok :stack-kept]))
+                                          (update :services #(vec (remove (set (keys (get-in result [:ok :stack-kept]))) %))))
+    (or (:missing-env result) (get-in result [:ok :missing-env]))
+    (assoc :missing-env (or (:missing-env result) (get-in result [:ok :missing-env])))))
 
 ;; ---------------------------------------------------------------------------
 ;; operations on a Profile
@@ -390,7 +662,9 @@
    pull in the optional dependencies the closure left out."
   [ctx p services needs carried pin?]
   (let [id (:profile/id p)]
-    (r/let-ok [out (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services)]
+    (r/let-ok [out (if (program/programs-only? p)
+                     (r/ok {:out ""})
+                     (port/-up! (:engine ctx) (cond-> p pin? (assoc :profile/no-deps? true)) services))]
       (let [now ((:now ctx))
             {:keys [held report]} (start-programs! ctx p services carried)
             wider (seq (remove (set services) needs))]
@@ -411,9 +685,14 @@
 (defn up-profile!
   "Bring `p` up alongside whatever is active. Becomes current when nothing is.
    A depends_on entry marked `required: false` is neither built nor started;
-   it is only needed when already running."
+   it is only needed when already running. A profile with no compose project
+   (`program/up-mode` :programs-only) asks compose nothing: it goes through
+   the same bring-up with no service, so only its programs start."
   [ctx p]
-  (r/let-ok [{:keys [start needs pin?]} (up-plan ctx p)
+  (r/let-ok [mode (program/up-mode p)
+             {:keys [start needs pin?]} (if (= :programs-only mode)
+                                          (r/ok {:start [] :needs [] :pin? false})
+                                          (up-plan ctx p))
              up (bring-up! ctx p (profile/up-services p start) needs
                            (live-programs ctx (profile/project p)) pin?)]
     (swap! (:state ctx) update :current #(or % (:profile/id p)))
@@ -450,7 +729,9 @@
         active (:active @(:state ctx))]
     (r/let-ok [services (if-let [a (get active id)]
                           (r/ok (:services a))
-                          (port/-closure (:engine ctx) p))]
+                          (if (program/programs-only? p)
+                            (r/ok [])
+                            (port/-closure (:engine ctx) p)))]
       (let [step (plan/down-release active id (profile/project p) services action)
             res (execute! ctx p step)
             stopped (when (r/ok? res) (stop-programs! ctx id #{}))]
@@ -490,20 +771,27 @@
   (when (active-entry ctx (:profile/id p)) (touch! ctx (:profile/id p))))
 
 (defn ps-profile
-  "Result<{:profile :needs :running}> for `p`; touches it when active."
+  "Result<{:profile :needs :running}> for `p`; touches it when active. A
+   profile with no compose project needs and runs no service."
   [ctx p]
-  (r/let-ok [needs (port/-closure (:engine ctx) p)
-             running (port/-running (:engine ctx) p)]
+  (r/let-ok [needs (if (program/programs-only? p) (r/ok []) (port/-closure (:engine ctx) p))
+             running (if (program/programs-only? p) (r/ok #{}) (port/-running (:engine ctx) p))]
     (touch-if-active! ctx p)
     (r/ok {:profile (:profile/id p) :project (profile/project p) :needs needs
            :running (vec (filter (set running) needs))})))
 
 (defn logs-profile
-  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active."
+  "Result<{:out}>: the last `tail` log lines of `p`; touches it when active.
+   A profile with no compose project has no container log to read and asks
+   docker nothing: :compose/programs-only (its programs log under the log dir)."
   [ctx p tail]
-  (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
-    (touch-if-active! ctx p)
-    (r/ok out)))
+  (if (program/programs-only? p)
+    (r/err :compose/programs-only
+           {:profile (:profile/id p) :verb :logs
+            :hint "no compose project, so no container logs; its programs log to files under :compose/log-dir"})
+    (r/let-ok [out (port/-logs (:engine ctx) p (or (:profile/services p) []) tail)]
+      (touch-if-active! ctx p)
+      (r/ok out))))
 
 ;; ---------------------------------------------------------------------------
 ;; the same by preset or active id
@@ -522,6 +810,7 @@
    the addon), stopping the programs they alone hold. Answers the forgotten ids."
   [ctx]
   (let [dropped (vec (for [[id a] (:active @(:state ctx))
+                           :when (not (program/programs-only? (:profile a)))
                            :let [running (r/bind (lookup ctx id) #(port/-running (:engine ctx) %))]
                            :when (and (r/ok? running) (not-any? (:ok running) (:services a)))]
                        id))]
@@ -532,12 +821,23 @@
       (persist! ctx))
     dropped))
 
+(defn- reap-step!
+  "Release one reaper `step`, answering its report row. A throw is that
+   section's error, never the pass's: the other sections are still reaped."
+  [ctx step]
+  (try
+    (step-report (release! ctx step))
+    (catch Throwable t
+      (assoc step :ok? false :error (r/err :compose/release-threw {:message (str t)})))))
+
 (defn reap!
-  "One reaper pass: reconcile, then release every idle profile."
+  "One reaper pass: reconcile, then release every idle profile. Each section
+   answers its own row: one that cannot be released (an unset variable, a
+   throw) is reported with why and the rest are still reaped."
   [ctx]
   (let [reconciled (reconcile! ctx)
         steps (plan/reap-releases (:settings ctx) ((:now ctx)) (:active @(:state ctx)))
-        reaped (mapv #(step-report (release! ctx %)) steps)]
+        reaped (mapv #(reap-step! ctx %) steps)]
     (when (seq reaped) (persist! ctx))
     {:reconciled reconciled :reaped reaped}))
 
@@ -579,11 +879,16 @@
         now ((:now ctx))
         presets (vec (for [[id p] (sort-by key (:compose/profiles settings))
                            :when (not (active-entry ctx id))
+                           ;; no compose project: nothing runs in docker to adopt
+                           :when (not (program/programs-only? p))
                            :let [closure (port/-closure engine p)]
                            :when (r/ok? closure)
                            :let [running (port/-running engine p)]
-                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))]
-                       (adopt-entry p (:ok closure) now)))
+                           :when (and (r/ok? running) (some (:ok running) (:ok closure)))
+                           ;; what a holder says it runs from, else assumed
+                           :let [{p' :profile assumed? :assumed?} (adopt-profile ctx p)]]
+                       (cond-> (adopt-entry p' (:ok closure) now)
+                         assumed? (assoc :inputs :assumed))))
         _ (swap! (:state ctx) update :active into (map (juxt :profile/id identity)) presets)
         owned (fn [project taken]
                 (into #{} (comp (filter #(= project (:project %))) (mapcat :services))
@@ -591,16 +896,25 @@
         strays (reduce (fn [taken [_ proj]]
                          (let [whole (target/project-profile proj)
                                running (port/-running engine whole)
+                               ;; what a live stack run holds is the run's, never a stray
+                               held (get (stack/stack-held (into {} (map (fn [[k e]] [k (:plan e)]))
+                                                                 (:stacks @(:state ctx))))
+                                         (profile/project whole) #{})
                                unowned (when (r/ok? running)
-                                         (vec (remove (owned (profile/project whole) taken) (:ok running))))]
+                                         (vec (remove (some-fn (owned (profile/project whole) taken) held)
+                                                      (:ok running))))]
                            (if (seq unowned)
                              (let [closure (port/-closure engine (assoc whole :profile/services unowned))
                                    needs (if (r/ok? closure) (:ok closure) unowned)]
-                               (conj taken (adopt-entry (target/section proj ["adopted"] unowned)
-                                                        unowned needs now)))
+                               ;; nothing says which checkout a stray came from
+                               (conj taken (assoc (adopt-entry (target/section proj ["adopted"] unowned)
+                                                               unowned needs now)
+                                                  :inputs :assumed)))
                              taken)))
                        []
-                       (sort-by key (:compose/projects settings)))
+                       ;; a project with no compose project has no stray container
+                       (remove (comp program/programs-only? target/project-profile val)
+                               (sort-by key (:compose/projects settings))))
         adopted (into presets strays)]
     (when (seq strays)
       (swap! (:state ctx) update :active
@@ -636,7 +950,9 @@
   (into (sorted-map)
         (for [[id proj] (get-in ctx [:settings :compose/projects])
               :let [whole (target/project-profile proj)
-                    res (port/-listed (:engine ctx) whole)]]
+                    res (if (program/programs-only? whole)
+                          (r/ok [])
+                          (port/-listed (:engine ctx) whole))]]
           [id (cond-> {:compose-project (profile/project whole) :ok? (r/ok? res)}
                 (r/err? res) (assoc :error (select-keys res [:error :exit :stderr])))])))
 
@@ -663,14 +979,19 @@
                          :idle-action (profile/idle-action settings p)
                          :activity (vec (sort (profile/activity (merge config/defaults settings) p)))}
                   (:profile/description p) (assoc :description (:profile/description p))
+                  ;; the checkout, files and env NAMES the section runs with (values of *_SRC only)
+                  (:profile a) (merge (target/inputs-summary (:profile a)))
+                  ;; adopted running with nothing to say how it was started
+                  (= :assumed (:inputs a)) (assoc :inputs "assumed")
+                  (get-in a [:profile :profile/inputs-from]) (assoc :inputs-from (get-in a [:profile :profile/inputs-from]))
                   bad (assoc :config-ok? false :config-project bad)
                   a (assoc :services (:services a)
                            :idle-seconds (quot (- now (:last-touch a)) 1000)
                            :reap-in-seconds (max 0 (quot (- (+ (:last-touch a) ttl) now) 1000)))
                   (and a bad) (assoc :reap-blocked? true)
-                  (seq (:claims a)) (assoc :claims (into (sorted-map)
-                                                         (map (fn [[k c]] [k (select-keys c [:note :since :seen])]))
-                                                         (:claims a)))
+                  (seq (:claims a)) (assoc :claims (swarm/claims-view (:claims a) now
+                                                                      (* 60000 (or (:compose/claim-ttl-minutes settings)
+                                                                                   (:compose/claim-ttl-minutes config/defaults)))))
                   (:orphaned-at a) (assoc :orphaned? true)
                   (:usage a) (assoc :usage (:usage a)
                                     :in-use-via (get-in a [:usage :sources] []))
@@ -717,8 +1038,9 @@
   (let [engine (:engine ctx)]
     (reduce (fn [acc [id proj]]
               (let [whole (target/project-profile proj)
-                    x (r/let-ok [services (port/-listed engine whole)
-                                 profiles (port/-profiles engine whole)]
+                    none? (program/programs-only? whole)
+                    x (r/let-ok [services (if none? (r/ok []) (port/-listed engine whole))
+                                 profiles (if none? (r/ok #{}) (port/-profiles engine whole))]
                         (r/ok {:project id :always-on services :profiles (vec (sort profiles))}))]
                 (if (r/err? x)
                   (reduced (assoc x :project id))

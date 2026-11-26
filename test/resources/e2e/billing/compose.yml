@@ -1,0 +1,34 @@
+# billing fixture ("project B"): Kafka consumer -> in-memory invoices,
+# traced via OpenTelemetry configured only from OTEL_* env vars.
+#
+# The project name comes from `docker compose -p <name>`, so the same file
+# serves project B (shared kafka) and project C (a second billing instance
+# pointed at its own kafka through KAFKA_BOOTSTRAP / TOPIC_PREFIX /
+# BILLING_PORT). No container_name and no hardcoded endpoints: every
+# connection target is passed in from the caller's environment.
+
+services:
+  billing:
+    build: .
+    image: hive-compose-e2e/billing:dev
+    ports:
+      - "${BILLING_PORT:-0}:8080"
+    environment:
+      # Passed through from the host only when set there.
+      - KAFKA_BOOTSTRAP
+      - TOPIC_PREFIX
+      - KAFKA_GROUP_ID
+      - HIVE_RUN_ID
+      - OTEL_EXPORTER_OTLP_ENDPOINT
+      - OTEL_RESOURCE_ATTRIBUTES
+      - OTEL_TRACES_EXPORTER
+      - OTEL_PROPAGATORS
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-billing}
+    # SIGTERM flushes spans; leave room past the app's own 10s hard exit.
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s

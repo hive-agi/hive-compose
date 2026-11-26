@@ -224,6 +224,25 @@ releases it.
 project's `:project/env` from the addon config, so repeat in `:profile/env` every
 value the preset's services need.
 
+Precedence, weakest to strongest: `:project/env` (target sections only) <
+`:profile/env` < the `env` of a call. The env a call gave (`up`, `switch`, a
+recreating `restart`) is remembered by the section (`:profile/call-env` in the
+state file, `pass` references kept as references), so a later `up` (by target
+or profile), `restart` or reaper pass of the same section never falls back to
+weaker env; `status` lists those vars as `call-env-keys`. `env={"VAR": null}`
+forgets VAR (a no-op when it is not remembered), and a `reload` that changes
+VAR's declared value (preset or project env) forgets it too, reporting
+`call-env-dropped {section [VAR]}`. An in-place `restart` recreates nothing, so
+its env is not remembered. `restart target=<svc>` (and `up`/`switch target=`
+of a section not yet active) of a service an active section holds, orphaned or
+not, runs with that section's dir, files and env, and a recreate's env is
+remembered by that section; when several hold it with different inputs the
+call is refused (`holders-disagree`, naming them) and `profile=<id>` picks one.
+`status` shows an active section's `dir`, `files`, `env-keys` (names only) and
+`env-src` (the value of each `*_SRC` variable that looks like a path, the
+checkout under test). An `allow_shared` answer says per shared service whether
+the engine `recreated`, `kept`, `created` it or left it `absent`.
+
 ## Safety
 
 - Only sections the addon started or adopted are ever reaped. Adoption covers
@@ -235,6 +254,64 @@ value the preset's services need.
   whole project).
 - The active map lives in `~/.local/state/hive-compose/state.edn`, so a restart
   still reaps what it started.
+- `up`, `switch` and `restart` refuse while orphans of a dead rootless docker
+  daemon still hold the section's docker volumes or host ports. An orphan is a
+  container process (subuid range, or a `docker-<id>.scope` cgroup) whose
+  parent is `systemd --user` and that no running container owns. The refusal
+  names each orphan with its pids, because recreating the service would run a
+  second copy on the same volume, e.g. two postmasters on one data dir.
+  `allow_orphans=true` goes ahead anyway and reports what it overrode. The
+  check reads `/proc` and `/etc/subuid`; when it cannot read them it says so
+  and lets the call through. `:compose/orphan-guard? false` turns it off.
+- A section never takes a service from under another live section of the same
+  compose project. compose keeps one container per service, so `restart
+  recreate=true` of a service another section holds (it runs it or needs it),
+  or an `up`/`switch` whose compose inputs (project dir, files, env, references
+  compared by rendering) differ from those the holder ran with, which makes
+  compose recreate the container on a changed config hash, is refused. The
+  refusal names the holder section, the agents owning it (its claims, else the
+  agents the last usage pass saw working in it), the services and which inputs
+  differ (variable names, never values). A holder is live unless it is
+  orphaned and unused. Sections with equal inputs share dependencies freely.
+  `allow_shared=true` goes ahead and reports what it overrode. The decision is
+  the pure `hive-compose.promote.ownership/conflicts`.
+
+## Resource caps (stacks)
+
+A stack can be capped so one run never takes the host down. Every key is
+optional, and a config without them runs uncapped as before.
+
+```edn
+{:compose/default-resources {:mem "512m"}      ; any instance nobody caps
+ :compose/budget "12g"                         ; all of a stack's capped memory
+ :compose/host-reserve "4g"                    ; MemAvailable kept free
+ :compose/projects
+ {"infra" {:project/provides {"kafka" {:service "kafka" :resources {:mem "1g" :cpus 2}}
+                              "search" {:service "es" :resources :unbounded}}}
+  "shop"  {:project/needs {"kafka" {:resources {:mem "2g" :jvm? true}}}}}
+ :compose/stacks
+ [{:stack/id "shop" :stack/consumers ["shop"]
+   :stack/resources {"kafka" {:mem "3g"}} :stack/budget "6g" :stack/priority 1}]}
+```
+
+- Precedence per key: `:stack/resources`, then the Need, then the Provide, then
+  `:compose/default-resources`. `:unbounded` opts out: no cap is written and
+  the instance is not summed.
+- A shared instance takes the largest cap of its consumers. `compose plan`
+  prints each instance's cap, the total, and what sharing saves against one
+  private copy per consumer.
+- `stack-up` refuses with `:compose/over-budget` (`:basis` `:stack`, `:budget`
+  or `:host`, plus `:limit`, `:total-mem`, `:over` and `:instances`) before
+  anything starts. The host limit is MemAvailable minus `:compose/host-reserve`,
+  compared with what is not yet running.
+- A private instance gets `mem_limit` and `cpus` in its stack override. JVM
+  services (`:jvm? true`, or a detected java image) also get
+  `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75`, merged per flag, and the
+  service's own flags win. A shared instance runs from its own files, so its
+  cap is summed and admitted but not written.
+- Reaper pressure guard: while MemAvailable is below `:compose/host-reserve`,
+  each pass stops the idle, unclaimed run whose stack has the lowest
+  `:stack/priority`.
 
 ## Config
 
@@ -249,7 +326,8 @@ that exits within it is reported `:status :exited` with `:exit-code`,
 `:log-tail` and `:advice`, and is not held; `status` reports a held program
 that died since the same way),
 `:compose/swarm?` (true), `:compose/notify?` (true), `:compose/activity`
-(`#{:nrepl}`), `:compose/claim-ttl-minutes` (30), `:compose/orphan-ttl-minutes` (10).
+(`#{:nrepl}`), `:compose/cpu-busy-percent` (5), `:compose/claim-ttl-minutes` (30),
+`:compose/orphan-ttl-minutes` (10).
 
 `:compose/activity` says which new connections count as use; a project
 overrides it for its sections with `:project/activity` (a preset with
@@ -260,6 +338,15 @@ running containers (`docker inspect`) are left out, so pools do not count, and
 a keep-alive connection counts once, when first seen. `who` and `status` name
 the source that counted (`:in-use-via`, e.g. `[:published]`) and each
 section's `:activity`.
+
+`:cpu` in the activity counts a section's running services busier than
+`:compose/cpu-busy-percent` (5, percent of one core) as use, whether or not a
+client is connected: a batch job or a queue worker that nobody touches is not
+reaped while it works. Each reaper pass takes one `docker stats --no-stream`
+sample of the project's running containers (found by compose label) and keeps
+the busiest container per service; `who` shows the reason as
+`{:service "worker" :cpu 80.0 :source :cpu}`. An engine that cannot read the
+load counts nothing, as before.
 
 ## Development
 

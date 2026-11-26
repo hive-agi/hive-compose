@@ -12,7 +12,8 @@
    deps.edn project runs its `:nrepl` alias or a plain nrepl.cmdline, lein and
    babashka run their headless REPL servers."
   (:require [clojure.string :as str]
-            [hive-dsl.result :as r]))
+            [hive-dsl.result :as r]
+            [malli.core :as m]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -120,6 +121,29 @@
   (let [services (set services)]
     (filterv (fn [p] (or (empty? (:program/with p)) (some services (:program/with p))))
              programs)))
+
+(defn programs-only?
+  "True when `p` (a Profile) runs no compose project: its project says
+   `:project/compose? false`, so it has no services and only host programs."
+  [p]
+  (false? (:profile/compose? p)))
+
+(m/=> programs-only? [:=> [:cat :map] :boolean])
+
+(defn up-mode
+  "Result<:compose | :programs-only>: how `up` brings Profile `p` up. A
+   profile with a compose project goes through compose as always. One without
+   (`programs-only?`) starts only its programs, with no docker call; with no
+   program either it has nothing to run, :compose/nothing-to-run."
+  [p]
+  (cond
+    (not (programs-only? p)) (r/ok :compose)
+    (seq (:profile/programs p)) (r/ok :programs-only)
+    :else (r/err :compose/nothing-to-run
+                 {:profile (:profile/id p)
+                  :hint "a project with :project/compose? false needs :project/programs"})))
+
+(m/=> up-mode [:=> [:cat :map] :map])
 
 (defn running-in
   "{program-id Running} of every program the active entries of `project` hold,

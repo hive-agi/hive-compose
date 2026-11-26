@@ -1,6 +1,7 @@
 (ns hive-compose.promote.profile
   "Pure reads over a Profile value and the Settings that default it."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [hive-compose.promote.target :as target]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -31,21 +32,22 @@
   (or (:profile/idle-action p) (:compose/default-idle-action settings)))
 
 (defn activity
-  "Which new connections count as use of `p`: its own :profile/activity (from
-   its project's :project/activity for a section), else the global
-   :compose/activity. A set of :nrepl and :published."
+  "What counts as use of `p`: its own :profile/activity (from its project's
+   :project/activity for a section), else the global :compose/activity. A set
+   of :nrepl, :published and :cpu."
   [settings p]
   (set (or (:profile/activity p) (:compose/activity settings))))
 
 (defn with-call-options
   "`p` adjusted for one `up`/`switch` call: `no-deps?` starts only its named
    services (their dependencies must already run), `wait?` waits until they
-   are healthy, `env` adds to the environment compose interpolates."
+   are healthy, `env` adds to the environment compose interpolates and is
+   remembered under :profile/call-env (see `promote.target/with-call-env`)."
   [p {:keys [no-deps? wait? env]}]
   (cond-> p
     (some? no-deps?) (assoc :profile/no-deps? (boolean no-deps?))
     (some? wait?) (assoc :profile/wait? (boolean wait?))
-    (seq env) (update :profile/env merge env)))
+    (seq env) (target/with-call-env env)))
 
 (defn up-services
   "What `up` starts for `p` whose depends_on closure is `closure`: only its

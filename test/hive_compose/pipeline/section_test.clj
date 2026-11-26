@@ -51,6 +51,26 @@
     (is (not (contains? (stub/running (:engine c) "shop") "ledger"))
         "always-on services outside the closure stay down")))
 
+(deftest a-stale-section-snapshot-releases-with-the-env-its-project-has-now
+  (let [c (ctx)
+        env-proj (assoc-in (get-in settings [:compose/projects "shop"])
+                           [:project/env] {"OVERLAY_SRC" "/now" "SHARED" "project"})
+        c (assoc-in c [:settings :compose/projects "shop"] env-proj)
+        snap {:profile/id "shop/web" :profile/dir "/old" :profile/services ["web"]
+              :profile/env {"CALL_ONLY" "x" "SHARED" "snapshot"}}]
+    (swap! (:state c) assoc-in [:active "shop/web" :profile] snap)
+    (testing "a variable the project gained after the snapshot is present"
+      (is (= {"OVERLAY_SRC" "/now" "CALL_ONLY" "x" "SHARED" "snapshot"}
+             (:profile/env (:ok (ops/lookup c "shop/web"))))))
+    (testing "the id and services stay, the project-derived dir follows the project"
+      (is (= "shop/web" (:profile/id (:ok (ops/lookup c "shop/web")))))
+      (is (= ["web"] (:profile/services (:ok (ops/lookup c "shop/web")))))
+      (is (= "/w/shop" (:profile/dir (:ok (ops/lookup c "shop/web"))))))
+    (testing "a section whose project left the config keeps its snapshot"
+      (swap! (:state c) assoc-in [:active "gone/web" :profile]
+             (assoc snap :profile/id "gone/web"))
+      (is (= "/old" (:profile/dir (:ok (ops/lookup c "gone/web"))))))))
+
 (deftest a-native-profile-target-means-its-own-members
   (let [res (up-target! (ctx) "frontend")]
     (is (= "shop/frontend" (:profile (:ok res))))
@@ -110,6 +130,80 @@
     (swap! (:clock c) + (* 61 minute))
     (ops/reap! c)
     (is (= #{} (stub/running (:engine c) "shop")))))
+
+(deftest an-adopted-section-is-released-by-container-name
+  (let [c (ctx {"shop" #{"ledger" "postgres"}})]
+    (is (= ["shop/adopted"] (ops/adopt! c)))
+    (testing "a stray from a compose file the project does not name"
+      (stub/undefine! (:engine c) "ledger")
+      (stub/unset! (:engine c) "shop" "OVERLAY_SRC"))
+    (swap! (:clock c) + (* 61 minute))
+    (let [[row & more] (:reaped (ops/reap! c))]
+      (is (empty? more))
+      (is (= {:profile/id "shop/adopted" :ok? true :by :container-name}
+             (select-keys row [:profile/id :ok? :by]))))
+    (is (= [[:stop-by-name "shop" ["ledger" "postgres"]]]
+           (filterv #(#{:stop :down :stop-by-name :rm-by-name} (first %)) (stub/calls (:engine c))))
+        "compose is never asked: neither the unknown service nor the unset variable stops it")
+    (is (= #{} (stub/running (:engine c) "shop")))
+    (is (not (contains? (:active @(:state c)) "shop/adopted")))))
+
+(deftest an-unset-project-variable-is-reported-per-section-and-the-pass-goes-on
+  (let [c (ctx)]
+    (up-target! c "web")
+    (up-target! c "ghost")
+    (stub/unset! (:engine c) "shop" "OVERLAY_SRC")
+    (swap! (:clock c) + (* 61 minute))
+    (let [{:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (= #{"blog/ghost" "shop/web"} (set (keys by-id))) "both sections answer a row")
+      (is (:ok? (by-id "blog/ghost")) "a project with every variable set is reaped as before")
+      (testing "the section whose files need the unset variable says which, and still stops by name"
+        (is (= "OVERLAY_SRC" (:missing-env (by-id "shop/web"))))
+        (is (:ok? (by-id "shop/web")))
+        (is (= :container-name (:by (by-id "shop/web"))))
+        (is (= #{} (stub/running (:engine c) "shop")))))))
+
+(deftest without-name-control-an-unset-variable-fails-only-its-section
+  (let [c (ctx)
+        plain (reify hive-compose.port/IComposeEngine
+                (-stop! [_ p _]
+                  (if (= "shop" (profile/project p))
+                    (r/err :compose/command-failed
+                           {:exit 1 :stderr "required variable OVERLAY_SRC is missing a value: x"})
+                    (r/ok {:out ""})))
+                (-running [_ _] (r/ok #{"web" "ghost"})))
+        c (assoc c :engine plain)]
+    (swap! (:state c) assoc :active
+           {"shop/web" {:project "shop" :services ["web"] :last-touch 0
+                        :profile {:profile/id "shop/web" :profile/dir "/w/shop" :profile/services ["web"]}}
+            "blog/ghost" {:project "blog" :services ["ghost"] :last-touch 0
+                          :profile {:profile/id "blog/ghost" :profile/dir "/w/blog" :profile/services ["ghost"]
+                                    :profile/ttl-minutes 5}}})
+    (swap! (:clock c) + (* 61 minute))
+    (let [{:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (:ok? (by-id "blog/ghost")))
+      (is (false? (:ok? (by-id "shop/web"))))
+      (is (= "OVERLAY_SRC" (:missing-env (by-id "shop/web"))))
+      (is (= ["shop/web"] (keys (:active @(:state c)))) "it stays active, to be retried once the variable is set"))))
+
+(deftest a-release-that-throws-fails-only-its-section
+  (let [c (ctx)]
+    (up-target! c "web")
+    (up-target! c "ghost")
+    (swap! (:clock c) + (* 61 minute))
+    (let [real (:engine c)
+          c (assoc c :engine (reify hive-compose.port/IComposeEngine
+                               (-stop! [_ p s]
+                                 (if (= "shop" (profile/project p))
+                                   (throw (ex-info "boom" {}))
+                                   (hive-compose.port/-stop! real p s)))
+                               (-running [_ p] (hive-compose.port/-running real p))))
+          {:keys [reaped]} (ops/reap! c)
+          by-id (into {} (map (juxt :profile/id identity)) reaped)]
+      (is (:ok? (by-id "blog/ghost")))
+      (is (= :compose/release-threw (get-in (by-id "shop/web") [:error :error]))))))
 
 (deftest reaping-a-section-spares-what-an-adopted-one-depends-on
   (let [c (ctx {"shop" #{"auth" "redis"}})]

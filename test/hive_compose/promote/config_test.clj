@@ -13,6 +13,17 @@
     (is (= (str home "/w/shop") (get-in s [:compose/profiles "api" :profile/dir])))
     (is (= (str home "/.local/state/hive-compose/state.edn") (:compose/state-file s)))))
 
+(deftest flake-history-settings-are-additive
+  (let [s (:ok (config/settings {} nil home))]
+    (is (= (str home "/.local/state/hive-compose/flake-history.ednl") (:compose/history-file s)))
+    (is (not (contains? s :compose/flaky)) "no thresholds unless configured"))
+  (let [s (:ok (config/settings {:compose/state-file "/st/state.edn"
+                                 :compose/flaky {:window 10}} nil home))]
+    (is (= "/st/flake-history.ednl" (:compose/history-file s)))
+    (is (= {:window 10} (:compose/flaky s))))
+  (is (= "/h/x.ednl" (:compose/history-file (:ok (config/settings {:compose/history-file "/h/x.ednl"} nil home)))))
+  (is (= :compose/invalid-config (:error (config/settings {:compose/flaky {:window 0}} nil home)))))
+
 (deftest map-shaped-profiles-take-their-key-as-id
   (let [s (:ok (config/settings {} {:api {:profile/dir "/w"}} home))]
     (is (= "api" (get-in s [:compose/profiles "api" :profile/id])))))
@@ -65,3 +76,100 @@
       (is (= ["docker-compose.yml" "docker-compose.override.yml"]
              (get-in s [:compose/projects "dc" :project/files])))
       (is (nil? (get-in s [:compose/projects "dc" :project/env]))))))
+
+(def ^:private preflight-cfg
+  {:compose/projects {"gone" {:project/id "gone" :project/dir "/w/gone"}
+                      "nofile" {:project/id "nofile" :project/dir "/w/nofile"
+                                :project/files ["docker-compose.yml" "/abs/override.yml"]}
+                      "nodefault" {:project/id "nodefault" :project/dir "/w/nodefault"}
+                      "shop" {:project/id "shop" :project/dir "/w/shop"}}
+   :compose/stacks {"s" {:stack/id "s" :stack/consumers ["gone" "shop"]}
+                    "ok" {:stack/id "ok" :stack/consumers ["shop"]}}})
+
+(def ^:private fake-fs
+  "The fake filesystem: what exists. /w/gone is not there at all, /w/nofile's
+   override is missing, /w/nodefault holds no compose file."
+  #{"/w/nofile" "/w/nofile/docker-compose.yml" "/w/nodefault" "/w/shop" "/w/shop/compose.yaml"})
+
+(deftest preflight-names-what-is-missing-as-data
+  (let [projects (:compose/projects (:ok (config/settings preflight-cfg nil home)))
+        pf #(config/project-preflight fake-fs (get projects %))]
+    (testing "a missing directory"
+      (is (= {:reason :compose/project-missing :project "gone" :missing :dir :paths ["/w/gone"]}
+             (pf "gone"))))
+    (testing "a missing configured compose file names just that file"
+      (is (= {:reason :compose/project-missing :project "nofile" :missing :compose-file
+              :paths ["/abs/override.yml"]}
+             (pf "nofile"))))
+    (testing "no compose file under compose's default names"
+      (is (= {:reason :compose/project-missing :project "nodefault" :missing :compose-file
+              :paths ["/w/nodefault"] :looked-for config/compose-default-files}
+             (pf "nodefault"))))
+    (testing "a present project: nil"
+      (is (nil? (pf "shop"))))
+    (testing "a project that expects no compose file needs only its dir"
+      (is (false? (config/compose-file-expected? {:project/compose? false})))
+      (is (nil? (config/project-preflight fake-fs {:project/id "x" :project/dir "/w/nodefault"
+                                                   :project/compose? false}))))
+    (testing "total: no dir at all is a missing dir, never a throw"
+      (is (= :dir (:missing (config/project-preflight fake-fs {})))))
+    (is (= ["gone" "nodefault" "nofile"] (keys (config/projects-preflight fake-fs projects))))))
+
+(deftest projects-rows-are-marked-and-present-ones-unchanged
+  (let [projects (:compose/projects (:ok (config/settings preflight-cfg nil home)))
+        shop {:name "shop" :status "running(1)" :managed? true :label-files []
+              :configured [{:id "shop"}]}
+        nofile {:name "nofile" :status "running(1)" :managed? false :label-files []
+                :configured [{:id "nofile" :files ["/w/nofile/docker-compose.yml" "/abs/override.yml"]}]}
+        rows (config/mark-projects [shop nofile] projects fake-fs)
+        by-name (into {} (map (juxt :name identity)) rows)]
+    (is (= shop (by-name "shop")) "a present project's row is unchanged")
+    (is (= :compose-file (get-in by-name ["nofile" :configured 0 :problem :missing])))
+    (testing "a missing project docker does not list gets a row of its own"
+      (is (= "missing" (:status (by-name "gone"))))
+      (is (= :compose/project-missing (get-in by-name ["gone" :configured 0 :problem :reason])))
+      (is (= :dir (get-in by-name ["gone" :configured 0 :problem :missing]))))
+    (is (= [shop] (config/mark-projects [shop] {"shop" (get projects "shop")} fake-fs))
+        "nothing missing: the rows as given")))
+
+(deftest plan-carries-the-problems-of-the-projects-its-stack-brings-up
+  (let [s (:ok (config/settings preflight-cfg nil home))
+        res (config/mark-plan {:ok {:text "plan"}} s "s" fake-fs)]
+    (is (= ["gone" "shop"] (config/stack-projects s "s")))
+    (is (= [{:reason :compose/project-missing :project "gone" :missing :dir :paths ["/w/gone"]}]
+           (get-in res [:ok :problems])))
+    (is (re-find #"MISSING: project gone dir /w/gone" (get-in res [:ok :text])))
+    (is (= {:ok {:text "plan"}} (config/mark-plan {:ok {:text "plan"}} s "ok" fake-fs))
+        "a stack of present projects: the plan unchanged")
+    (is (= [:dir] (map :missing (:problems (config/mark-plan {:error :x} s "s" fake-fs))))
+        "an error plan carries them too")
+    (is (= [] (config/stack-projects s "unknown")))))
+
+(deftest a-probe-that-cannot-tell-is-unreadable-never-missing
+  (let [s (:ok (config/settings preflight-cfg nil home))
+        projects (:compose/projects s)
+        throwing (fn [_] (throw (java.io.IOException. "boom")))
+        ;; the fake port answers EACCES on /w/gone the way the real one does: :unknown
+        denied (fn [p] (cond (= p "/w/gone") :unknown (fake-fs p) :present :else :missing))]
+    (testing "a throwing probe: no exception, no :compose/project-missing"
+      (is (= :unknown (config/path-state throwing "/x")))
+      (let [problems (config/projects-preflight throwing projects)]
+        (is (= #{:compose/project-unreadable} (set (map :reason (vals problems)))))
+        (is (= {:reason :compose/project-unreadable :project "shop" :unreadable :dir :paths ["/w/shop"]}
+               (get problems "shop"))))
+      (let [rows (config/mark-projects [] projects throwing)]
+        (is (= #{"unreadable"} (set (map :status rows))))
+        (is (not-any? #(= :compose/project-missing (get-in % [:configured 0 :problem :reason])) rows)))
+      (let [res (config/mark-plan {:ok {:text "plan"}} s "s" throwing)]
+        (is (= #{:compose/project-unreadable} (set (map :reason (get-in res [:ok :problems])))))
+        (is (re-find #"UNREADABLE: project gone dir /w/gone" (get-in res [:ok :text])))))
+    (testing "a permission-denied dir reads as unknown: unreadable, with the path"
+      (is (= {:reason :compose/project-unreadable :project "gone" :unreadable :dir :paths ["/w/gone"]}
+             (config/project-preflight denied (get projects "gone"))))
+      (is (nil? (config/project-preflight denied (get projects "shop"))) "a present project unchanged"))
+    (testing "an unknown compose file next to a missing one: missing wins"
+      (is (= {:reason :compose/project-missing :project "nofile" :missing :compose-file
+              :paths ["/abs/override.yml"]}
+             (config/project-preflight
+              (fn [p] (cond (= p "/w/nofile/docker-compose.yml") :unknown (fake-fs p) :present :else :missing))
+              (get projects "nofile")))))))

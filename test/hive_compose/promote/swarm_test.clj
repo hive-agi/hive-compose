@@ -3,7 +3,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [hive-compose.promote.swarm :as sw]))
+            [hive-compose.promote.swarm :as sw]
+            [hive-compose.schema]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -52,6 +53,91 @@
       (is (= {"ling-1" :stale} (sw/expired-claims claims nil 1000 1000))))
     (testing "the swarm no longer lists ling-2; a claim made outside the swarm is not judged by it"
       (is (= {"ling-1" :gone "ling-2" :gone} (sw/expired-claims claims #{"other"} 1000 5000))))))
+
+;; ---------------------------------------------------------------------------
+;; the liveness law (claim-end): wave claims and plain claims
+
+(defn- legacy-end
+  "The law before wave claims, kept here as the oracle for plain claims."
+  [agent {:keys [seen swarm?]} live now ttl-ms]
+  (cond
+    (and swarm? live (not (contains? live agent))) :gone
+    (>= (- now (or seen 0)) ttl-ms) :stale
+    :else nil))
+
+(def gen-agent (gen/elements ["ling-1" "ling-2" "coordinator:f07f8867"]))
+(def gen-live (gen/one-of [(gen/return nil) (gen/set gen-agent)]))
+(def gen-plain (gen/hash-map :since gen/nat :seen gen/nat :swarm? gen/boolean))
+(def gen-wave (gen/fmap (fn [[c until]] (assoc c :until until)) (gen/tuple gen-plain gen/nat)))
+(def gen-claim (gen/one-of [gen-plain gen-wave]))
+
+(defspec claim-end-is-monotone-in-now 300
+  (prop/for-all [agent gen-agent c gen-claim live gen-live
+                 now gen/nat dt gen/nat ttl gen/s-pos-int]
+    (or (nil? (sw/claim-end agent c live now ttl))
+        (some? (sw/claim-end agent c live (+ now dt) ttl)))))
+
+(defspec a-wave-claim-is-live-iff-now-is-before-until 300
+  (prop/for-all [agent gen-agent c gen-wave live gen-live now gen/nat ttl gen/s-pos-int]
+    (= (< now (:until c)) (sw/claim-live? agent c live now ttl))))
+
+(defspec a-wave-claim-never-depends-on-the-swarm-roster 300
+  (prop/for-all [agent gen-agent c gen-wave a gen-live b gen-live now gen/nat ttl gen/s-pos-int]
+    (= (sw/claim-end agent c a now ttl) (sw/claim-end agent c b now ttl))))
+
+(defspec plain-claims-keep-the-old-law 300
+  (prop/for-all [agent gen-agent c gen-plain live gen-live now gen/nat ttl gen/s-pos-int]
+    (= (legacy-end agent c live now ttl) (sw/claim-end agent c live now ttl))))
+
+(defspec a-renewal-is-live-when-it-is-made 300
+  ;; over (stored until or none, now, ttl given or not): whatever was stored,
+  ;; the claim right after a renewal at `now` holds at `now`
+  (prop/for-all [stored (gen/one-of [(gen/return nil) gen/nat])
+                 now gen/nat
+                 ttl (gen/one-of [(gen/return nil) gen/s-pos-int])
+                 claim-ttl gen/s-pos-int]
+    (let [old (cond-> {:since 0 :seen 0} stored (assoc :until stored))
+          until (when ttl (+ now ttl))
+          c (get (sw/claim {"a" old} "a" now {:until until}) "a")]
+      (and (sw/claim-live? "a" c nil now claim-ttl)
+           ;; a live wave claim renewed without ttl keeps its end; a lapsed one is plain
+           (= (:until c) (cond until until
+                               (and stored (> stored now)) stored
+                               :else nil))))))
+
+(deftest a-plain-renewal-after-the-wave-ended-is-a-plain-claim
+  (let [c (sw/claim {"co" {:since 0 :seen 0 :until 1000 :note "gate"}} "co" 1500 {})]
+    (is (= {:since 0 :seen 1500 :note "gate"} (get c "co")))
+    (is (sw/lapsed-wave {:until 1000} 1500 nil))
+    (is (not (sw/lapsed-wave {:until 1000} 999 nil)) "a live wave claim keeps its end")
+    (is (not (sw/lapsed-wave {:until 1000} 1500 9000)) "a new ttl moves it instead")))
+
+(deftest a-wave-claim-outlives-its-agent-and-ends-at-until
+  (let [claims (sw/claim {} "coordinator:f07f8867" 0 {:note "pv01 gate" :swarm? true :until 1000})]
+    (is (= {} (sw/expired-claims claims #{} 999 10)) "gone from the swarm and long unrenewed: still held")
+    (is (= {"coordinator:f07f8867" :expired} (sw/expired-claims claims #{} 1000 10)))
+    (testing "a renewal moves :until; one without leaves it"
+      (is (= 5000 (get-in (sw/claim claims "coordinator:f07f8867" 500 {:until 5000}) ["coordinator:f07f8867" :until])))
+      (is (= 1000 (get-in (sw/claim claims "coordinator:f07f8867" 500 {}) ["coordinator:f07f8867" :until]))))
+    (testing "the view names wave? and expires-in-seconds"
+      (is (= {:note "pv01 gate" :since 0 :seen 0 :wave? true :until 1000 :expires-in-seconds 0}
+             (sw/claim-view (get claims "coordinator:f07f8867") 400 60000)))
+      (is (= {:since 0 :seen 0 :wave? false :expires-in-seconds 60}
+             (sw/claim-view {:since 0 :seen 0} 0 60000))))))
+
+(deftest wave-until-is-bounded-and-needs-a-note
+  (is (= {:ok nil} (sw/wave-until 0 nil 480 nil)) "no ttl_minutes: a plain claim")
+  (is (= {:ok (* 240 60000)} (sw/wave-until 0 240 480 "pv01")))
+  (let [over (sw/wave-until 0 481 480 "pv01")]
+    (is (= :compose/claim-ttl-over-max (:error over)))
+    (is (= 480 (:max over)) "the refusal names the bound"))
+  (is (= :compose/invalid-param (:error (sw/wave-until 0 0 480 "pv01"))))
+  (is (= :compose/missing-param (:error (sw/wave-until 0 60 480 "  "))))
+  (is (= "note" (:param (sw/wave-until 0 60 480 nil)))))
+
+(deftest a-stored-claim-without-until-still-loads
+  (is (nil? (hive-compose.schema/explain hive-compose.schema/Claim {:since 1 :seen 2 :note "x" :swarm? false})))
+  (is (nil? (hive-compose.schema/explain hive-compose.schema/Claim {:since 1 :seen 2 :until 3}))))
 
 (deftest usage-names-every-reason
   (is (= {:in-use? false :by [] :sources []} (sw/usage {})))

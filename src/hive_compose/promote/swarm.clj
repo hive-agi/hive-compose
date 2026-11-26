@@ -6,7 +6,8 @@
    declared itself, kept on the active entry under :claims
    {agent-id {:since ms :seen ms :note s :swarm? bool}}. A route is one
    program with an nREPL: {:dir :program/id :project :nrepl-port ..}."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [hive-dsl.result :as r]))
 
 ;; SPDX-License-Identifier: MIT
 
@@ -62,28 +63,111 @@
 ;; ---------------------------------------------------------------------------
 ;; claims
 
+(defn wave?
+  "True when `claim` is a wave claim: it carries an absolute :until."
+  [claim]
+  (int? (:until claim)))
+
+(defn lapsed-wave
+  "True when renewing `claim` at `now` without a new `until` finds a wave
+   claim whose :until has already passed: the renewal then makes it a plain
+   claim from `now`, which is what a caller who leaves out ttl_minutes means.
+   Without this the renewal would keep the stale :until, answer ok and be
+   dropped as :expired on the next pass."
+  [claim now until]
+  (boolean (and (nil? until) (wave? claim) (<= (:until claim) now))))
+
 (defn claim
   "`claims` with `agent` claiming at `now`. A renewed claim keeps its :since,
-   and its note unless a new one is given."
-  [claims agent now {:keys [note swarm?]}]
+   and its note unless a new one is given. `until` (absolute ms) makes it a
+   WAVE claim, live until then whatever the swarm says; a renewal with an
+   `until` moves it. One without leaves a live wave claim as it was, and
+   turns a wave claim whose :until has passed into a plain claim
+   (`lapsed-wave`)."
+  [claims agent now {:keys [note swarm? until]}]
   (update claims agent
           (fn [c] (cond-> (assoc (or c {:since now}) :seen now)
+                    ;; a renewal without ttl after the wave ended: a plain claim from now
+                    (lapsed-wave c now until) (dissoc :until)
                     (some? note) (assoc :note note)
-                    (some? swarm?) (assoc :swarm? (boolean swarm?))))))
+                    (some? swarm?) (assoc :swarm? (boolean swarm?))
+                    (some? until) (assoc :until until)))))
+
+(defn claim-end
+  "Why `claim` of `agent` no longer holds at `now`, nil while it holds. THE
+   one liveness law for section and stack-run claims:
+     - a wave claim (:until) holds while `now` < :until, and nothing else
+       counts: not the swarm roster, not :seen. Past it: :expired;
+     - any other claim ends :gone when its agent was in the swarm when it
+       claimed (:swarm?) and the swarm (`live`, a set of ids; nil when no
+       swarm answers or none is asked) no longer lists it, and :stale when
+       not renewed for `ttl-ms`.
+   Monotone in `now`: once ended, a claim stays ended at every later now."
+  [agent claim live now ttl-ms]
+  (let [{:keys [seen swarm? until]} claim]
+    (cond
+      (wave? claim) (when (>= now until) :expired)
+      (and swarm? live (not (contains? live agent))) :gone
+      (>= (- now (or seen 0)) ttl-ms) :stale
+      :else nil)))
+
+(defn claim-live?
+  "True while `claim` of `agent` holds at `now` (see `claim-end`)."
+  [agent claim live now ttl-ms]
+  (nil? (claim-end agent claim live now ttl-ms)))
 
 (defn expired-claims
-  "{agent reason} of the claims in `claims` that no longer hold at `now`:
-   :gone when the agent was in the swarm when it claimed and the swarm
-   (`live`, a set of ids; nil when no swarm answers) no longer lists it,
-   :stale when not renewed for `ttl-ms`."
+  "{agent reason} of the claims in `claims` that no longer hold at `now`
+   (`claim-end`): :expired, :gone or :stale."
   [claims live now ttl-ms]
   (into (sorted-map)
-        (keep (fn [[agent {:keys [seen swarm?]}]]
-                (cond
-                  (and swarm? live (not (contains? live agent))) [agent :gone]
-                  (>= (- now (or seen 0)) ttl-ms) [agent :stale]
-                  :else nil)))
+        (keep (fn [[agent c]] (when-let [why (claim-end agent c live now ttl-ms)] [agent why])))
         claims))
+
+(defn expires-in-seconds
+  "Seconds until `claim` ends by the clock at `now` (its :until for a wave
+   claim, :seen plus `ttl-ms` otherwise), never below 0. A plain claim may
+   end sooner when its agent leaves the swarm."
+  [claim now ttl-ms]
+  (let [end (if (wave? claim) (:until claim) (+ (or (:seen claim) 0) ttl-ms))]
+    (max 0 (quot (- end now) 1000))))
+
+(defn claim-view
+  "What status, who and stack-status show of one claim: note, since, seen,
+   whether it is a wave claim (with its :until) and expires-in-seconds."
+  [claim now ttl-ms]
+  (cond-> (assoc (select-keys claim [:note :since :seen])
+                 :wave? (wave? claim)
+                 :expires-in-seconds (expires-in-seconds claim now ttl-ms))
+    (wave? claim) (assoc :until (:until claim))))
+
+(defn claims-view
+  "{agent claim-view} of `claims`, sorted by agent (the owner)."
+  [claims now ttl-ms]
+  (into (sorted-map) (map (fn [[k c]] [k (claim-view c now ttl-ms)])) claims))
+
+(defn wave-until
+  "Result<until-or-nil>: the absolute :until of a claim asked at `now` with
+   `ttl-minutes` (nil when none was asked: a plain claim). Refused when it is
+   not a positive integer (invalid-param), above `max-minutes`
+   (claim-ttl-over-max, naming the bound: never clamped), or when the claim
+   has no non-blank `note` (missing-param): a wave claim outlives its agent,
+   so it must say what it holds the section for."
+  [now ttl-minutes max-minutes note]
+  (cond
+    (nil? ttl-minutes) (r/ok nil)
+    (not (and (int? ttl-minutes) (pos? ttl-minutes)))
+    (r/err :compose/invalid-param {:param "ttl_minutes" :value ttl-minutes
+                                   :hint "a whole number of minutes, at least 1"})
+    (> ttl-minutes max-minutes)
+    (r/err :compose/claim-ttl-over-max
+           {:param "ttl_minutes" :value ttl-minutes :max max-minutes
+            :hint (str "a wave claim lasts at most " max-minutes
+                       " minutes (:compose/claim-max-ttl-minutes); claim again before it ends to move it")})
+    (str/blank? note)
+    (r/err :compose/missing-param {:param "note"
+                                   :hint "a wave claim (ttl_minutes) needs a note saying what it holds the section for"})
+    :else (r/ok (+ now (* 60000 ttl-minutes)))))
 
 ;; ---------------------------------------------------------------------------
 ;; usage
@@ -142,27 +226,46 @@
     (merge (apply dissoc mine published)
            (without-hosts (select-keys mine published) own))))
 
+(defn busy-services
+  "{service percent} of `load` ({service percent}) above `threshold`, among
+   the services of `footprint` (all of `load` when nil). A reading that is
+   no number is left out."
+  [load threshold footprint]
+  (into (sorted-map)
+        (filter (fn [[s pct]]
+                  (and (number? pct) (> pct threshold)
+                       (or (nil? footprint) (contains? (set footprint) s)))))
+        load))
+
 (defn usage
   "{:in-use? bool :by [reason] :sources [source]} of an active section from
    what one pass saw: `claims` still holding, `agents` working in its
-   project's directories and `fresh` ({port #{peer}}) connections opened to
+   project's directories, `fresh` ({port #{peer}}) connections opened to
    its ports since the last pass, each port's source (:nrepl, :published)
-   given by `sources` ({port source}). A reason is {:claim agent}, {:agent id}
-   or {:port p :peers n :source s}; :sources names, in that order and once
-   each, what the reasons came from: :claim, :agent, or a port's source
-   (:port when `sources` does not name it)."
-  [{:keys [claims agents fresh sources]}]
+   given by `sources` ({port source}), and `busy` ({service percent}) services
+   found working on their own (see `busy-services`). A reason is {:claim
+   agent}, {:agent id}, {:port p :peers n :source s} or {:service s :cpu
+   percent :source :cpu}; :sources names, in that order and once each, what
+   the reasons came from: :claim, :agent, a port's source (:port when
+   `sources` does not name it), :cpu."
+  [{:keys [claims agents fresh sources busy]}]
   (let [ports (for [[p peers] (sort-by key fresh) :when (seq peers)]
                 (cond-> {:port p :peers (count peers)}
                   (get sources p) (assoc :source (get sources p))))
-        by (vec (concat (map (fn [a] {:claim a}) (sort (keys claims)))
+        cpu (for [[s pct] (sort-by key busy)]
+              {:service s :cpu pct :source :cpu})
+        by (vec (concat (map (fn [a] (cond-> {:claim a}
+                                       (wave? (get claims a)) (assoc :wave? true :until (:until (get claims a)))))
+                             (sort (keys claims)))
                         (map (fn [a] {:agent (:agent/id a)}) agents)
-                        ports))]
+                        ports
+                        cpu))]
     {:in-use? (boolean (seq by))
      :by by
      :sources (vec (distinct (concat (when (seq claims) [:claim])
                                      (when (seq agents) [:agent])
-                                     (map #(or (:source %) :port) ports))))}))
+                                     (map #(or (:source %) :port) ports)
+                                     (when (seq cpu) [:cpu]))))}))
 
 ;; ---------------------------------------------------------------------------
 ;; nREPL routes
